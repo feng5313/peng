@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<body>
+<h1>调试信息</h1>
+<pre id="result">加载中...</pre>
+<script>
+fetch('/api/webui/debug-eval', {
+  method: 'POST',
+  headers: {'Content-Type': 'application/json'},
+  body: JSON.stringify({code: `JSON.stringify({
+    viewTab: state.currentViewTab,
+    layout: state.currentLayout,
+    tabs: state.editorTabs.map(t => ({id:t.id,n:t.name,isNew:t.isNewFile,path:t.path})),
+    groups: state.editorGroups ? state.editorGroups.map(g => ({id:g.id,cur:g.currentTabId,tabs:g.tabs.map(t=>t.name),hasEditor:!!g.monacoEditor})) : null,
+    globalEditor: !!monacoEditor,
+    currentTabId: (state.editorGroups && state.editorGroups.length > 0 ? state.editorGroups[0].currentTabId : null)  // 🔧 Task#334
+  })`})
+}).then(r => r.json()).then(d => {
+  document.getElementById('result').textContent = JSON.stringify(d, null, 2);
+}).catch(e => {
+  document.getElementById('result').textContent = 'Error: ' + e.message;
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,892 @@
+#!/usr/bin/env python3
+"""
+LSP查询CLI工具 - 供nest exec远程调用
+
+用法:
+  单次模式: python3 bin/lsp-query <action> <file_path> <line> <column> [<workdir>]
+  守护模式: python3 bin/lsp-query --serve <workdir>
+  状态检查: python3 bin/lsp-query --check-status <file_path> [<workdir>]
+  停止守护: python3 bin/lsp-query --stop <workdir>
+
+action: definition, references, hover, symbols, implementation, completion
+环境变量:
+  LSP_CONTENT: base64编码的文件内容（用于补全时传递编辑器最新内容）
+输出: JSON格式结果（最后一行）
+
+守护模式通过Unix socket通信，LSP服务器进程常驻运行，避免每次请求都启动新进程。
+"""
+import sys
+import os
+import json
+import asyncio
+import base64
+import signal
+import time
+
+# 常驻daemon的TCP端口范围（基于workdir hash分配，避免冲突）
+_DAEMON_HOST = "127.0.0.1"
+_DAEMON_PORT_BASE = 19000
+_DAEMON_PORT_RANGE = 1000
+PID_FILE_TEMPLATE = None  # 延迟初始化（需要区分平台）
+
+def _get_pid_dir():
+    """获取pid文件目录（跨平台）"""
+    if sys.platform == "win32":
+        return os.path.join(os.environ.get("TEMP", "."), "lsp-query")
+    return "/tmp"
+
+def _server_address(workdir):
+    """根据workdir生成唯一的(host, port)"""
+    import hashlib
+    # 统一路径分隔符，避免 D:/... 和 D:\... 算出不同端口
+    normalized = workdir.replace("\\", "/").rstrip("/")
+    h = int(hashlib.md5(normalized.encode()).hexdigest(), 16)
+    port = _DAEMON_PORT_BASE + (h % _DAEMON_PORT_RANGE)
+    return (_DAEMON_HOST, port)
+
+def _pid_path(workdir):
+    """根据workdir生成唯一的pid文件路径"""
+    import hashlib
+    # 统一路径分隔符
+    normalized = workdir.replace("\\", "/").rstrip("/")
+    h = hashlib.md5(normalized.encode()).hexdigest()[:12]
+    pid_dir = _get_pid_dir()
+    os.makedirs(pid_dir, exist_ok=True)
+    return os.path.join(pid_dir, f"lsp-query-{h}.pid")
+
+
+def main():
+    # 确保项目src在Python路径中
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src_path = os.path.join(project_root, "src")
+    if src_path not in sys.path:
+        sys.path.insert(0, src_path)
+
+    # --check-status: 轻量级检查LSP服务器是否可用（不启动LSP进程）
+    if len(sys.argv) >= 2 and sys.argv[1] == "--check-status":
+        file_path = sys.argv[2] if len(sys.argv) > 2 else ""
+        workdir = sys.argv[3] if len(sys.argv) > 3 else os.getcwd()
+        _check_status(file_path, workdir)
+        return
+
+    # --stop: 停止指定workdir的daemon进程
+    if len(sys.argv) >= 2 and sys.argv[1] == "--stop":
+        workdir = sys.argv[2] if len(sys.argv) > 2 else os.getcwd()
+        _stop_daemon(workdir)
+        return
+
+    # --serve: 启动daemon模式（常驻LSP服务器进程）
+    if len(sys.argv) >= 2 and sys.argv[1] == "--serve":
+        workdir = sys.argv[2] if len(sys.argv) > 2 else os.getcwd()
+        _start_daemon(workdir)
+        return
+
+    # --daemon-ping: 检查daemon是否存活
+    if len(sys.argv) >= 2 and sys.argv[1] == "--daemon-ping":
+        workdir = sys.argv[2] if len(sys.argv) > 2 else os.getcwd()
+        _daemon_ping(workdir)
+        return
+
+    if len(sys.argv) < 5:
+        print(json.dumps({"success": False, "error": f"用法: {sys.argv[0]} <action> <file_path> <line> <column> [<workdir>]"}))
+        sys.exit(1)
+
+    action = sys.argv[1]
+    file_path = sys.argv[2]
+    line = int(sys.argv[3])
+    column = int(sys.argv[4])
+    workdir = sys.argv[5] if len(sys.argv) > 5 and not sys.argv[5].startswith('--') else os.path.dirname(os.path.dirname(os.path.abspath(file_path)))
+
+    # 检查是否从环境变量接收编辑器内容
+    stdin_content = None
+    env_content = os.environ.get("LSP_CONTENT", "")
+    if env_content:
+        try:
+            stdin_content = base64.b64decode(env_content).decode("utf-8")
+        except Exception:
+            stdin_content = None
+
+    # 优先尝试通过daemon发送请求（复用常驻LSP服务器）
+    result = _query_via_daemon(workdir, action, file_path, line, column, stdin_content)
+    if result is not None:
+        print(json.dumps(result))
+        return
+
+    # daemon不可用，回退到单次模式
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_run(action, file_path, line, column, workdir, stdin_content))
+    finally:
+        # 清理所有子进程
+        import subprocess
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+
+
+async def _run(action, file_path, line, column, workdir, stdin_content=None):
+    """单次模式：启动LSP服务器、执行查询、关闭。仅当daemon不可用时使用。"""
+    adapter = None
+    try:
+        from peng.tools.lsp.manager import AdapterManager
+        from peng.tools.lsp.language import get_server_type
+        from pathlib import Path
+
+        ext = Path(file_path).suffix
+        language = get_server_type(ext)
+        if not language:
+            print(json.dumps({"success": False, "error": f"不支持的文件类型: {ext}"}))
+            return
+
+        # 对C/C++项目自动检测compile_commands.json
+        if ext in ('.c', '.h', '.cpp', '.hpp', '.cc', '.cxx', '.hxx'):
+            _ensure_compile_commands(Path(workdir))
+
+        mgr = AdapterManager(workdir)
+        adapter = mgr.get_adapter(file_path)
+        if not adapter:
+            print(json.dumps({"success": False, "error": f"无法创建适配器: {language}"}))
+            return
+
+        # 检查是否有LSP服务器
+        if not adapter.has_server():
+            print(json.dumps({"success": False, "error": f"LSP服务器未安装: {language}"}))
+            return
+
+        # 使用LSP服务器（通过adapter的原始LSPClient）
+        result = await _run_with_server(adapter, action, file_path, line, column, stdin_content)
+        print(json.dumps(result))
+
+    except Exception as e:
+        import traceback
+        print(json.dumps({"success": False, "error": f"{e}", "traceback": traceback.format_exc()}))
+    finally:
+        # 确保关闭LSP客户端进程，避免子进程泄漏
+        if adapter:
+            try:
+                if hasattr(adapter, '_client') and adapter._client:
+                    await adapter._client.close()
+            except Exception:
+                pass
+
+
+# ==================== Daemon模式 ====================
+
+
+def _query_via_daemon(workdir, action, file_path, line, column, stdin_content=None):
+    """
+    通过TCP socket向daemon进程发送查询请求。
+    返回None表示daemon不可用，需要回退到单次模式。
+    """
+    host, port = _server_address(workdir)
+    import socket
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(30)
+        sock.connect((host, port))
+
+        request = {
+            "action": action,
+            "file_path": file_path,
+            "line": line,
+            "column": column,
+            "workdir": workdir,
+        }
+        if stdin_content is not None:
+            request["content"] = stdin_content
+
+        # 协议：发送JSON行，接收JSON行
+        msg = json.dumps(request) + "\n"
+        sock.sendall(msg.encode("utf-8"))
+
+        # 读取响应（直到收到完整JSON行）
+        buf = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+            if b"\n" in buf:
+                break
+
+        sock.close()
+        response_text = buf.decode("utf-8").strip()
+        if not response_text:
+            return None
+
+        return json.loads(response_text)
+
+    except (ConnectionRefusedError, ConnectionResetError, socket.timeout, json.JSONDecodeError, OSError) as e:
+        print(f"[lsp-query] daemon连接失败: {e}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"[lsp-query] daemon通信异常: {e}", file=sys.stderr)
+        return None
+
+
+def _daemon_ping(workdir):
+    """检查daemon是否存活"""
+    result = _query_via_daemon(workdir, "ping", "", 1, 1, None)
+    if result is not None:
+        print(json.dumps({"alive": True, "workdir": workdir}))
+    else:
+        print(json.dumps({"alive": False, "workdir": workdir}))
+
+
+def _stop_daemon(workdir):
+    """停止daemon进程"""
+    pid_path = _pid_path(workdir)
+
+    # 先尝试通过TCP发送shutdown命令
+    result = _query_via_daemon(workdir, "shutdown", "", 1, 1, None)
+
+    # 如果有pid文件，确保进程已终止
+    if os.path.exists(pid_path):
+        try:
+            with open(pid_path) as f:
+                pid = int(f.read().strip())
+            kill_sig = signal.SIGTERM if sys.platform != "win32" else signal.SIGINT
+            os.kill(pid, kill_sig)
+            print(f"[lsp-query] 已发送终止信号到daemon进程 (pid={pid})", file=sys.stderr)
+        except (ProcessLookupError, ValueError, OSError):
+            pass
+        try:
+            os.unlink(pid_path)
+        except Exception:
+            pass
+
+    print(json.dumps({"success": True, "message": "daemon已停止"}))
+
+
+def _start_daemon(workdir):
+    """
+    启动daemon模式：常驻LSP服务器，通过TCP socket接收请求。
+    跨平台：Linux和Windows均使用TCP socket。
+    """
+    host, port = _server_address(workdir)
+    pid_path = _pid_path(workdir)
+
+    # 检查是否已有daemon运行（可能有多个残留进程）
+    if os.path.exists(pid_path):
+        try:
+            with open(pid_path) as f:
+                for line in f:
+                    pid_str = line.strip()
+                    if pid_str:
+                        try:
+                            os.kill(int(pid_str), 0)  # 检查进程是否存活
+                            # 进程还活着，先杀掉
+                            os.kill(int(pid_str), signal.SIGTERM if sys.platform != "win32" else signal.SIGINT)
+                            print(f"[lsp-query] 已终止残留daemon (pid={pid_str})", file=sys.stderr)
+                        except (ProcessLookupError, ValueError, OSError):
+                            pass
+        except Exception:
+            pass
+        try:
+            os.unlink(pid_path)
+        except Exception:
+            pass
+
+    # 写入pid文件
+    with open(pid_path, "w") as f:
+        f.write(str(os.getpid()))
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    daemon = _LspDaemon(workdir, host, port, loop)
+
+    if sys.platform != "win32":
+        def _signal_handler(sig, frame):
+            print(f"[lsp-query] 收到信号 {sig}，正在关闭daemon...", file=sys.stderr)
+            loop.call_soon_threadsafe(daemon.shutdown)
+        signal.signal(signal.SIGTERM, _signal_handler)
+        signal.signal(signal.SIGINT, _signal_handler)
+
+    try:
+        loop.run_until_complete(daemon.run())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.run_until_complete(daemon.cleanup())
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+        try:
+            os.unlink(pid_path)
+        except Exception:
+            pass
+        print("[lsp-query] daemon已退出", file=sys.stderr)
+
+
+class _LspDaemon:
+    """LSP守护进程：常驻运行LSP服务器，通过TCP socket接收查询请求"""
+
+    def __init__(self, workdir, host, port, loop):
+        self.workdir = workdir
+        self.host = host
+        self.port = port
+        self.loop = loop
+        self._server = None
+        self._running = False
+        self._adapter = None  # 常驻的AdapterManager，LSP客户端保持连接
+        self._opened_files = {}  # uri -> version，跟踪已打开的文件
+        # 从config读取大文件阈值作为TCP行读取缓冲区limit
+        self._tcp_limit = self._read_large_file_threshold()
+
+    def _read_large_file_threshold(self):
+        """从config/webui.json读取large_file_threshold，作为TCP readline的limit"""
+        try:
+            config_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "config", "webui.json"
+            )
+            if os.path.isfile(config_path):
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                return cfg.get("webui", {}).get("large_file_threshold", 3 * 1024 * 1024)
+        except Exception:
+            pass
+        return 3 * 1024 * 1024  # 默认3MB
+
+    async def run(self):
+        """启动daemon主循环"""
+        from peng.tools.lsp.manager import AdapterManager
+        from pathlib import Path
+
+        # 预创建AdapterManager（但不立即启动LSP服务器，等第一个请求时启动）
+        self._adapter_mgr = AdapterManager(self.workdir)
+
+        # 对C/C++项目自动检测compile_commands.json
+        _ensure_compile_commands(Path(self.workdir))
+
+        # 启动TCP服务器（limit从config/webui.json读取）
+        self._server = await asyncio.start_server(
+            self._handle_client, self.host, self.port, limit=self._tcp_limit
+        )
+        self._running = True
+        print(f"[lsp-query] daemon已启动: workdir={self.workdir}, tcp={self.host}:{self.port}", file=sys.stderr)
+
+        # 持续运行直到被关闭
+        async with self._server:
+            await self._server.serve_forever()
+
+    async def _handle_client(self, reader, writer):
+        """处理客户端连接"""
+        try:
+            while self._running:
+                # 读取请求行
+                line = await asyncio.wait_for(reader.readline(), timeout=300)
+                if not line:
+                    break
+
+                request_text = line.decode("utf-8").strip()
+                if not request_text:
+                    continue
+
+                try:
+                    request = json.loads(request_text)
+                except json.JSONDecodeError:
+                    response = {"success": False, "error": "无效的JSON请求"}
+                    writer.write((json.dumps(response) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    continue
+
+                # 处理特殊命令
+                action = request.get("action", "")
+                if action == "shutdown":
+                    response = {"success": True, "message": "daemon正在关闭"}
+                    writer.write((json.dumps(response) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    self.shutdown()
+                    break
+                elif action == "ping":
+                    response = {"success": True, "alive": True, "workdir": self.workdir}
+                    writer.write((json.dumps(response) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    continue
+
+                # 执行LSP查询
+                response = await self._execute_query(request)
+                writer.write((json.dumps(response) + "\n").encode("utf-8"))
+                await writer.drain()
+
+        except asyncio.TimeoutError:
+            pass
+        except Exception as e:
+            import traceback as _tb
+            print(f"[lsp-query] daemon处理请求异常: {e}\n{_tb.format_exc()}", file=sys.stderr)
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    def _build_completion_context(self, content, line, column, file_path):
+        """
+        构造精简的补全上下文文件内容。
+        提取：#include + using/namespace声明 + 光标附近代码
+        这样clangd能快速解析，返回准确的上下文补全。
+        
+        返回: (新文件内容, 新文件中的光标行号, 新文件中的光标列号)
+        """
+        import re
+        import os
+        
+        # strip BOM
+        if content and content[0] == '\ufeff':
+            content = content[1:]
+        
+        lines = content.split('\n')
+        target_line_idx = line - 1  # 0-based
+
+        # 1. 提取头部声明（#include, using, namespace, #define, typedef, template）
+        header_lines = []
+        header_patterns = [
+            re.compile(r'^\s*#\s*include'),
+            re.compile(r'^\s*using\s'),
+            re.compile(r'^\s*namespace\s'),
+            re.compile(r'^\s*#\s*define'),
+            re.compile(r'^\s*typedef\s'),
+            re.compile(r'^\s*template\s*<'),
+        ]
+        for ln in lines:
+            if any(p.match(ln) for p in header_patterns):
+                header_lines.append(ln)
+            # 遇到非声明行就停止扫描头部（避免函数体中的using等被误提取）
+            # 但要跳过空行和注释
+            stripped = ln.strip()
+            if stripped and not stripped.startswith('#') and not any(p.match(ln) for p in header_patterns):
+                if not stripped.startswith('//') and not stripped.startswith('/*'):
+                    break
+
+        # 2. 提取光标附近的上下文（前后各50行）
+        ctx_range = 50
+        ctx_start = max(0, target_line_idx - ctx_range)
+        ctx_end = min(len(lines), target_line_idx + ctx_range + 1)
+        ctx_lines = lines[ctx_start:ctx_end]
+
+        # 3. 计算光标在新文件中的行号
+        # 新文件 = header_lines + [''] + ctx_lines
+        # header占 len(header_lines) 行，空行占1行，ctx偏移 = target_line_idx - ctx_start
+        blank_line_count = 1  # header和ctx之间的空行
+        new_line = len(header_lines) + blank_line_count + (target_line_idx - ctx_start) + 1  # +1因为line是1-based
+        new_column = column  # 列号不变
+
+        # 4. 组合
+        result_lines = header_lines + [''] + ctx_lines
+        new_content = '\n'.join(result_lines)
+
+        # 5. 修正 #include "xxx.h" 路径：临时文件在/tmp下，相对路径找不到头文件
+        # 对相对include（"xxx.h"而非<xxx.h>），改为绝对路径引用原文件所在目录
+        file_dir = os.path.dirname(os.path.abspath(file_path))
+        fixed_header = []
+        include_re = re.compile(r'^(\s*#\s*include\s+")([^"/]+)(")')
+        for hl in header_lines:
+            m = include_re.match(hl)
+            if m:
+                # 相对路径include → 改为引用原文件目录的绝对路径
+                inc_file = m.group(2)
+                abs_inc = os.path.join(file_dir, inc_file)
+                if os.path.isfile(abs_inc):
+                    fixed_header.append(f'{m.group(1)}{abs_inc}{m.group(3)}')
+                else:
+                    fixed_header.append(hl)
+            else:
+                fixed_header.append(hl)
+
+        # 重新组合
+        result_lines = fixed_header + [''] + ctx_lines
+        new_content = '\n'.join(result_lines)
+
+        return new_content, new_line, new_column
+
+    async def _execute_query(self, request):
+        """在常驻LSP客户端上执行查询"""
+        from peng.tools.lsp.language import get_server_type
+        from pathlib import Path
+        from peng.tools.lsp.client import LSPClient
+
+        action = request.get("action", "")
+        file_path = request.get("file_path", "")
+        line = request.get("line", 1)
+        column = request.get("column", 1)
+        content = request.get("content")  # 编辑器传入的内容（可选）
+
+        try:
+            ext = Path(file_path).suffix
+            language = get_server_type(ext)
+            if not language:
+                return {"success": False, "error": f"不支持的文件类型: {ext}"}
+
+            # 获取或创建适配器（LSP客户端保持常驻）
+            adapter = self._adapter_mgr.get_adapter(file_path)
+            if not adapter:
+                return {"success": False, "error": f"无法创建适配器: {language}"}
+
+            if not adapter.has_server():
+                return {"success": False, "error": f"LSP服务器未安装: {language}"}
+
+            # 获取LSP客户端（如果已存在则复用，不会重新启动）
+            client = await adapter.get_client()
+
+            abs_path = str(Path(file_path).resolve())
+            from peng.tools.lsp.client import _path_to_uri
+
+            # ===== 统一文件同步方式（didChange/didOpen） =====
+            # 读取文件内容
+            if content is not None:
+                text = content
+            else:
+                try:
+                    text = Path(file_path).read_text(encoding="utf-8")
+                except Exception:
+                    text = ""
+
+            uri = _path_to_uri(abs_path)
+
+            # 通知文件已打开（如果还没有打开过，或者内容有变化）
+            if text:
+                current_version = self._opened_files.get(abs_path, 0) + 1
+                if abs_path in self._opened_files:
+                    await client.send_notification("textDocument/didChange", {
+                        "textDocument": {"uri": uri, "version": current_version},
+                        "contentChanges": [{"text": text}]
+                    })
+                else:
+                    await client.text_document_did_open(abs_path, adapter.language, text)
+                self._opened_files[abs_path] = current_version
+
+            result = {"success": True, "locations": [], "contents": [], "symbols": [], "items": []}
+
+            if action == "definition":
+                raw = await client.goto_definition(abs_path, line, column)
+                result["locations"] = _parse_locations(raw)
+
+            elif action == "references":
+                raw = await client.find_references(abs_path, line, column)
+                result["locations"] = _parse_locations(raw)
+
+            elif action == "hover":
+                raw = await client.hover(abs_path, line, column)
+                if raw:
+                    contents = raw.get("contents", "") if isinstance(raw, dict) else str(raw)
+                    if isinstance(contents, list):
+                        result["contents"] = [c.get("value", str(c)) if isinstance(c, dict) else str(c) for c in contents]
+                    elif isinstance(contents, dict):
+                        result["contents"] = [contents.get("value", str(contents))]
+                    else:
+                        result["contents"] = [str(contents)]
+
+            elif action == "symbols":
+                raw = await client.document_symbols(abs_path)
+                if raw:
+                    for sym in (raw if isinstance(raw, list) else []):
+                        rng = sym.get("range", {}) or sym.get("location", {}).get("range", {})
+                        s = rng.get("start", {})
+                        result["symbols"].append({
+                            "name": sym.get("name", ""),
+                            "kind": sym.get("kind", 6),
+                            "startLine": s.get("line", 0) + 1,
+                            "startColumn": s.get("character", 0) + 1,
+                        })
+
+            elif action == "completion":
+                # 无content的completion（用磁盘文件）
+                # 有content时，上面已经通过didChange/didOpen同步到原文件，直接在原文件上completion
+                raw = await client.completion(abs_path, line, column)
+                items = raw.get("items", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+                for item in items:
+                    label = item.get("label", "").strip()
+                    result["items"].append({
+                        "label": label,
+                        "kind": item.get("kind", 6),
+                        "detail": item.get("detail", ""),
+                        "insertText": item.get("insertText") or label,
+                    })
+
+            elif action == "implementation":
+                raw = await client.implementation(abs_path, line, column)
+                result["locations"] = _parse_locations(raw)
+
+            return result
+
+        except Exception as e:
+            import traceback as _tb
+            error_msg = str(e)
+            if "超时" in error_msg or "Timeout" in error_msg or "LSP服务器未启动" in error_msg:
+                print(f"[lsp-query] LSP client异常，将重建: {error_msg}", file=sys.stderr)
+                try:
+                    if hasattr(adapter, '_client') and adapter._client:
+                        await adapter._client.close()
+                        adapter._client = None
+                except Exception:
+                    pass
+                self._opened_files.clear()
+            return {"success": False, "error": error_msg, "traceback": _tb.format_exc()}
+
+    async def _completion_with_context(self, client, adapter, abs_path, ext, line, column, content):
+        """
+        用临时上下文文件做completion。
+        每次请求构造精简的临时文件（include + 光标上下文），
+        didOpen给clangd后补全，确保clangd总是看到编辑器最新内容。
+        """
+        import tempfile
+        import os
+        from peng.tools.lsp.client import _path_to_uri
+        from pathlib import Path
+
+        # 构造精简上下文
+        ctx_content, ctx_line, ctx_column = self._build_completion_context(content, line, column, abs_path)
+
+        # 创建临时文件（同后缀，这样clangd能识别语言）
+        tmp_dir = tempfile.gettempdir()
+        tmp_name = f"peng_lsp_{os.getpid()}_{abs_path.replace('/', '_').replace('\\', '_')}{ext}"
+        tmp_path = os.path.join(tmp_dir, tmp_name)
+
+        # 写入临时文件
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            f.write(ctx_content)
+
+        try:
+            tmp_uri = _path_to_uri(tmp_path)
+
+            # 先关闭可能已打开的临时文件
+            if tmp_path in self._opened_files:
+                await client.send_notification("textDocument/didClose", {
+                    "textDocument": {"uri": tmp_uri}
+                })
+                del self._opened_files[tmp_path]
+
+            # didOpen临时文件
+            await client.text_document_did_open(tmp_path, adapter.language, ctx_content)
+            self._opened_files[tmp_path] = 1
+
+            # 在临时文件上做completion
+            raw = await client.completion(tmp_path, ctx_line, ctx_column)
+            items = raw.get("items", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+
+            result = {"success": True, "locations": [], "contents": [], "symbols": [], "items": []}
+            for item in items:
+                label = item.get("label", "").strip()
+                result["items"].append({
+                    "label": label,
+                    "kind": item.get("kind", 6),
+                    "detail": item.get("detail", ""),
+                    "insertText": item.get("insertText") or label,
+                })
+
+            # didClose临时文件（保持daemon干净）
+            await client.send_notification("textDocument/didClose", {
+                "textDocument": {"uri": tmp_uri}
+            })
+            self._opened_files.pop(tmp_path, None)
+
+            return result
+
+        except Exception as e:
+            import traceback as _tb
+            return {"success": False, "error": str(e), "traceback": _tb.format_exc()}
+        finally:
+            # 清理临时文件
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    def shutdown(self):
+        """关闭daemon"""
+        self._running = False
+        if self._server:
+            self._server.close()
+
+    async def cleanup(self):
+        """清理资源"""
+        if self._adapter_mgr:
+            try:
+                await self._adapter_mgr.close_all()
+            except Exception:
+                pass
+
+
+async def _run_with_server(adapter, action, file_path, line, column, stdin_content=None):
+    """通过LSPClient调用真正的LSP服务器"""
+    from pathlib import Path as P
+
+    try:
+        client = await adapter.get_client()
+        abs_path = str(P(file_path).resolve())
+
+        # 确保文件已打开
+        # 优先使用stdin传入的内容（编辑器最新内容），否则读磁盘文件
+        if stdin_content is not None:
+            text = stdin_content
+        else:
+            try:
+                text = P(file_path).read_text(encoding="utf-8")
+            except Exception:
+                text = ""
+        
+        if text:
+            await client.text_document_did_open(abs_path, adapter.language, text)
+
+        result = {"success": True, "locations": [], "contents": [], "symbols": [], "items": []}
+
+        if action == "definition":
+            raw = await client.goto_definition(abs_path, line, column)
+            result["locations"] = _parse_locations(raw)
+
+        elif action == "references":
+            raw = await client.find_references(abs_path, line, column)
+            result["locations"] = _parse_locations(raw)
+
+        elif action == "hover":
+            raw = await client.hover(abs_path, line, column)
+            if raw:
+                contents = raw.get("contents", "") if isinstance(raw, dict) else str(raw)
+                if isinstance(contents, list):
+                    result["contents"] = [c.get("value", str(c)) if isinstance(c, dict) else str(c) for c in contents]
+                elif isinstance(contents, dict):
+                    result["contents"] = [contents.get("value", str(contents))]
+                else:
+                    result["contents"] = [str(contents)]
+
+        elif action == "symbols":
+            raw = await client.document_symbols(abs_path)
+            if raw:
+                for sym in (raw if isinstance(raw, list) else []):
+                    rng = sym.get("range", {}) or sym.get("location", {}).get("range", {})
+                    s = rng.get("start", {})
+                    result["symbols"].append({
+                        "name": sym.get("name", ""),
+                        "kind": sym.get("kind", 6),
+                        "startLine": s.get("line", 0) + 1,
+                        "startColumn": s.get("character", 0) + 1,
+                    })
+
+        elif action == "completion":
+            raw = await client.completion(abs_path, line, column)
+            items = raw.get("items", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+            for item in items:
+                result["items"].append({
+                    "label": item.get("label", ""),
+                    "kind": item.get("kind", 6),
+                    "detail": item.get("detail", ""),
+                    "insertText": item.get("insertText") or item.get("label", ""),
+                })
+
+        elif action == "implementation":
+            raw = await client.implementation(abs_path, line, column)
+            result["locations"] = _parse_locations(raw)
+
+        return result
+
+    except Exception as e:
+        import traceback
+        return {"success": False, "error": str(e), "traceback": traceback.format_exc()}
+
+
+def _parse_locations(raw):
+    """解析LSP Location/LocationLink列表"""
+    locations = []
+    if not raw:
+        return locations
+    items = raw if isinstance(raw, list) else [raw]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        uri = item.get("uri", "") or item.get("targetUri", "")
+        rng = item.get("range", {}) or item.get("targetRange", {})
+        s = rng.get("start", {})
+        e = rng.get("end", {})
+        # 跨平台URI解析：file:///D:/work/... 或 file:///home/...
+        path = uri
+        if path.startswith("file:///"):
+            path = path[8:]  # file:///D:/... -> D:/... (Windows) 或 file:///home/... -> home/... (Linux需修正)
+        elif path.startswith("file://"):
+            path = path[7:]  # file://home/... -> home/...
+        elif path.startswith("file:"):
+            path = path[5:]
+        # Linux路径需要还原前导/
+        if not _is_windows_path(path) and not path.startswith("/"):
+            path = "/" + path
+        # URL解码
+        from urllib.parse import unquote
+        path = unquote(path)
+        locations.append({
+            "path": path,
+            "startLine": s.get("line", 0) + 1,
+            "startColumn": s.get("character", 0) + 1,
+            "endLine": e.get("line", 0) + 1,
+            "endColumn": e.get("character", 0) + 1,
+        })
+    return locations
+
+
+def _is_windows_path(path):
+    """判断是否为Windows路径（如 D:/... 或 D:\\...）"""
+    import re
+    return bool(re.match(r'^[a-zA-Z]:[/\\]', path))
+
+
+def _check_status(file_path, workdir):
+    """检查指定文件的LSP服务器是否可用（不启动LSP进程）"""
+    try:
+        from peng.tools.lsp.language import get_server_type
+        from peng.tools.lsp.manager import AdapterManager
+        from pathlib import Path
+
+        if not file_path:
+            print(json.dumps({"success": True, "available": False, "language": None, "reason": "无文件路径"}))
+            return
+
+        ext = Path(file_path).suffix
+        language = get_server_type(ext)
+        if not language:
+            # TS/JS有Monaco内置支持，不算不可用
+            if ext in ('.ts', '.tsx', '.js', '.jsx'):
+                print(json.dumps({"success": True, "available": True, "language": "builtin", "reason": "Monaco内置支持"}))
+            else:
+                print(json.dumps({"success": True, "available": False, "language": None, "reason": f"不支持的语言: {ext}"}))
+            return
+
+        mgr = AdapterManager(workdir)
+        adapter = mgr.get_adapter(file_path)
+        if not adapter:
+            print(json.dumps({"success": True, "available": False, "language": language, "reason": f"无适配器: {language}"}))
+            return
+
+        if adapter.has_server():
+            print(json.dumps({"success": True, "available": True, "language": language, "reason": ""}))
+        else:
+            print(json.dumps({"success": True, "available": False, "language": language, "reason": f"LSP服务器未安装: {adapter.server_name}"}))
+    except Exception as e:
+        print(json.dumps({"success": True, "available": False, "language": None, "reason": str(e)[:200]}))
+
+
+def _ensure_compile_commands(project_root):
+    """
+    对C/C++项目自动检测compile_commands.json位置。
+    如果项目根目录没有compile_commands.json但build/目录下有，自动创建符号链接。
+    """
+    cc_file = project_root / "compile_commands.json"
+    if cc_file.exists():
+        return  # 已存在，无需处理
+
+    # 检查常见构建目录
+    for build_dir_name in ("build", "cmake-build-debug", "cmake-build-release", "out"):
+        build_cc = project_root / build_dir_name / "compile_commands.json"
+        if build_cc.exists():
+            try:
+                cc_file.symlink_to(build_dir_name + "/compile_commands.json")
+                import sys
+                print(f"[LSP] 已自动创建符号链接: {cc_file} -> {build_dir_name}/compile_commands.json", file=sys.stderr)
+            except Exception as e:
+                import sys
+                print(f"[LSP] 创建compile_commands.json符号链接失败: {e}", file=sys.stderr)
+            return
+
+
+if __name__ == "__main__":
+    main()

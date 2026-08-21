@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""
+提示词管理命令行工具
+
+管理提示词的查询、获取、保存、版本管理、使用统计等功能。
+所有提示词存储在config/prompts.json文件中。
+"""
+
+import argparse
+import logging
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+# 添加项目根目录和src到路径
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+import peng.common.jsonp as json
+from peng.config import get_path
+
+try:
+    from peng.config import PathsConfig
+except ImportError:
+    print("提示: 请确保在项目根目录下运行此脚本")
+    sys.exit(1)
+
+logger = logging.getLogger(__name__)
+PROMPTS_FILE = get_path("prompts_json")
+
+
+def load_prompts() -> dict:
+    """加载prompts.json文件"""
+    try:
+        with open(PROMPTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"prompts": {}, "history": {}}
+    except json.JSONDecodeError as e:
+        logger.error(f"prompts.json格式错误: {e}")
+        sys.exit(1)
+
+
+def save_prompts(data: dict) -> None:
+    """保存prompts.json文件"""
+    with open(PROMPTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def query_prompts(args: argparse.Namespace) -> None:
+    """查询所有提示词（返回名字+摘要表格）"""
+    data = load_prompts()
+    prompts = data.get("prompts", {})
+
+    if not prompts:
+        print("暂无提示词")
+        return
+
+    print("提示词列表（名字+摘要）:")
+    print("-" * 100)
+    print(f"{'名字':<30} {'摘要':<40} {'分类':<15} {'版本':<10}")
+    print("-" * 100)
+
+    for name, prompt_data in prompts.items():
+        summary = prompt_data.get("summary", "")[:40]
+        category = prompt_data.get("category", "")
+        version = prompt_data.get("version", "")
+        print(f"{name:<30} {summary:<40} {category:<15} {version:<10}")
+
+
+def get_prompt(args: argparse.Namespace) -> None:
+    """根据名字获取详细提示词"""
+    data = load_prompts()
+    prompts = data.get("prompts", {})
+
+    if args.name not in prompts:
+        print(f"❌ 提示词'{args.name}'不存在")
+        sys.exit(1)
+
+    prompt_data = prompts[args.name]
+    print(json.dumps(prompt_data, indent=2, ensure_ascii=False))
+
+
+def get_prompt_by_category(args: argparse.Namespace) -> None:
+    """根据分类获取提示词列表"""
+    data = load_prompts()
+    prompts = data.get("prompts", {})
+
+    result = {
+        name: prompt_data
+        for name, prompt_data in prompts.items()
+        if prompt_data.get("category") == args.category
+    }
+
+    if not result:
+        print(f"❌ 分类'{args.category}'下暂无提示词")
+        sys.exit(1)
+
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+def save_prompt(args: argparse.Namespace) -> None:
+    """保存新提示词"""
+    data = load_prompts()
+    prompts = data.get("prompts", {})
+
+    if args.name in prompts:
+        print(f"❌ 提示词'{args.name}'已存在，请使用update-version更新")
+        sys.exit(1)
+
+    # 验证必要字段
+    if not args.summary or not args.content:
+        print("❌ summary和content是必需的参数")
+        sys.exit(1)
+
+    # 解析variables（可选）
+    variables = {}
+    if args.variables:
+        try:
+            variables = json.loads(args.variables)
+        except json.JSONDecodeError:
+            print("❌ variables参数必须是有效的JSON字符串")
+            sys.exit(1)
+
+    # 解析tags（可选）
+    tags = []
+    if args.tags:
+        tags = args.tags.split(",")
+
+    # 构建提示词数据
+    prompt_data = {
+        "name": args.name,
+        "summary": args.summary,
+        "version": "1.0.0",
+        "category": args.category or "custom",
+        "content": args.content,
+        "use_small_model": args.use_small_model,
+        "variables": variables,
+        "tags": tags,
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
+        "usage_count": 0,
+        "success_rate": 1.0,
+        "changelog": "1.0.0: 初始版本",
+    }
+
+    prompts[args.name] = prompt_data
+    save_prompts(data)
+    print(f"✅ 提示词'{args.name}'保存成功")
+
+
+def update_prompt_version(args: argparse.Namespace) -> None:
+    """更新提示词版本"""
+    data = load_prompts()
+    prompts = data.get("prompts", {})
+    history = data.get("history", {})
+
+    if args.name not in prompts:
+        print(f"❌ 提示词'{args.name}'不存在")
+        sys.exit(1)
+
+    prompt_data = prompts[args.name]
+    old_version = prompt_data["version"]
+    old_content = prompt_data["content"]
+
+    # 更新版本号
+    version_parts = old_version.split(".")
+    if len(version_parts) == 3:
+        version_parts[2] = str(int(version_parts[2]) + 1)
+    new_version = ".".join(version_parts)
+
+    # 保存历史版本
+    if args.name not in history:
+        history[args.name] = []
+
+    history[args.name].append(
+        {
+            "version": old_version,
+            "content": old_content,
+            "created_at": prompt_data["updated_at"],
+            "changelog": prompt_data.get("changelog", ""),
+        }
+    )
+
+    # 更新当前版本
+    prompt_data["version"] = new_version
+    prompt_data["content"] = args.content
+    prompt_data["updated_at"] = datetime.now().isoformat()
+    prompt_data["changelog"] = f"{new_version}: {args.changelog}"
+
+    data["history"] = history
+    save_prompts(data)
+    print(f"✅ 提示词'{args.name}'已更新到版本{new_version}")
+
+
+def get_prompt_history(args: argparse.Namespace) -> None:
+    """获取提示词历史版本"""
+    data = load_prompts()
+    history = data.get("history", {})
+
+    if args.name not in history:
+        print(f"❌ 提示词'{args.name}'没有历史版本")
+        sys.exit(1)
+
+    print(json.dumps(history[args.name], indent=2, ensure_ascii=False))
+
+
+def record_prompt_usage(args: argparse.Namespace) -> None:
+    """记录提示词使用情况"""
+    data = load_prompts()
+    prompts = data.get("prompts", {})
+
+    if args.name not in prompts:
+        print(f"❌ 提示词'{args.name}'不存在")
+        sys.exit(1)
+
+    prompt_data = prompts[args.name]
+    usage_count = prompt_data.get("usage_count", 0)
+    success_count = usage_count * prompt_data.get("success_rate", 1.0)
+
+    usage_count += 1
+    if args.success:
+        success_count += 1
+
+    prompt_data["usage_count"] = usage_count
+    prompt_data["success_rate"] = success_count / usage_count
+
+    save_prompts(data)
+    print(f"✅ 提示词'{args.name}'使用情况已更新")
+
+
+def get_prompt_stats(args: argparse.Namespace) -> None:
+    """获取提示词使用统计"""
+    data = load_prompts()
+    prompts = data.get("prompts", {})
+
+    if args.name not in prompts:
+        print(f"❌ 提示词'{args.name}'不存在")
+        sys.exit(1)
+
+    prompt_data = prompts[args.name]
+    stats = {
+        "name": args.name,
+        "usage_count": prompt_data.get("usage_count", 0),
+        "success_rate": prompt_data.get("success_rate", 1.0),
+        "version": prompt_data.get("version", ""),
+        "last_updated": prompt_data.get("updated_at", ""),
+    }
+    print(json.dumps(stats, indent=2, ensure_ascii=False))
+
+
+def list_prompts(args: argparse.Namespace) -> None:
+    """列出所有提示词详细信息"""
+    data = load_prompts()
+    prompts = data.get("prompts", {})
+
+    if not prompts:
+        print("暂无提示词")
+        return
+
+    print(json.dumps(prompts, indent=2, ensure_ascii=False))
+
+
+def remove_prompt(args: argparse.Namespace) -> None:
+    """删除指定名字的提示词"""
+    data = load_prompts()
+    prompts = data.get("prompts", {})
+    history = data.get("history", {})
+
+    if args.name not in prompts:
+        print(f"❌ 提示词'{args.name}'不存在")
+        sys.exit(1)
+
+    # 删除提示词
+    del prompts[args.name]
+
+    # 删除历史记录（如果有）
+    if args.name in history:
+        del history[args.name]
+        print(f"ℹ️  已同时删除提示词'{args.name}'的历史版本")
+
+    data["history"] = history
+    save_prompts(data)
+    print(f"✅ 提示词'{args.name}'已删除")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="提示词管理工具")
+    subparsers = parser.add_subparsers(dest="command", help="子命令")
+
+    # query: 查询所有提示词
+    query_parser = subparsers.add_parser("query", help="查询所有提示词（名字+摘要）")
+
+    # get: 根据名字获取详细提示词
+    get_parser = subparsers.add_parser("get", help="根据名字获取详细提示词")
+    get_parser.add_argument("name", help="提示词名字")
+
+    # get-by-category: 根据分类获取提示词列表
+    get_cat_parser = subparsers.add_parser("get-by-category", help="根据分类获取提示词列表")
+    get_cat_parser.add_argument("category", help="提示词分类")
+
+    # save: 保存新提示词
+    save_parser = subparsers.add_parser("save", help="保存新提示词")
+    save_parser.add_argument("name", help="提示词名字（唯一标识）")
+    save_parser.add_argument("summary", help="提示词摘要（<100字符）")
+    save_parser.add_argument("content", help="提示词内容")
+    save_parser.add_argument("--category", default="custom", help="提示词分类（默认：custom）")
+    save_parser.add_argument("--use-small-model", action="store_true", help="是否使用小模型")
+    save_parser.add_argument("--variables", help="变量定义（JSON字符串）")
+    save_parser.add_argument("--tags", help="标签（逗号分隔）")
+
+    # update-version: 更新提示词版本
+    update_parser = subparsers.add_parser("update-version", help="更新提示词版本")
+    update_parser.add_argument("name", help="提示词名字")
+    update_parser.add_argument("content", help="新提示词内容")
+    update_parser.add_argument("changelog", help="变更说明")
+
+    # history: 获取提示词历史版本
+    history_parser = subparsers.add_parser("history", help="获取提示词历史版本")
+    history_parser.add_argument("name", help="提示词名字")
+
+    # record-usage: 记录提示词使用情况
+    record_parser = subparsers.add_parser("record-usage", help="记录提示词使用情况")
+    record_parser.add_argument("name", help="提示词名字")
+    record_parser.add_argument("--success", action="store_true", help="是否成功")
+
+    # stats: 获取提示词使用统计
+    stats_parser = subparsers.add_parser("stats", help="获取提示词使用统计")
+    stats_parser.add_argument("name", help="提示词名字")
+
+    # list: 列出所有提示词详细信息
+    list_parser = subparsers.add_parser("list", help="列出所有提示词详细信息")
+
+    # remove: 删除指定名字的提示词
+    remove_parser = subparsers.add_parser("remove", help="删除指定名字的提示词")
+    remove_parser.add_argument("name", help="提示词名字")
+
+    args = parser.parse_args()
+
+    # 无论有没有参数或子命令，都先加载数据并存档（确保转换成.jsonp格式）
+    data = load_prompts()
+    save_prompts(data)
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    # 命令映射
+    commands = {
+        "query": query_prompts,
+        "get": get_prompt,
+        "get-by-category": get_prompt_by_category,
+        "save": save_prompt,
+        "update-version": update_prompt_version,
+        "history": get_prompt_history,
+        "record-usage": record_prompt_usage,
+        "stats": get_prompt_stats,
+        "list": list_prompts,
+        "remove": remove_prompt,
+    }
+
+    if args.command in commands:
+        commands[args.command](args)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

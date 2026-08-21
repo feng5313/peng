@@ -1,0 +1,26 @@
+{
+  "type": "postgresql",
+  "echo_sql": false,
+  "log_level": "INFO",
+  "postgresql": {
+    "host": "localhost",
+    "port": 5432,
+    "user": "peng",
+    "password": "peng_password",
+    "database": "peng_db",
+    "pool_size": 30,
+    "max_overflow": 20,
+    "monitor_enabled": true,
+    "monitor_interval": 60,
+    "connect_timeout": 30,
+    "idle_timeout": 300,
+    "wal": {
+      "wal_level": "replica",
+      "fsync": "on",
+      "synchronous_commit": "on",
+      "max_wal_size": "1GB",
+      "min_wal_size": "80MB",
+      "wal_keep_size": "128MB"
+    }
+  }
+}

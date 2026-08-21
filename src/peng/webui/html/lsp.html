@@ -1,0 +1,224 @@
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LSP管理 - Peng</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <style>
+        .lsp-container {
+            padding: 20px;
+        }
+        .lsp-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .lsp-title {
+            font-size: 24px;
+            font-weight: bold;
+        }
+        .lsp-dependencies {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+        }
+        .lsp-dependency-card {
+            background: #1e1e1e;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 15px;
+        }
+        .lsp-dependency-name {
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        .lsp-dependency-status {
+            display: flex;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .lsp-status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        .lsp-status-dot.installed {
+            background: #4caf50;
+        }
+        .lsp-status-dot.not-installed {
+            background: #f44336;
+        }
+        .lsp-dependency-version {
+            color: #888;
+            margin-bottom: 10px;
+        }
+        .lsp-dependency-actions {
+            display: flex;
+            gap: 10px;
+        }
+        .lsp-btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .lsp-btn-primary {
+            background: #2196f3;
+            color: white;
+        }
+        .lsp-btn-secondary {
+            background: #555;
+            color: white;
+        }
+        .lsp-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .lsp-loader {
+            width: 20px;
+            height: 20px;
+            border: 2px solid #fff;
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: lsp-spin 1s linear infinite;
+            display: inline-block;
+        }
+        @keyframes lsp-spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="lsp-container">
+        <div class="lsp-header">
+            <h1 class="lsp-title">LSP语言服务器管理</h1>
+            <button id="refreshBtn" class="lsp-btn lsp-btn-primary">刷新状态</button>
+        </div>
+        <div id="lspDependencies" class="lsp-dependencies">
+            <div style="grid-column: 1/-1; text-align: center; padding: 40px;">
+                <div class="lsp-loader"></div>
+                <p>加载中...</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // LSP管理页面JavaScript
+        const LSPDependencies = document.getElementById('lspDependencies');
+        const refreshBtn = document.getElementById('refreshBtn');
+
+        // 加载LSP依赖项状态
+        async function loadLSPDependencies() {
+            try {
+                const response = await fetch('/api/lsp/dependencies');
+                const data = await response.json();
+
+                if (data.success) {
+                    renderLSPDependencies(data.data);
+                } else {
+                    showError('加载失败: ' + data.message);
+                }
+            } catch (error) {
+                showError('加载失败: ' + error.message);
+            }
+        }
+
+        // 渲染LSP依赖项
+        function renderLSPDependencies(dependencies) {
+            if (Object.keys(dependencies).length === 0) {
+                LSPDependencies.innerHTML = '<p>暂无依赖项数据</p>';
+                return;
+            }
+
+            let html = '';
+            for (const [name, status] of Object.entries(dependencies)) {
+                const installed = status.installed || false;
+                const version = status.version || 'unknown';
+                const statusClass = installed ? 'installed' : 'not-installed';
+                const statusText = installed ? '已安装' : '未安装';
+
+                html += `
+                    <div class="lsp-dependency-card">
+                        <div class="lsp-dependency-name">${name}</div>
+                        <div class="lsp-dependency-status">
+                            <div class="lsp-status-dot ${statusClass}"></div>
+                            <span>${statusText}</span>
+                        </div>
+                        <div class="lsp-dependency-version">版本: ${version}</div>
+                        <div class="lsp-dependency-actions">
+                            <button class="lsp-btn lsp-btn-primary"
+                                    onclick="installDependency('${name}')"
+                                    ${installed ? 'disabled' : ''}>
+                                安装
+                            </button>
+                            <button class="lsp-btn lsp-btn-secondary"
+                                    onclick="checkDependency('${name}')">
+                                检查
+                            </button>
+                        </div>
+                    </div>
+                `;
+            }
+
+            LSPDependencies.innerHTML = html;
+        }
+
+        // 安装依赖项
+        async function installDependency(name) {
+            const btn = event.target;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="lsp-loader"></span> 安装中...';
+
+            try {
+                const response = await fetch(`/api/lsp/install/${name}`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+
+                if (data.success) {
+                    showToast('success', '安装成功', name + ' 已安装');
+                    loadLSPDependencies();
+                } else {
+                    showToast('error', '安装失败', data.message);
+                    btn.disabled = false;
+                    btn.innerHTML = '安装';
+                }
+            } catch (error) {
+                showToast('error', '安装失败', error.message);
+                btn.disabled = false;
+                btn.innerHTML = '安装';
+            }
+        }
+
+        // 检查依赖项
+        async function checkDependency(name) {
+            showToast('info', '检查中', '正在检查 ' + name + '...');
+            loadLSPDependencies();
+        }
+
+        // 显示错误
+        function showError(message) {
+            LSPDependencies.innerHTML = `
+                <div style="grid-column: 1/-1; text-align: center; color: #f44336;">
+                    ${message}
+                </div>
+            `;
+        }
+
+        // 刷新按钮事件
+        refreshBtn.addEventListener('click', () => {
+            showToast('info', '刷新中', '正在刷新LSP状态...');
+            loadLSPDependencies();
+        });
+
+        // 页面加载时自动加载
+        loadLSPDependencies();
+    </script>
+</body>
+</html>

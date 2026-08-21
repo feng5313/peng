@@ -1,0 +1,9 @@
+# 保留各平台脚本的原始行尾
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+*.sh   text eol=lf
+
+# Windows 专用二进制/配置
+*.exe   binary
+*.dll   binary

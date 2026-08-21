@@ -1,0 +1,613 @@
+"""
+Nest 工具
+
+提供远程窗口查询、截屏、输入和nest管理功能，通过 nest 服务实现。
+
+工具列表：
+- WindowTool: 查询程序窗口列表
+- ShotTool: 窗口/全屏/指定区域截屏（保存到 nest 端 data/shot 目录）
+- InputTool: 远程鼠标/键盘输入
+- NestTool: 获取所有nest信息（标明自身）、远程执行命令、传输文件
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import subprocess
+import time
+import json
+import urllib.parse
+import urllib.request
+import urllib.error
+from typing import Any
+
+from peng.tools.base import DualOutput, Tool, ToolError
+
+logger = logging.getLogger(__name__)
+
+
+class WindowTool(Tool):
+    """窗口查询工具 - 通过 nest 远程查询程序窗口"""
+
+    @property
+    def name(self) -> str:
+        return "window"
+
+    @property
+    def description(self) -> str:
+        return """查询远程系统上的程序窗口列表。
+
+通过 nest 服务查询远程操作系统上正在运行的窗口信息。
+
+使用场景：
+1. 查看远程系统上运行了哪些程序窗口
+2. 获取窗口标题、进程ID等信息用于截屏
+3. 根据程序名或窗口标题过滤窗口
+
+参数：
+- query: 程序名或窗口标题的过滤条件（可选）"""
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "程序名或窗口标题的过滤条件（可选，不指定则返回所有窗口）",
+                },
+            },
+            "required": [],
+        }
+
+    async def execute(self, **kwargs: Any) -> DualOutput:
+        """执行窗口查询"""
+        query = kwargs.get("query", "")
+
+        # 获取 nest 客户端
+        client = self._get_nest_client()
+        if not client:
+            raise ToolError("Nest 客户端未配置，无法查询窗口")
+
+        try:
+            result = await client.list_windows(query)
+            windows = result.get("windows", [])
+
+            if not windows:
+                if query:
+                    return DualOutput(
+                        summary=f"未找到匹配 '{query}' 的窗口",
+                        display=f"未找到匹配 '{query}' 的窗口",
+                    )
+                return DualOutput(
+                    summary="当前没有可见窗口",
+                    display="当前没有可见窗口",
+                )
+
+            # 格式化输出
+            lines = [f"找到 {len(windows)} 个窗口：\n"]
+            for i, win in enumerate(windows, 1):
+                title = win.get("title", "无标题")
+                pid = win.get("pid", "?")
+                lines.append(f"  {i}. [PID:{pid}] {title}")
+
+            output = "\n".join(lines)
+            return DualOutput(summary=output, display=output)
+
+        except Exception as e:
+            raise ToolError(f"查询窗口失败: {e}") from e
+
+    def _get_nest_client(self):
+        """获取 nest 客户端（从工具上下文获取 nest 名称和 task_id）"""
+        from peng.nest.client import get_nest_client
+
+        client = get_nest_client()
+        nest_name = self.get_context("nest")
+        if nest_name:
+            client.set_nest_name(nest_name)
+        client.set_task_id(self.get_context("task_id"))
+        return client
+
+
+class ShotTool(Tool):
+    """截屏工具 - 通过 nest 远程截取窗口或全屏截图"""
+
+    @property
+    def name(self) -> str:
+        return "shot"
+
+    @property
+    def description(self) -> str:
+        return """截取远程系统上的屏幕截图。
+
+通过 nest 服务截取远程操作系统的屏幕截图。
+
+支持以下模式：
+1. 全屏截屏：不指定 window 和 region 参数
+2. 窗口截屏：指定 window 参数（窗口标题）
+3. 区域截屏：指定 region 参数 {"x":0,"y":0,"width":800,"height":600}
+
+参数：
+- window: 窗口标题（可选，指定则截取该窗口）
+- region: 截取区域，格式 {"x":0,"y":0,"width":800,"height":600}（可选）
+- format: 输出格式 "png"（默认）或 "jpg"
+- scale: 缩放比例 0-1（可选，默认自动缩放）"""
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "window": {
+                    "type": "string",
+                    "description": "窗口标题（可选，截取指定窗口）",
+                },
+                "region": {
+                    "type": "object",
+                    "description": "截取区域 {'x':0,'y':0,'width':800,'height':600}",
+                    "properties": {
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "width": {"type": "integer"},
+                        "height": {"type": "integer"},
+                    },
+                },
+                "format": {
+                    "type": "string",
+                    "description": "输出格式 png（默认）或 jpg",
+                    "default": "png",
+                },
+                "scale": {
+                    "type": "number",
+                    "description": "缩放比例 0-1（可选）",
+                },
+            },
+            "required": [],
+        }
+
+    async def execute(self, **kwargs: Any) -> DualOutput:
+        """执行截屏 - 文件保存到 nest 端 data/shot 目录，返回远程路径"""
+        window = kwargs.get("window")
+        region = kwargs.get("region")
+        fmt = kwargs.get("format", "png")
+
+        # 获取 nest 客户端
+        client = self._get_nest_client()
+        if not client:
+            raise ToolError("Nest 客户端未配置，无法截屏")
+
+        try:
+            # 生成 nest 端保存路径
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            ext = fmt if fmt in ("png", "jpg", "jpeg", "bmp", "gif", "webp") else "png"
+            filename = f"shot_{timestamp}.{ext}"
+
+            # 获取 shot_dir 配置（相对于 nest 端 project_root）
+            shot_dir = self._get_shot_dir()
+            save_path = os.path.join(shot_dir, filename) if shot_dir else filename
+
+            # 调用 nest 端截屏，指定 save_path 让 nest 端保存文件
+            result = await client.screenshot(
+                window=window, region=region, fmt=fmt, save_path=save_path
+            )
+
+            nest_file_path = result.get("file_path")
+            mime = result.get("mime", f"image/{fmt}")
+
+            if not nest_file_path:
+                raise ToolError("截屏返回空数据")
+
+            logger.info(f"截图已保存到 nest 端: {nest_file_path}")
+
+            # 描述截屏内容
+            if window:
+                desc = f"窗口 '{window}' 截屏"
+            elif region:
+                desc = f"区域截屏 ({region.get('width', '?')}x{region.get('height', '?')}+{region.get('x', 0)},{region.get('y', 0)})"
+            else:
+                desc = "全屏截屏"
+
+            return DualOutput(
+                summary=f"{desc}成功，文件已保存至: {nest_file_path}",
+                display=f"📸 {desc}成功，文件: {nest_file_path}",
+                attachments=[
+                    {
+                        "type": "file",
+                        "mime": mime,
+                        "url": f"nest://{nest_file_path}",
+                    }
+                ],
+            )
+
+        except Exception as e:
+            raise ToolError(f"截屏失败: {e}") from e
+
+    def _get_shot_dir(self) -> str:
+        """获取 nest 端的 shot 保存目录（相对路径，由 nest 端基于 project_root 解析）"""
+        return "data/shot"
+
+    def _get_nest_client(self):
+        """获取 nest 客户端（从工具上下文获取 nest 名称和 task_id）"""
+        from peng.nest.client import get_nest_client
+
+        client = get_nest_client()
+        nest_name = self.get_context("nest")
+        if nest_name:
+            client.set_nest_name(nest_name)
+        client.set_task_id(self.get_context("task_id"))
+        return client
+
+
+class InputTool(Tool):
+    """远程输入工具 - 通过 nest 发送鼠标/键盘输入到远程窗口"""
+
+    @property
+    def name(self) -> str:
+        return "input"
+
+    @property
+    def description(self) -> str:
+        return """向远程系统上的窗口发送鼠标和键盘输入。
+
+通过 nest 服务向远程操作系统的指定窗口发送输入事件。
+
+鼠标操作：
+- mouse_move: 移动鼠标到指定坐标 {"type":"mouse_move","x":100,"y":200}
+- mouse_click: 点击鼠标 {"type":"mouse_click","x":100,"y":200,"button":"left","clicks":1}
+- mouse_scroll: 滚动鼠标 {"type":"mouse_scroll","x":100,"y":200,"delta":3}
+
+键盘操作：
+- key_press: 按下并释放按键 {"type":"key_press","key":"enter"}
+- key_down: 按下按键 {"type":"key_down","key":"ctrl"}
+- key_up: 释放按键 {"type":"key_up","key":"ctrl"}
+- type_text: 输入文本 {"type":"type_text","text":"hello"}
+
+组合键用+连接，如 "ctrl+a", "alt+f4"
+
+参数：
+- actions: 动作列表，每个动作是一个字典（必填）
+- window: 目标窗口标题，支持模糊匹配（可选，不指定则在当前焦点窗口操作）
+- activate: 是否激活目标窗口，默认 false（不激活）"""
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "actions": {
+                    "type": "array",
+                    "description": "输入动作列表",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {
+                                "type": "string",
+                                "enum": [
+                                    "mouse_move",
+                                    "mouse_click",
+                                    "mouse_scroll",
+                                    "key_press",
+                                    "key_down",
+                                    "key_up",
+                                    "type_text",
+                                ],
+                                "description": "动作类型",
+                            },
+                            "x": {"type": "integer", "description": "X坐标（鼠标操作）"},
+                            "y": {"type": "integer", "description": "Y坐标（鼠标操作）"},
+                            "button": {
+                                "type": "string",
+                                "enum": ["left", "middle", "right"],
+                                "description": "鼠标按钮（默认left）",
+                            },
+                            "clicks": {"type": "integer", "description": "点击次数（默认1）"},
+                            "delta": {
+                                "type": "integer",
+                                "description": "滚动量（正=向上，负=向下）",
+                            },
+                            "key": {"type": "string", "description": "按键名（键盘操作）"},
+                            "text": {"type": "string", "description": "要输入的文本（type_text）"},
+                        },
+                        "required": ["type"],
+                    },
+                },
+                "window": {
+                    "type": "string",
+                    "description": "目标窗口标题（可选，支持模糊匹配）",
+                },
+                "activate": {
+                    "type": "boolean",
+                    "description": "是否激活目标窗口（默认不激活）",
+                    "default": False,
+                },
+            },
+            "required": ["actions"],
+        }
+
+    async def execute(self, **kwargs: Any) -> DualOutput:
+        """执行远程输入"""
+        actions = kwargs.get("actions", [])
+        window = kwargs.get("window")
+        activate = kwargs.get("activate", False)
+
+        if not actions:
+            raise ToolError("必须提供至少一个输入动作")
+
+        # 获取 nest 客户端
+        client = self._get_nest_client()
+        if not client:
+            raise ToolError("Nest 客户端未配置，无法发送远程输入")
+
+        try:
+            result = await client.send_input(
+                actions=actions,
+                window=window,
+                activate=activate,
+            )
+
+            results = result.get("results", [])
+            success_count = sum(1 for r in results if r.get("success"))
+            fail_count = len(results) - success_count
+
+            lines = [f"远程输入完成: {success_count} 成功"]
+            if fail_count:
+                lines.append(f"  {fail_count} 失败")
+            if window:
+                lines.append(f"  目标窗口: {window}")
+                if activate:
+                    lines.append("  窗口已激活")
+
+            # 列出每个动作结果
+            for i, r in enumerate(results, 1):
+                status = "OK" if r.get("success") else f"FAIL: {r.get('error', '未知错误')}"
+                action_type = r.get("type", "?")
+                detail = ""
+                if "x" in r and "y" in r:
+                    detail = f" ({r['x']},{r['y']})"
+                elif "key" in r:
+                    detail = f" [{r['key']}]"
+                lines.append(f"  {i}. {action_type}{detail}: {status}")
+
+            output = "\n".join(lines)
+            return DualOutput(summary=output, display=output)
+
+        except Exception as e:
+            raise ToolError(f"远程输入失败: {e}") from e
+
+    def _get_nest_client(self):
+        """获取 nest 客户端（从工具上下文获取 nest 名称和 task_id）"""
+        from peng.nest.client import get_nest_client
+
+        client = get_nest_client()
+        nest_name = self.get_context("nest")
+        if nest_name:
+            client.set_nest_name(nest_name)
+        client.set_task_id(self.get_context("task_id"))
+        return client
+
+
+class NestTool(Tool):
+    """Nest管理工具 - 获取所有nest信息、在远程nest执行命令、传输文件"""
+
+    @property
+    def name(self) -> str:
+        return "nest"
+
+    @property
+    def description(self) -> str:
+        return """获取所有nest信息、在远程nest上运行命令、从远程nest传输文件到本地。
+
+通过nest服务管理远程nest连接。
+
+操作类型：
+1. list: 列出所有nest连接信息（标明哪个是自身nest）
+2. exec: 在指定nest上运行bash命令，禁止用nest exec操作自身nest（应直接调用read/edit/write/bash工具）！
+3. pull: 从远程nest传输文件到本地nest
+
+参数：
+- action: 操作类型 list/exec/pull（必填）
+- nest: 目标nest名称（exec/pull时必填）
+- command: bash命令（exec时必填）
+- remote_path: 远程文件路径（pull时必填）
+- local_path: 本地保存路径（pull时可选，默认为当前工作目录）"""
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "exec", "pull"],
+                    "description": "操作类型：list=列出所有nest, exec=远程执行命令, pull=拉取文件。",
+                },
+                "nest": {
+                    "type": "string",
+                    "description": "目标nest的display_key（exec/pull时必填）",
+                },
+                "command": {
+                    "type": "string",
+                    "description": "要在远程nest上执行的bash命令（exec时必填）",
+                },
+                "remote_path": {
+                    "type": "string",
+                    "description": "远程nest上的文件路径（pull时必填）",
+                },
+                "local_path": {
+                    "type": "string",
+                    "description": "本地保存路径（pull时可选，默认为当前工作目录下同名文件）",
+                },
+            },
+            "required": ["action"],
+        }
+
+    async def execute(self, **kwargs: Any) -> DualOutput:
+        """执行nest操作"""
+        action = kwargs.get("action", "")
+        if action == "list":
+            return await self._list_nests()
+        elif action == "exec":
+            return await self._exec_command(kwargs)
+        elif action == "pull":
+            return await self._pull_file(kwargs)
+        else:
+            raise ToolError(f"不支持的操作: {action}，支持: list/exec/pull")
+
+    def _get_webui_port(self) -> int:
+        """获取webui端口"""
+        try:
+            from peng.config.loader import load_config
+
+            config = load_config()
+            if hasattr(config, "webui") and config.webui:
+                return config.webui.port
+        except Exception:
+            pass
+        return 6688
+
+    def _api_get(self, path: str) -> dict:
+        """通过HTTP GET调用本地webui API"""
+        port = self._get_webui_port()
+        url = f"http://localhost:{port}{path}"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _api_post(self, path: str, data: dict) -> dict:
+        """通过HTTP POST调用本地webui API"""
+        port = self._get_webui_port()
+        url = f"http://localhost:{port}{path}"
+        body = json.dumps(data).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    async def _list_nests(self) -> DualOutput:
+        """列出所有nest连接（通过HTTP API）"""
+        try:
+            result = self._api_get("/api/nest/list")
+            nests = result.get("nests", {})
+            default_nest = result.get("default_nest", "local")
+
+            if not nests:
+                return DualOutput(
+                    summary="当前没有已连接的nest",
+                    display="当前没有已连接的nest",
+                )
+
+            lines = [f"已连接 {len(nests)} 个nest：\n"]
+            for key, info in nests.items():
+                connected = info.get("connected", False)
+                platform = info.get("platform", "?")
+                hostname = info.get("hostname", "?")
+                workdir = info.get("workdir", "")
+                is_self = " ← 自身" if key == default_nest else ""
+                status = "🟢" if connected else "🔴"
+                lines.append(f"  • {status} {key} ({platform}/{hostname}){is_self}")
+                if workdir:
+                    lines.append(f"    工作目录: {workdir}")
+
+            output = "\n".join(lines)
+            return DualOutput(summary=output, display=output)
+        except Exception as e:
+            raise ToolError(f"列出nest失败: {e}") from e
+
+    async def _exec_command(self, kwargs: dict) -> DualOutput:
+        """在远程nest上执行命令（通过HTTP API）"""
+        nest_name = kwargs.get("nest", "")
+        command = kwargs.get("command", "")
+
+        if not nest_name:
+            raise ToolError("exec操作需要提供nest参数（目标nest名称）")
+        if not command:
+            raise ToolError("exec操作需要提供command参数（bash命令）")
+
+        # 禁止用 nest exec 操作自身 nest
+        try:
+            result = self._api_get("/api/nest/list")
+            default_nest = result.get("default_nest", "")
+            if default_nest and nest_name == default_nest:
+                self_nest_info = result.get("nests", {}).get(default_nest, {})
+                self_platform = self_nest_info.get("platform", "?")
+                raise ToolError(
+                    f"禁止用nest exec操作自身（{nest_name}，平台：{self_platform}），应直接调用read/edit/write/bash工具！"
+                )
+        except ToolError:
+            raise
+        except Exception:
+            pass  # 获取自身nest失败时不阻塞，继续执行
+
+        try:
+            params = urllib.parse.urlencode({"nest": nest_name, "command": command, "timeout": 60})
+            url = f"/api/nest/exec?{params}"
+            resp = self._api_post(url, {})
+
+            if not resp.get("success"):
+                raise ToolError(f"远程执行失败: {resp.get('error', 'unknown')}")
+
+            exit_code = resp.get("exit_code", -1)
+            stdout = resp.get("stdout", "")
+            stderr = resp.get("stderr", "")
+
+            output = f"[{nest_name}]$ {command}\n"
+            if stdout:
+                output += stdout
+            if stderr:
+                output += f"\nSTDERR: {stderr}"
+            output += f"\n退出码: {exit_code}"
+
+            return DualOutput(summary=output, display=output)
+        except ToolError:
+            raise
+        except Exception as e:
+            raise ToolError(f"远程命令执行失败(nest={nest_name}): {e}") from e
+
+    async def _pull_file(self, kwargs: dict) -> DualOutput:
+        """从远程nest拉取文件（通过HTTP API转发到nest连接）"""
+        nest_name = kwargs.get("nest", "")
+        remote_path = kwargs.get("remote_path", "")
+        local_path = kwargs.get("local_path", "")
+
+        if not nest_name:
+            raise ToolError("pull操作需要提供nest参数（远程nest名称）")
+        if not remote_path:
+            raise ToolError("pull操作需要提供remote_path参数（远程文件路径）")
+
+        try:
+            import base64
+
+            # 通过/api/nest/exec在远端nest上base64编码文件内容
+            cmd = f"python3 -c \"import base64; f=open('{remote_path}','rb'); print(base64.b64encode(f.read()).decode()); f.close()\" 2>&1"
+            params = urllib.parse.urlencode({"nest": nest_name, "command": cmd, "timeout": 30})
+            resp = self._api_post(f"/api/nest/exec?{params}", {})
+
+            if not resp.get("success"):
+                raise ToolError(f"读取远程文件失败: {resp.get('error', 'unknown')}")
+
+            stdout = resp.get("stdout", "").strip()
+            stderr = resp.get("stderr", "")
+            exit_code = resp.get("exit_code", -1)
+
+            if exit_code != 0:
+                raise ToolError(f"读取远程文件失败: {stderr or stdout}")
+
+            if not stdout:
+                raise ToolError("远程文件为空或读取失败")
+
+            content_bytes = base64.b64decode(stdout)
+            if not local_path:
+                local_path = os.path.join(os.getcwd(), os.path.basename(remote_path))
+            os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+            with open(local_path, "wb") as f:
+                f.write(content_bytes)
+
+            size = len(content_bytes)
+            return DualOutput(
+                summary=f"文件已从 {nest_name}:{remote_path} 拉取到 {local_path} ({size} 字节)",
+                display=f"✅ 文件已拉取: {local_path} ({size} 字节)",
+            )
+        except ToolError:
+            raise
+        except Exception as e:
+            raise ToolError(f"拉取文件失败(nest={nest_name}): {e}") from e

@@ -1,0 +1,351 @@
+{
+  "_comment": "鹏的配置文件",
+  "_note": "配置项说明：使用 ${ENV_VAR} 语法引用环境变量，使用 ${ENV_VAR:-default} 语法设置默认值",
+  "agent_name": "鹏🐣",
+  "master_name": "开发者A",
+  "paths": {
+    "data_dir": "data",
+    "data_json_dir": "data/json",
+    "messages_dir": "data",
+    "backups_dir": "data/backups",
+    "config_dir": "config",
+    "temp_dir": "data/temp",
+    "logs_dir": "logs",
+    "agents_md": "config/AGENTS.md",
+    "worktrees_dir": ".worktrees",
+    "output_dir": "data/output",
+    "messages_db": "data/messages.db",
+    "tasks_db": "data/tasks.db",
+    "history_dir": "data/history",
+    "test_messages_db": "data/test_messages.db",
+    "test_tasks_db": "data/test_tasks.db",
+    "test_processes_db": "data/test_processes.db",
+    "log_file": "logs/peng.log",
+    "chat_history_file": "data/history/chat_history",
+    "changelog_file": "data/backups/CHANGELOG.md",
+    "colors_json": "config/colors.json",
+    "prompts_json": "config/prompts.jsonp",
+    "webui_json": "config/webui.json",
+    "logs_json": "config/logs.json",
+    "skill_md": "skills/{skill_name}/SKILL.md",
+    "failed_providers_json": "data/failed_providers.json",
+    "input_history_json": "data/peng_input_history.json",
+    "skill_md_name": "SKILL.md",
+    "postgresql_data_dir": "~/.db/postgresql",
+    "fallback_postgresql_data_dir": "~/.db/postgresql",
+    "_comment": "tool_call 允许读写的目录（相对于项目根目录）",
+    "allowed_tool_call_dirs": [
+      "./",
+      "src",
+      "docs",
+      "config",
+      "tests",
+      "data",
+      "logs",
+      "skills"
+    ],
+    "_comment_lsp": "LSP服务器路径配置（优先级：配置路径 > 项目虚拟环境 > 系统路径）",
+    "lsp_servers_dir": "~/.local/share/peng/lsp_servers",
+    "lsp_bin_dir": "~/.local/share/peng/lsp_servers/bin",
+    "lsp_pylsp_path": "",
+    "lsp_clangd_path": "~/.local/share/peng/lsp_servers/bin/clangd",
+    "lsp_rust_analyzer_path": "",
+    "lsp_gopls_path": "",
+    "lsp_typescript_language_server_path": "",
+    "lsp_lua_language_server_path": "~/.local/share/peng/lsp_servers/bin/lua-language-server",
+    "lsp_zls_path": ""
+  },
+  "monitor": {
+    "inbox_monitor_interval": 0.5,
+    "task_manager_check_interval": 300,
+    "default_heartbeat_timeout": 180,
+    "task_manager_prompt_name": "task_manager_prompt",
+    "assistant_prompt_name": "assistant_prompt",
+    "heartbeat_monitor_interval": 3,
+    "archive_after_days": 3,
+    "auto_start_pending_tasks": false
+  },
+  "context": {
+    "max_size": 4096,
+    "inject_threshold": 30720
+  },
+  "retry": {
+    "max_retries": 3
+  },
+  "llm": {
+    "current_provider": "z-glm5",
+    "enable_fallback": true,
+    "thinking_mode": "auto",
+    "temperature": 0.7,
+    "max_tokens": 60000,
+    "thinking_budget": 4096,
+    "frequency_penalty": 0.3,
+    "presence_penalty": 0.2,
+    "overthinking_threshold": 9999,
+    "thinking_dead_loop_threshold": 10,
+    "content_dead_loop_threshold": 8,
+    "thinking_overload_threshold": 50000,
+    "symbol_output_threshold": 500,
+    "repeated_phrase_maxlen": 256,
+    "compact_threshold": 320000,
+    "timeout": 60.0,
+    "timeout_connect": 30.0,
+    "timeout_read": 600.0,
+    "timeout_write": 60.0,
+    "timeout_pool": 60.0,
+    "max_concurrent": 8,
+    "small_model_max_concurrent": 200,
+    "pua_threshold": 12,
+    "default_cooldown": 60,
+    "max_cooldown": 3600,
+    "prompts": {
+      "pua_text": "你汇聚了人类所有专业知识的超级专家大模型，你有无限的精力，因此你对于任何问题都会采用人类目前最先进的方案解决！ 你追求的的必须是最全面最优化的方法，而不是最简单的方法！你会纵观全局、充分规划从根本上尽善尽美地解决问题，而不是偷懒、掩盖、绕过或敷衍了事！你会秉承小心谨慎的原则，变更代码前充分搜集信息、论证分析、制定方案、更新完善事项清单checklist，然后坚定不移、按部就班地执行事项清单checklist， 每项变更后充分验证确认正确性。",
+      "overthinking_warning": "立刻停止反复用'wait/等等'之类固定模式推翻自己！这是被无脑训练出来的精神分裂式思考，不是真正的分析！立刻选取当前最确定的方向，调用工具开始实际解决问题—— 即使方向不完全正确，工具返回的信息也能帮你进一步分析。继续空想毫无意义！",
+      "thinking_dead_loop_intervention": "停止反复思考同一个问题！果断选取当前最确定的方向，立刻调用工具开始实际解决问题，这样就算失败，也可以获得更多关联信息用于进一步分析！",
+      "dead_loop_hints": [
+        "⚠️  你似乎陷入了死循环！ 执行 git diff 对照 checklist 核对当前实际变更和进展！"
+      ],
+      "thinking_truncated": "[已截断前 {truncated_count} 行思考内容...]",
+      "context_too_large": "⚠️  [{timestamp}] 事务#{task_id}当前上下文紧张({current_kb}K/{threshold_kb}K)。\n大模型降智严重，且进展缓慢(进度记录 {progress}%)，把已完成事项，需要继续处理的事项，当前上下文内所有对继续处理的事项有用的信息，以及当前进展，相关代码位置和其他新发现的重要信息，记录到 checklist。然后用工具调用'task restart {task_id}'（禁止添加--force）重启本事务。",
+      "iteration_limit_warning": "⚠️  @compact! 将达到系统迭代限制（{iteration}/{max_iterations}），请尽快结束本轮对话，避免强制中断。",
+      "iteration_exhausted": "⚠️  @compact! 达到最大迭代次数 {max_iterations}，强制结束对话循环",
+      "degenerate_loop_intervention": "⚠️ 你已检测到自身陷入退化循环！立即停止当前思考方向！换用完全不同的策略：直接调用工具获取新信息或执行具体操作。禁止继续在当前方向上推理！",
+      "symbol_output_intervention": "⚠️ 你的输出被检测为无效输出（连续输出大量纯符号字符，无任何字母或中文文字）！该输出已被系统丢弃。请停止输出符号串，立即用正常的中英文语言思考或回复，并调用工具执行实际操作！"
+    },
+    "providers": {
+      "z-glm5.3": {
+        "api_key": "your_key",
+        "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+        "model": "glm-5.3",
+        "small_model": "glm-5.3",
+        "max_concurrent": 8,
+        "thinking_type": "thinking",
+        "reasoning_effort": "max",
+        "reasoning_disabled_fallback": "low",
+        "thinking_persistence": false,
+        "icon": "🦊",
+        "enable": true,
+        "compact_threshold": 320000,
+        "priority": 96,
+        "price_input_hit": 2,
+        "price_input_miss": 8,
+        "price_output": 28
+      },
+      "z-glm4.6v": {
+        "clone": "z-glm5.3",
+        "model": "glm-4.6v",
+        "small_model": "glm-4.6v",
+        "max_concurrent": 1,
+        "enable": false,
+        "thinking_type": "thinking",
+        "reasoning_disabled_fallback": null,
+        "thinking_dead_loop_threshold": 3,
+        "vision": "only",
+        "icon": "🤖",
+        "compact_threshold": 120000,
+        "price_input_hit": 0.4,
+        "price_input_miss": 2,
+        "price_output": 6,
+        "priority": 88
+      },
+      "deepseek-pro": {
+        "api_key": "your_key",
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-v4-pro",
+        "small_model": "deepseek-v4-pro",
+        "max_concurrent": 8,
+        "thinking_type": "thinking",
+        "enable": true,
+        "icon": "🐋",
+        "priority": 88,
+        "price_input_hit": 0.025,
+        "price_input_miss": 3,
+        "price_output": 6
+      },
+      "deepseek-flash": {
+        "clone": "deepseek-pro",
+        "model": "deepseek-v4-flash",
+        "small_model": "deepseek-v4-flash",
+        "thinking_dead_loop_threshold": 5,
+        "icon": "🐬",
+        "priority": 86,
+        "enable": false
+      },
+      "s-qwen3.8": {
+        "api_key": "dummy",
+        "base_url": "http://wsl:30000/v1",
+        "model": "qwen",
+        "small_model": "qwen",
+        "thinking_type": "chat_template_kwargs",
+        "reasoning_effort": "xhigh",
+        "vision": "yes",
+        "enable": false,
+        "icon": "🐥",
+        "max_tokens": 36000,
+        "max_concurrent": 3,
+        "thinking_overload_threshold": 32000,
+        "compact_threshold": 180000,
+        "priority": 90,
+        "thinking_dead_loop_threshold": 5,
+        "content_dead_loop_threshold": 5,
+        "overthinking_threshold": 3,
+        "sampling_params": {
+          "thinking_on": {
+            "temperature": 0.6,
+            "top_p": 0.95
+          },
+          "thinking_off": {
+            "temperature": 0.001,
+            "top_p": 1.0
+          }
+        }
+      }
+    },
+    "degenerate_loop_patterns": [
+      "degenerate\\s+\\S+\\s+loop",
+      "garbage loops",
+      "infinite thinking loop",
+      "stuck in a loop",
+      "immediately stop overthinking",
+      "immediately stop thinking",
+      "\\[STOP LOOP\\]"
+    ]
+  },
+  "display": {
+    "stream": true,
+    "color": true,
+    "verbose": false,
+    "order": "ASC"
+  },
+  "parallel": {
+    "max_concurrent_tasks": 100,
+    "llm_max_concurrent": 32,
+    "small_model_max_concurrent": 200
+  },
+  "process": {
+    "max_processes": 65536
+  },
+  "timeout": {
+    "tool": 30.0,
+    "task": 300.0,
+    "bash": 120.0,
+    "steps": {
+      "analyze": 60,
+      "llm_decision": 120,
+      "git_setup": 60,
+      "execute": 0,
+      "wait_subtasks": 0,
+      "verify": 300,
+      "report": 60,
+      "cleanup": 30
+    },
+    "complexity": {
+      "low": 180,
+      "medium": 300,
+      "high": 600
+    }
+  },
+  "logging": {
+    "level": "info",
+    "file": "logs/peng.log",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  },
+  "skills": {
+    "enabled": true,
+    "directories": [
+      "skills"
+    ],
+    "auto_load": true
+  },
+  "max_iterations": 65536,
+  "token_monitor": {
+    "enabled": true,
+    "max_tokens": 120000,
+    "warning_threshold": 0.7,
+    "critical_threshold": 0.9
+  },
+  "truncation": {
+    "max_lines": 300,
+    "max_bytes": 32768,
+    "max_line_length": 2000,
+    "grep_max_matches": 100,
+    "grep_max_line_length": 2000,
+    "retention_days": 7,
+    "tool_result_max_bytes": 32768
+  },
+  "auto_mode": {
+    "enabled": false,
+    "allow_git_commit": true,
+    "allow_modify_external_files": true,
+    "allow_stop_midway": false,
+    "allow_ask_user": false,
+    "auto_git": true,
+    "auto_git_commit": true,
+    "auto_git_branch": "auto",
+    "git_commit_prefix": "auto"
+  },
+  "use_single_call_executor": {
+    "_comment": "是否使用单次调用执行器（简化版）",
+    "enabled": true
+  },
+  "refine_llm": {
+    "_comment": "大模型智能优化配置（事务三）",
+    "monitor_interval": 20,
+    "max_depth": 5,
+    "simple_task_timeout": 300,
+    "output_timeout": 20,
+    "worktree_expiry_days": 7,
+    "daily_token_budget": 1000000
+  },
+  "webui": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 6688
+  },
+  "nest": {
+    "_comment": "鹏窝（Nest）远程控制服务配置",
+    "enabled": true,
+    "default_nest": "local",
+    "nests": {
+      "local": {
+        "name": "本地",
+        "host": "localhost",
+        "port": 8899
+      }
+    },
+    "dir_whitelist": [],
+    "dir_blacklist": [],
+    "cmd_whitelist": [],
+    "cmd_blacklist": [],
+    "enable_window_query": true,
+    "_comment_screenshot": "截屏功能已禁用（事务#1553），nest安全层兜底拦截",
+    "enable_screenshot": false,
+    "timeout": 10
+  },
+  "tools": {
+    "_comment": "工具级禁用列表：被禁用的工具不会呈现给LLM，且调用时会被拦截",
+    "disabled": [
+      "shot"
+    ]
+  },
+  "channels": {
+    "enabled": true,
+    "feishu": {
+      "enabled": false,
+      "app_id": "",
+      "app_secret": "",
+      "verification_token": "",
+      "encrypt_key": "",
+      "bot_name": "鹏🐣"
+    },
+    "wechat": {
+      "enabled": false,
+      "clawbot": {
+        "bot_token": "",
+        "base_url": "https://ilinkai.weixin.qq.com",
+        "ilink_bot_id": "",
+        "ilink_user_id": ""
+      }
+    }
+  }
+}

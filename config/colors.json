@@ -1,0 +1,87 @@
+{
+  "_comment": "鹏的颜色配置 - 所有颜色统一在此文件配置",
+  "_colors_note": "支持的颜色格式: ANSI颜色名(black,red,green,yellow,blue,magenta,cyan,white), 亮色(bright_*), 样式(bold,dim,underline), 别名(gray/grey), RGB格式(rgb:R,G,B), 256色(color256:N), none(不着色)",
+  "models": {
+    "big_model": "white",
+    "small_model": "bright_black"
+  },
+  "ui": {
+    "prompt": "cyan",
+    "agent_name": "cyan",
+    "system": "yellow",
+    "error": "bright_red",
+    "success": "bright_green",
+    "warning": "yellow",
+    "dim": "bright_black",
+    "info": "cyan",
+    "goodbye": "green",
+    "title": "cyan"
+  },
+  "tools": {
+    "tool_call": "bright_magenta",
+    "tool_result": "bright_green",
+    "tool_error": "bright_red",
+    "tool_executing": "bright_magenta"
+  },
+  "agent": {
+    "thinking": "bright_black",
+    "tool_call": "bright_blue",
+    "result": "bright_green"
+  },
+  "bash": {
+    "error": "bright_red",
+    "success": "bright_green",
+    "info": "bright_blue",
+    "reset": "reset"
+  },
+  "web": {
+    "info": "bright_blue",
+    "reset": "reset"
+  },
+  "file": {
+    "error": "bright_red",
+    "success": "bright_green",
+    "warning": "bright_yellow",
+    "info": "bright_blue",
+    "highlight": "bright_cyan",
+    "bold": "bold",
+    "dim": "dim",
+    "reset": "reset"
+  },
+  "message": {
+    "error": "bright_red",
+    "success": "bright_green",
+    "warning": "bright_yellow",
+    "info": "bright_blue",
+    "highlight": "bright_magenta",
+    "title": "bright_cyan",
+    "content": "bright_white",
+    "bold": "bold",
+    "dim": "dim",
+    "reset": "reset",
+    "content_green": "rgb:170,250,170",
+    "content_blue": "rgb:150,150,250",
+    "label_green": "bright_green",
+    "label_blue": "bright_blue",
+    "timestamp": "gray"
+  },
+  "task": {
+    "error": "bright_red",
+    "success": "bright_green",
+    "warning": "bright_yellow",
+    "info": "bright_blue",
+    "highlight": "bright_magenta",
+    "title": "bright_cyan",
+    "content": "bright_white",
+    "bold": "bold",
+    "dim": "dim",
+    "reset": "reset"
+  },
+  "fly": {
+    "error": "red",
+    "success": "green",
+    "warning": "yellow",
+    "info": "blue",
+    "reset": "reset"
+  }
+}

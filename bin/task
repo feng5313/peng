@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""
+鹏的事务管理工具（入口脚本）
+
+用于查询事务树、消息链和事务控制的命令行工具。
+
+连接优先级：
+1. 本地 peng service (localhost:PENG_PORT) → 本地模式直接执行
+2. config/nest.json 中默认 nest 的 host → 通过 WebSocket 远程执行
+
+命令:
+    task --local <COMMAND>        强制本地模式执行
+    task list [OPTIONS]         列出事务
+    task show <ID>              显示事务详情
+    task tree <ID>              显示事务树
+    task msg <ID>               显示消息链
+    task subtask <ID> [CONTENT] 子事务操作（无参数=显示，有内容=创建）
+    task pause <ID>             暂停事务（递归暂停子事务）
+    task cancel <ID>            取消事务（递归取消子事务）
+    task up <ID>                提高优先级（递归提高子事务）
+    task down <ID>              降低优先级（递归降低子事务）
+    task delete <ID>            递归删除事务及其所有子事务
+    task kill <ID>              杀死指定事务的所有后台进程
+    task killall                杀死pid.json中记录的所有后台进程
+    task daemon                 显示所有已注册的后台进程
+    task retry <ID>             重试事务
+    task recover                恢复中断的事务
+    task start <ID>             启动待定事务
+    task status <ID> [状态]     显示或设置事务状态（pending/running/completed/failed）
+    task info <ID> [信息]       事务信息操作（无参数=显示，有内容=添加，-d=清空）
+    task checklist <ID> [内容]  事务检查清单操作（无参数=显示，有内容=设置，-d=清空）
+    task report <ID> [内容]     事务汇报操作（无参数=显示，有内容=设置，-d=清空）
+    task output <ID> [选项]     显示事务输出文件内容（含回滚链接的行尾追加 [↩️R<ID>] 回滚ID标记）
+    task rollback <ID> [回滚ID] 按回滚ID回滚事务到指定快照（--list 列出全部，回滚ID为行尾标记中的数字，如 R12）
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+_SCRIPT_DIR = Path(__file__).resolve().parent.parent
+# 跨平台虚拟环境路径
+_VENV_PYTHON = (
+    _SCRIPT_DIR / ".venv" / "Scripts" / "python.exe"
+    if sys.platform == "win32"
+    else _SCRIPT_DIR / ".venv" / "bin" / "python"
+)
+
+# 提前处理 --no-think 参数：设置环境变量（不再覆盖peng.json中的thinking_mode）
+# 🔧 Task#597: 删除强制写入peng.json的逻辑，让thinking_mode由WebUI/用户控制
+_no_think = "--no-think" in sys.argv or os.environ.get("PENG_NO_THINK") == "1"
+if "--no-think" in sys.argv:
+    sys.argv.remove("--no-think")
+os.environ["PENG_NO_THINK"] = "1" if _no_think else ""
+
+# 添加项目路径并确保依赖已同步
+sys.path.insert(0, str(_SCRIPT_DIR / "src"))
+from peng.common.platform import ensure_uv_sync
+
+ensure_uv_sync(_SCRIPT_DIR)
+
+if _VENV_PYTHON.exists() and sys.executable != str(_VENV_PYTHON):
+    import subprocess
+    result = subprocess.run([str(_VENV_PYTHON), __file__] + sys.argv[1:])
+    sys.exit(result.returncode)
+
+# 提前检测 --local 参数和远程模式
+# --local 需要在数据库初始化之前处理，远程模式不需要本地数据库
+_force_local = "--local" in sys.argv
+_clean_args = [a for a in sys.argv[1:] if a != "--local"]
+
+# 连接优先级：本地服务优先，无本地服务时连接默认 nest 的 host
+# 这里的检测是快速路径，避免加载日志和DB模块的开销
+# _task_impl.main() 内部也有同样的检测作为兜底（console_scripts 入口）
+sys.path.insert(0, str(_SCRIPT_DIR / "src"))
+from peng.cli.remote import is_local_service_running
+
+if _force_local or is_local_service_running():
+    # 本地模式：本地服务运行中 或 强制 --local
+    pass
+else:
+    # 无本地服务，尝试远程模式（连接默认 nest 的 host）
+    from peng.cli.remote import try_remote_mode
+    _remote_result = try_remote_mode("task", _clean_args, force_local=False)
+    if _remote_result is not None:
+        sys.exit(_remote_result)
+    # 远程模式也不可用，尝试本地模式（_task_impl.main 会再次检测）
+    # 不在这里退出，而是让 _task_impl.main 处理
+
+# 以下是本地模式逻辑
+# 初始化日志系统（最早初始化，确保所有日志都能记录）
+from peng.common.logging_config import setup_logging_from_config
+
+setup_logging_from_config()
+
+# 确保PostgreSQL可用（仅检测，不自动部署）
+from peng.db.postgres_auto_deploy import check_postgresql_ready
+
+_ok, _err = check_postgresql_ready()
+if not _ok:
+    print(f"PostgreSQL数据库异常，{_err}，建议尝试重新安装。", file=sys.stderr)
+    sys.exit(1)
+
+# 导入并运行主函数（本地模式）
+from peng.cli._task_impl import main
+
+# 使用去除 --local 的参数
+sys.argv = [sys.argv[0]] + _clean_args
+sys.exit(main())

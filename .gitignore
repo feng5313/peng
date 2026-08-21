@@ -1,0 +1,66 @@
+/dev/null
+# Python
+/'~'
+__pycache__/
+*.pyc
+*.pyo
+*.bak
+*.bak2
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+
+# node_modules
+node_modules
+
+# 数据文件
+data/
+*.db.bak
+
+# 日志
+logs/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 测试
+.coverage*
+coverage.json
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.mypy_cache
+:memory:
+
+# Worktrees
+.worktrees/
+.hive/.worktrees/
+
+# 会话文件
+.peng/sessions/
+
+# 临时文件
+INBOX-ALERT.md
+.installed
+uv.lock
+.claude
+.hive
+.opencode
+MagicMock
+temp/
+tmp/
+nest.json
+test_large_file.py
+
+# Debug scripts
+debug_*.py
+check_config.py
+parse_logs.py
+.peng
+.worktree/

@@ -1,0 +1,36 @@
+{
+  "configurations": {
+    "Launch": {
+      "adapter": "vscode-cpptools",
+      "filetypes": [
+        "cpp",
+        "c",
+        "objc",
+        "rust"
+      ],
+      "configuration": {
+        "request": "launch",
+        "program": "bin/fly",
+        "args": [ 
+        ],
+        "cwd": "/mnt/wsl/work/peng",
+        "environment": [],
+        "stopAtEntry": false,
+        "externalConsole": true,
+        "MIMode": "gdb",
+        "setupCommands": [
+          {
+            "description": "Enable pretty-printing for gdb",
+            "text": "-enable-pretty-printing",
+            "ignoreFailures": true
+          }
+        ]
+      },
+      "breakpoints": {
+        "exception": {
+          "all": "N"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,102 @@
+{
+  "_comment": "鹏的日志配置文件 - 控制各类日志的记录开关",
+  "_note": "所有选项默认为 true，可根据需要关闭以减少日志量。所有日志统一记录到：logs/peng.log",
+  "llm": {
+    "request": {
+      "messages": true,
+      "tools": true,
+      "parameters": true,
+      "full_payload": true
+    },
+    "response": {
+      "content": true,
+      "tool_calls": true,
+      "thinking": true,
+      "metadata": true,
+      "full_response": true
+    },
+    "stream": {
+      "chunks": false,
+      "final_result": false
+    },
+    "error": {
+      "http_errors": true,
+      "parse_errors": true,
+      "timeout_errors": true,
+      "stack_trace": true
+    },
+    "performance": {
+      "latency": true,
+      "token_usage": true,
+      "concurrency_wait": false
+    },
+    "debug": {
+      "headers": false,
+      "response_headers": false,
+      "retries": true
+    }
+  },
+  "task": {
+    "create": true,
+    "status": true,
+    "worktree": true,
+    "child_task": true,
+    "orchestration": true,
+    "git": true
+  },
+  "message": {
+    "inbox": true,
+    "process": true,
+    "chain": true,
+    "context": true,
+    "database": true,
+    "llm_processor": {
+      "tools_loaded": true,
+      "process_attempt": true,
+      "process_success": true,
+      "direct_reply": true,
+      "fallback": true,
+      "error": true,
+      "json_parse": true,
+      "validation": true
+    }
+  },
+  "process": {
+    "create": true,
+    "status": true,
+    "heartbeat": true,
+    "timeout": true,
+    "runtime": true,
+    "callbacks": true
+  },
+  "agent": {
+    "decision": true,
+    "tool_call": true,
+    "result": true,
+    "thinking": true
+  },
+  "session": {
+    "create": true,
+    "pause_resume": true,
+    "cancel": true,
+    "chain_switch": true
+  },
+  "database": {
+    "query": true,
+    "save": true,
+    "recovery": true,
+    "migration": true
+  },
+  "git": {
+    "worktree": true,
+    "branch": true,
+    "commit": true,
+    "ignore": true,
+    "status": true
+  },
+  "debug": {
+    "verbose": false,
+    "trace": false,
+    "profiling": false
+  }
+}

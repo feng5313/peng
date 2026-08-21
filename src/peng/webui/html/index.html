@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ agent_name }} Web UI</title>
+    <link rel="icon" type="image/svg+xml" href="/static/img/favicon.svg">
+    <link rel="stylesheet" href="/static/css/style.css?v={{ cache_v }}">
+    <link rel="stylesheet" href="/static/css/xterm.css?v={{ cache_v }}">
+</head>
+<body class="dark-theme">
+    <!-- 标题栏 -->
+    <header class="header">
+        <div class="header-title">
+            <span class="logo"><img src="/static/img/favicon.svg" alt="logo" style="height:1.8rem;vertical-align:middle;"></span>
+            <h1>{{ agent_name }} - 大鹏一日同风起，扶摇直上九万里！</h1>
+        </div>
+        <!-- 布局选择器 -->
+        <div class="layout-selector" id="layout-selector">
+            <button class="layout-btn active" data-layout="default" title="默认布局">
+                <svg viewBox="0 0 20 20" width="16" height="16" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="1" y="1" width="18" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>
+                    <rect x="1" y="1" width="18" height="4" rx="2" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>
+                    <line x1="1" y1="5" x2="19" y2="5" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>
+                </svg>
+            </button>
+            <button class="layout-btn" data-layout="editor-output-terminal" title="编辑器 / 输出+终端">
+                <svg viewBox="0 0 20 20" width="16" height="16" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="1" y="1" width="18" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>
+                    <line x1="1" y1="10" x2="19" y2="10" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>
+                    <line x1="10" y1="10" x2="10" y2="19" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>
+                </svg>
+            </button>
+            <button class="layout-btn" data-layout="editor-tabbed" title="编辑器 / 输出·终端">
+                <svg viewBox="0 0 20 20" width="16" height="16" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="1" y="1" width="18" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>
+                    <line x1="1" y1="10" x2="19" y2="10" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>
+                    <rect x="1" y="11" width="5" height="3" rx="0" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>
+                    <rect x="6" y="11" width="5" height="3" rx="0" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>
+                </svg>
+            </button>
+            <button class="layout-btn" data-layout="editor-output-terminal-rows" title="编辑器 / 输出 / 终端">
+                <svg viewBox="0 0 20 20" width="16" height="16" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="1" y="1" width="18" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>
+                    <line x1="1" y1="7" x2="19" y2="7" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>
+                    <line x1="1" y1="13" x2="19" y2="13" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>
+                </svg>
+            </button>
+        </div>
+        <div class="header-actions">
+            <button id="fullscreen-toggle" class="btn-icon" title="全屏">
+                ⛶
+            </button>
+            <button id="theme-toggle" class="btn-icon" title="切换主题">
+                🌙
+            </button>
+            <button id="font-toggle" class="btn-icon" title="字体设置">
+                Aa
+            </button>
+        </div>
+    </header>
+
+    <!-- 主内容区 -->
+    <div class="main-container">
+        <!-- 左边栏：消息树 -->
+        <aside class="sidebar sidebar-left" id="sidebar-left">
+            <div class="sidebar-header">
+                <div class="sidebar-title-row">
+                    <h2>📜 消息</h2>
+                    <button id="wechat-config-btn" class="btn-channel-icon" title="微信配置">
+                        <svg class="channel-icon wechat-icon" viewBox="0 0 24 24" width="18" height="18"><path d="M8.691 2.188C3.891 2.188 0 5.476 0 9.53c0 2.212 1.17 4.203 3.002 5.55a.59.59 0 0 1 .213.665l-.39 1.48c-.019.07-.048.141-.048.213 0 .163.13.295.29.295a.326.326 0 0 0 .167-.054l1.903-1.114a.864.864 0 0 1 .717-.098 10.16 10.16 0 0 0 2.837.403c.276 0 .543-.027.811-.05-.857-2.578.157-4.972 1.932-6.446 1.703-1.415 3.882-1.98 5.853-1.838-.576-3.583-4.196-6.348-8.596-6.348zM5.785 5.991c.642 0 1.162.529 1.162 1.18a1.17 1.17 0 0 1-1.162 1.178A1.17 1.17 0 0 1 4.623 7.17c0-.651.52-1.18 1.162-1.18zm5.813 0c.642 0 1.162.529 1.162 1.18a1.17 1.17 0 0 1-1.162 1.178 1.17 1.17 0 0 1-1.162-1.178c0-.651.52-1.18 1.162-1.18zm5.34 2.867c-1.797-.052-3.746.512-5.28 1.786-1.72 1.428-2.687 3.72-1.78 6.22.942 2.453 3.666 4.229 6.884 4.229.826 0 1.622-.12 2.361-.336a.722.722 0 0 1 .598.082l1.584.926a.272.272 0 0 0 .14.047c.134 0 .24-.111.24-.247 0-.06-.023-.12-.038-.177l-.327-1.233a.582.582 0 0 1-.023-.156.49.49 0 0 1 .201-.398C23.024 18.48 24 16.82 24 14.98c0-3.21-2.931-5.837-7.062-6.122zM14.033 13.4c.535 0 .969.44.969.982a.976.976 0 0 1-.969.983.976.976 0 0 1-.969-.983c0-.542.434-.982.97-.982zm4.844 0c.535 0 .969.44.969.982a.976.976 0 0 1-.969.983.976.976 0 0 1-.969-.983c0-.542.434-.982.97-.982z"/></svg>
+                    </button>
+                    <button id="feishu-config-btn" class="btn-channel-icon" title="飞书配置">
+                        <img class="feishu-icon" src="/static/img/feishu-icon-gray.png" width="18" height="18" alt="飞书" data-color-src="/static/img/feishu-icon.png" data-gray-src="/static/img/feishu-icon-gray.png">
+                    </button>
+                </div>
+                <div class="sidebar-header-controls">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="show-archived-toggle">
+                        归档
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="enable-drag-toggle">
+                        拖动
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="show-delete-buttons-toggle">
+                        删除
+                    </label>
+                </div>
+            </div>
+            <div class="search-box">
+                <input type="text" id="message-search" class="search-input" placeholder="关键词过滤...">
+                <button class="search-clear-btn" title="清空">✕</button>
+            </div>
+            <div id="message-tree" class="tree-container">
+                <div class="loading">加载中...</div>
+            </div>
+        </aside>
+        
+        <!-- 左边栏拖拽手柄 -->
+        <div class="resize-handle resize-handle-left" id="resize-left"></div>
+
+        <!-- 中间：主界面 -->
+        <main class="main-content" id="main-content">
+            <!-- ===== 多布局面板区域 ===== -->
+            <!-- 编辑器面板（非默认布局时显示在上方） -->
+            <div id="layout-editor-panel" class="layout-panel layout-editor-panel" style="display:none;">
+                <div id="editor-panel-header" class="panel-header">
+                    <div class="editor-title">
+                        <span class="panel-label">编辑器</span>
+                        <button id="editor-open-file-2" class="editor-file-btn" title="打开文件">📂</button>
+                        <span id="editor-file-path-2" class="editor-file-path"></span>
+                        <span id="editor-cursor-info-2" class="editor-cursor-info"></span>
+                    </div>
+                    <div class="editor-actions">
+                        <button id="editor-fullscreen-btn" class="editor-btn" title="满页面显示">⛶</button>
+                        <button id="editor-split-btn" class="editor-btn" title="分拆编辑器">
+                            <svg viewBox="0 0 20 20" width="16" height="16">
+                                <rect x="1" y="1" width="18" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>
+                                <line x1="10" y1="1" x2="10" y2="19" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>
+                            </svg>
+                        </button>
+                        <button id="editor-restore-tab-btn" class="editor-btn editor-restore-btn" title="最近的文件"><svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="#58a6ff" stroke-width="1.5" stroke-linecap="round"><circle cx="10" cy="10" r="7.5"/><line x1="10" y1="10" x2="10" y2="6"/><line x1="10" y1="10" x2="14" y2="10"/></svg></button>
+                        <button id="editor-save-as-2" class="editor-btn" title="另存为">🗃️</button>
+                        <button id="editor-save-2" class="editor-btn editor-btn-primary" title="保存">💾</button>
+                    </div>
+                </div>
+                <div id="editor-groups-container" class="editor-groups-container">
+                    <!-- 🔧 Task#343：group DOM由JS动态创建（createGroupDom），不再硬编码 -->
+                </div>
+            </div>
+            <!-- 可拖拽分割条 -->
+            <div id="layout-split-handle-1" class="layout-split-handle" style="display:none;"></div>
+            <!-- 输出+终端下方区域（非默认布局） -->
+            <div id="layout-bottom-panel" class="layout-panel layout-bottom-panel" style="display:none;">
+                <!-- 布局2：左右分栏 -->
+                <div id="layout-bottom-left" class="layout-bottom-left" style="display:none;">
+                    <div class="panel-header panel-header-mini">
+                        <span class="panel-label">输出</span>
+                        <span id="output-msg-info-2" class="output-filter-status"></span>
+                        <div class="output-actions" id="output-actions-2">
+                            <button class="btn-icon-sm" id="btn-clear-output-2" title="清空输出">🗑️</button>
+                            <button class="btn-icon-sm" id="btn-copy-output-2" title="查看全部">📄</button>
+                            <button class="btn-icon-sm" id="btn-prev-page-2" title="上一页" disabled>⬆️</button>
+                            <button class="btn-icon-sm" id="btn-next-page-2" title="下一页" disabled>⬇️</button>
+                            <button class="btn-icon-sm" id="btn-scroll-bottom-2" title="回到底部">⏬</button>
+                        </div>
+                    </div>
+                    <div id="layout-output-host-left" class="layout-output-host">
+                        <!-- output-filters + #output will be moved here -->
+                    </div>
+                </div>
+                <div id="layout-bottom-split" class="layout-split-handle-h" style="display:none;"></div>
+                <div id="layout-bottom-right" class="layout-bottom-right" style="display:none;">
+                    <!-- 终端头部去除独立行，标签内显示"终端" -->
+                    <div id="layout-terminal-host-right" class="layout-terminal-host"></div>
+                </div>
+                <!-- 布局3：下方共用标签页 -->
+                <div id="layout-bottom-tabbed" class="layout-bottom-tabbed" style="display:none;">
+                    <div class="panel-header panel-header-mini">
+                        <div class="panel-tabs" id="panel-tabs-bottom">
+                            <button class="panel-tab active" data-panel="output">输出</button>
+                            <button class="panel-tab" data-panel="terminal">终端</button>
+                        </div>
+                        <span id="output-msg-info-3" class="output-filter-status"></span>
+                        <div class="output-actions" id="output-actions-3">
+                            <button class="btn-icon-sm" id="btn-clear-output-3" title="清空输出">🗑️</button>
+                            <button class="btn-icon-sm" id="btn-copy-output-3" title="查看全部">📄</button>
+                            <button class="btn-icon-sm" id="btn-prev-page-3" title="上一页" disabled>⬆️</button>
+                            <button class="btn-icon-sm" id="btn-next-page-3" title="下一页" disabled>⬇️</button>
+                            <button class="btn-icon-sm" id="btn-scroll-bottom-3" title="回到底部">⏬</button>
+                        </div>
+                    </div>
+                    <div id="layout-output-host-tabbed" class="layout-output-host">
+                        <!-- output-filters + #output will be moved here -->
+                    </div>
+                    <div id="layout-terminal-host-tabbed" class="layout-terminal-host" style="display:none;">
+                        <!-- terminal-view will be moved here -->
+                    </div>
+                </div>
+            </div>
+            <!-- 可拖拽分割条（三行布局：输出和终端之间） -->
+            <div id="layout-split-handle-2" class="layout-split-handle" style="display:none;"></div>
+            <!-- 终端面板（三行布局的底部） -->
+            <div id="layout-terminal-panel" class="layout-panel layout-terminal-panel" style="display:none;">
+                <div id="layout-terminal-host-rows" class="layout-terminal-host">
+                    <!-- terminal-view will be moved here -->
+                </div>
+            </div>
+
+            <!-- ===== 默认布局：原有output-container ===== -->
+            <div class="output-container" id="default-output-container">
+             <div class="output-header" id="output-header">
+              <div class="view-tabs" id="view-tabs">
+                       <button class="view-tab active" data-view="output">输出</button>
+                      <button class="view-tab" data-view="terminal">终端</button>
+                      <button class="view-tab" data-view="editor">编辑器</button>
+                  </div>
+                 <!-- 终端视图的头部元素 -->
+                 <div id="output-xterm-header">
+                     <span id="output-msg-info-default" class="output-filter-status">选择话题查看输出</span>
+                     <div class="output-actions" id="output-actions">
+                         <button class="btn-icon-sm" id="btn-clear-output" title="清空输出">🗑️</button>
+                         <button class="btn-icon-sm" id="btn-copy-output" title="查看全部">📄</button>
+                         <button class="btn-icon-sm" id="btn-prev-page" title="上一页" disabled>⬆️</button>
+                         <button class="btn-icon-sm" id="btn-next-page" title="下一页" disabled>⬇️</button>
+                         <button class="btn-icon-sm" id="btn-scroll-bottom" title="回到底部">⏬</button>
+                     </div>
+                  </div>
+                    <!-- 编辑器视图的头部元素（替换终端头部） -->
+                    <div id="editor-header" style="display: none;" class="output-editor-header">
+                       <div class="editor-title">
+                           <button id="editor-open-file" class="editor-file-btn" title="打开文件">📂</button>
+                           <span id="editor-file-path" class="editor-file-path"></span>
+                           <span id="editor-cursor-info" class="editor-cursor-info"></span>
+                       </div>
+                       <div class="editor-actions">
+                           <button id="editor-fullscreen-btn-default" class="editor-btn" title="满页面显示">⛶</button>
+                            <button id="editor-split-btn-default" class="editor-btn" title="分拆编辑器">
+                                <svg viewBox="0 0 20 20" width="16" height="16">
+                                    <rect x="1" y="1" width="18" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>
+                                    <line x1="10" y1="1" x2="10" y2="19" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>
+                                </svg>
+                            </button>
+                            <button id="editor-restore-tab-btn-default" class="editor-btn editor-restore-btn" title="最近的文件"><svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="#58a6ff" stroke-width="1.5" stroke-linecap="round"><circle cx="10" cy="10" r="7.5"/><line x1="10" y1="10" x2="10" y2="6"/><line x1="10" y1="10" x2="14" y2="10"/></svg></button>
+                            <button id="editor-save-as" class="editor-btn" title="另存为">🗃️</button>
+                            <button id="editor-save" class="editor-btn editor-btn-primary" title="保存">💾</button>
+                       </div>
+                  </div>
+              </div>
+                <!-- 输出来源过滤checkbox -->
+                <div class="output-filters" id="output-filters">
+                    <label class="filter-checkbox">
+                        <input type="checkbox" id="filter-thinking" checked data-source="thinking">
+                        <span>思考过程</span>
+                    </label>
+                    <label class="filter-checkbox">
+                        <input type="checkbox" id="filter-bash" checked data-source="bash">
+                        <span>命令输出</span>
+                    </label>
+                    <label class="filter-checkbox">
+                        <input type="checkbox" id="filter-tool_call" checked data-source="tool_call">
+                        <span>工具调用</span>
+                    </label>
+                    <label class="filter-checkbox">
+                        <input type="checkbox" id="filter-tool_result" checked data-source="tool_result">
+                        <span>工具结果</span>
+                    </label>
+                    <label class="filter-checkbox">
+                        <input type="checkbox" id="filter-system" checked data-source="system">
+                        <span>系统消息</span>
+                    </label>
+                    <label class="filter-checkbox">
+                        <input type="checkbox" id="filter-task" checked data-source="task">
+                        <span>事务输出</span>
+                    </label>
+                    <div class="output-keyword-highlight-wrapper">
+                        <div class="output-keyword-input-box">
+                            <input type="text" id="output-keyword-highlight" class="search-input output-keyword-highlight-input" placeholder="搜索...">
+                            <button class="output-highlight-action-btn" id="output-search-btn" title="搜索输出 (Enter)">🔍</button>
+                            <button class="search-clear-btn output-highlight-clear-btn" title="清空">✕</button>
+                        </div>
+                        <span class="output-search-nav" id="output-search-nav" style="display:none;">
+                            <span class="output-search-counter" id="output-search-counter">0/0</span>
+                            <button class="output-search-nav-btn" id="output-search-prev" title="上一个匹配 (Shift+Enter)">↑</button>
+                            <button class="output-search-nav-btn" id="output-search-next" title="下一个匹配 (Enter)">↓</button>
+                        </span>
+                    </div>
+                </div>
+                <div id="output" class="output">
+                </div>
+                <!-- 编辑器视图（默认布局） - 始终使用group结构管理 -->
+                <div id="editor-view" class="editor-view" style="display: none;">
+                    <!-- editor-groups-container会被JS在默认布局下移到这里 -->
+                </div>
+                  <!-- 终端视图（默认布局） -->
+                  <div id="terminal-view" class="terminal-view" style="display: none;">
+                      <div class="terminal-header" id="terminal-header">
+                          <div class="terminal-tabs" id="terminal-tabs"></div>
+                          <div class="terminal-actions">
+                              <button class="btn-icon-sm" id="terminal-fullscreen" title="满页面显示">⛶</button>
+                          </div>
+                      </div>
+                      <div id="terminal-container" class="terminal-container"></div>
+                  </div>
+            </div>
+
+            <!-- 输入栏 -->
+            <div class="input-container">
+                <div class="input-options">
+                    <div class="workdir-wrapper">
+                        <button id="help-btn" class="btn-icon-small" title="帮助"><img src="/static/img/favicon.svg" alt="帮助"></button>
+                        <div class="nest-dropdown" id="nest-dropdown">
+                            <div class="nest-dropdown-selected" id="nest-dropdown-selected" tabindex="0" title="选择鹏窝（Nest）">
+                                <span class="nest-dropdown-icon" id="nest-dropdown-icon">🪹</span>
+                                <span class="nest-dropdown-text" id="nest-dropdown-text">local</span>
+                                <span class="nest-dropdown-arrow"></span>
+                            </div>
+                            <div class="nest-dropdown-list" id="nest-dropdown-list"></div>
+                        </div>
+                        <input type="hidden" id="nest-select" value="local">
+                        <label for="workdir-input" class="workdir-label">工作目录:</label>
+                        <input type="text" id="workdir-input" class="workdir-input" placeholder="/path/to/workdir">
+                        <button id="file-browser-btn" class="btn-icon-small" title="文件浏览器">
+                            📁
+                        </button>
+                    </div>
+                    <button id="attach-btn" class="btn-small" title="上传文档">📂</button>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="thinking-toggle" checked>
+                        思考
+                    </label>
+                    <div class="thinking-budget-wrapper" style="display: none;">
+                        <span class="thinking-budget-label">思维链:</span>
+                        <input type="range" id="thinking-budget-slider" class="thinking-budget-slider"
+                               min="0" max="80000" step="1000" value="56000">
+                        <input type="number" id="thinking-budget" class="thinking-budget-input"
+                               min="0" max="80000" step="1000" value="56000" placeholder="不限">
+                        <span class="thinking-budget-unit"></span>
+                    </div>
+                    <label class="checkbox-label" style="display: none;">
+                        <input type="checkbox" id="search-toggle" checked>
+                        搜索
+                    </label>
+                    <button id="api-provider-btn" class="btn-small" title="大模型接口设置">🤖轮选</button>
+                </div>
+                <div class="input-row">
+                    <button id="new-msg-btn" class="btn-icon" title="开始新消息 (/new)">✨</button>
+                    <div class="message-input-wrapper">
+                        <div id="message-input" class="contenteditable-input" contenteditable="true" data-placeholder="输入新消息..."></div>
+                        <button id="message-clear-btn" class="search-clear-btn message-clear-btn" title="清空输入框">✕</button>
+                    </div>
+                    <div class="input-actions">
+                        <button id="send-btn" class="btn-primary">发送</button>
+                    </div>
+                </div>
+                <!-- 附件列表 -->
+                <div id="file-list" class="file-list"></div>
+            </div>
+        </main>
+
+        <!-- 右边栏拖拽手柄 -->
+        <div class="resize-handle resize-handle-right" id="resize-right"></div>
+        
+        <!-- 右侧栏：事务树 -->
+        <aside class="sidebar sidebar-right" id="sidebar-right">
+            <div class="sidebar-header">
+                <h2>🎋 事务</h2>
+                <div class="sidebar-header-controls">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="enable-task-drag-toggle">
+                        拖动
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="show-task-delete-buttons-toggle">
+                        删除
+                    </label>
+                </div>
+            </div>
+            <div class="search-box">
+                <input type="text" id="task-search" class="search-input" placeholder="关键词过滤...">
+                <button class="search-clear-btn" title="清空">✕</button>
+            </div>
+            <div id="task-tree" class="tree-container">
+                <div class="loading">加载中...</div>
+            </div>
+        </aside>
+    </div>
+
+    <!-- 状态栏 -->
+    <footer class="footer">
+        <div class="status-left">
+            <span id="status-clock" class="status-clock"></span>
+            <span id="status-indicator" class="status-dot running"></span>
+            <span id="status-text">服务运行中</span>
+            <span id="nest-traffic" class="nest-traffic"></span>
+        </div>
+        <div class="status-throughputs" id="status-throughputs">
+        </div>
+        <div class="status-right">
+            <span id="coding-plan-usage" class="coding-plan-badge" style="display:none"></span>
+            <span id="deepseek-usage" class="coding-plan-badge" style="display:none"></span>
+        </div>
+    </footer>
+
+    <!-- Toast通知容器 -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- 文件浏览器模态框 -->
+
+    <!-- 文件浏览器模态框 -->
+    <div id="file-browser-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="file-browser-title">📁 文件浏览器</h2>
+                <button class="btn-icon-sm modal-close" id="file-browser-close" title="关闭">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="file-browser-path">
+                    <input type="text" id="file-browser-current-path" class="file-browser-path-input" value="/" title="点击编辑路径，回车跳转">
+                </div>
+                <div id="file-browser-filename-wrapper" class="file-browser-filename-wrapper" style="display: none;">
+                    <label for="file-browser-filename" class="file-browser-filename-label">文件名:</label>
+                    <input type="text" id="file-browser-filename" class="file-browser-filename-input" placeholder="输入文件名...">
+                </div>
+                <div id="file-browser-newdir-wrapper" class="file-browser-newdir-wrapper" style="display: none;">
+                    <label for="file-browser-newdir-name" class="file-browser-newdir-label">目录名:</label>
+                    <input type="text" id="file-browser-newdir-name" class="file-browser-newdir-input" placeholder="输入目录名...">
+                    <button id="file-browser-newdir-confirm" class="btn-small btn-primary">创建</button>
+                    <button id="file-browser-newdir-cancel" class="btn-small btn-secondary">取消</button>
+                </div>
+                <div id="file-browser-tree" class="file-browser-tree">
+                    <div class="loading">加载中...</div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="file-browser-create-dir" class="btn-secondary">新建目录</button>
+                <button id="file-browser-set-workdir" class="btn-secondary">设为工作目录</button>
+                <button id="file-browser-select" class="btn-primary">打开/选择</button>
+                <button id="file-browser-cancel" class="btn-secondary">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 大模型接口设置模态框 -->
+    <div id="api-provider-modal" class="modal">
+        <div class="modal-content" id="api-provider-modal-content">
+            <div class="modal-header">
+                <h2>🤖 大模型接口设置</h2>
+                <button class="btn-icon-sm modal-close" id="api-provider-close" title="关闭">✕</button>
+            </div>
+            <div class="modal-body">
+                <p style="color: var(--text-secondary); margin-bottom: 12px; font-size: 13px;">
+                    勾选启用大模型接口，调整优先级。
+                </p>
+                <div id="api-provider-list" class="api-provider-list">
+                    <div class="loading">加载中...</div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="api-provider-create-btn" class="btn-primary">新建</button>
+                <button id="api-provider-close-btn" class="btn-secondary">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 新建大模型provider模态框 -->
+    <div id="create-provider-modal" class="modal">
+        <div class="modal-content" style="max-width: 560px;">
+            <div class="modal-header">
+                <h2> ✨ 新建大模型接口</h2>
+                <button class="btn-icon-sm modal-close" id="create-provider-close" title="关闭">✕</button>
+            </div>
+            <div class="modal-body" style="max-height: 65vh; overflow-y: auto;">
+                <div class="create-provider-form">
+                    <div class="form-group">
+                        <label class="form-label">名称 <span style="color:#ff6b6b">*</span></label>
+                        <input type="text" id="cp-name" class="form-input" placeholder="如 my-glm5">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">继承自</label>
+                        <select id="cp-clone" class="form-input">
+                            <option value="">-- 不继承 --</option>
+                        </select>
+                        <span style="font-size:11px; color:var(--text-secondary);">选择后自动填充</span>
+                    </div>
+                    <div class="form-section-title">基本配置</div>
+                    <div class="form-group">
+                        <label class="form-label">图标</label>
+                        <input type="text" id="cp-icon" class="form-input" value="🤖" style="max-width:60px;">
+                        <span id="cp-icon-preview" style="font-size:20px;">🤖</span>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">接口密钥</label>
+                        <input type="password" id="cp-api_key" class="form-input" placeholder="sk-...">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">接口地址</label>
+                        <input type="text" id="cp-base_url" class="form-input" placeholder="https://api.example.com/v1">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">模型 <span style="color:#ff6b6b">*</span></label>
+                        <input type="text" id="cp-model" class="form-input" placeholder="如 glm-5, qwen3-plus">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">轻量模型</label>
+                        <input type="text" id="cp-small_model" class="form-input" placeholder="轻量模型名称">
+                    </div>
+                    <div class="form-section-title">高级配置</div>
+                    <div class="form-group">
+                        <label class="form-label">优先级</label>
+                        <input type="number" id="cp-priority" class="form-input" value="50" min="0" max="99" style="max-width:80px;">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">启用</label>
+                        <input type="checkbox" id="cp-enable" checked>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">推理类型</label>
+                        <select id="cp-thinking_type" class="form-input">
+                            <option value="">自动检测</option>
+                            <option value="thinking">thinking</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">思考模式</label>
+                        <select id="cp-thinking_mode" class="form-input">
+                            <option value="auto">自动</option>
+                            <option value="enabled">开启</option>
+                            <option value="low">开启(轻量)</option>
+                            <option value="medium">开启(中等)</option>
+                            <option value="high">开启(增强)</option>
+                            <option value="xhigh">开启(超强)</option>
+                            <option value="max">开启(深度)</option>
+                            <option value="disabled">关闭</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">最大令牌数</label>
+                        <input type="number" id="cp-max_tokens" class="form-input" placeholder="默认全局配置" style="max-width:120px;">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">压缩阈值</label>
+                        <input type="number" id="cp-compact_threshold" class="form-input" placeholder="上下文压缩阈值" style="max-width:120px;">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">输入费用(命中)</label>
+                        <input type="number" step="any" id="cp-price_input_hit" class="form-input" placeholder="0=全局默认" style="max-width:120px;">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">输入费用(未命中)</label>
+                        <input type="number" step="any" id="cp-price_input_miss" class="form-input" placeholder="0=全局默认" style="max-width:120px;">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">输出费用</label>
+                        <input type="number" step="any" id="cp-price_output" class="form-input" placeholder="0=全局默认" style="max-width:120px;">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">视觉能力</label>
+                        <select id="cp-vision" class="form-input" style="flex: none; width: auto; max-width: none;">
+                            <option value="no" selected>无</option>
+                            <option value="yes">有</option>
+                            <option value="only">仅视觉</option>
+                        </select>
+                    </div>
+                </div>
+                <div id="create-provider-status" style="font-size:13px; margin-top:8px; display:none;"></div>
+            </div>
+            <div class="modal-footer">
+                <button id="create-provider-cancel-btn" class="btn-secondary">取消</button>
+                <button id="create-provider-save-btn" class="btn-primary">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 图片浏览器（无边框浮动窗口，点击外部或Esc关闭） -->
+    <div id="image-viewer-modal" class="image-viewer-modal">
+        <div id="image-viewer-window" class="image-viewer-window">
+            <img id="image-viewer-img" class="image-viewer-img" src="" alt="">
+        </div>
+    </div>
+
+    <!-- 微信配置模态框 -->
+    <div id="wechat-config-modal" class="modal">
+        <div class="modal-content" style="max-width: 440px;">
+            <div class="modal-header">
+                <h2>💚 微信配置</h2>
+                <button class="btn-icon-sm modal-close" id="wechat-config-close" title="关闭">✕</button>
+            </div>
+            <div class="modal-body">
+                <div id="wechat-status" class="channel-status-bar">
+                    <span class="status-dot disconnected" id="wechat-status-dot"></span>
+                    <span id="wechat-status-text">未连接</span>
+                </div>
+                <div class="channel-config-form">
+                    <p style="color:var(--text-secondary); font-size:13px; margin-bottom:12px;">使用微信官方 ClawBot 插件（iLink 协议）接入。</p>
+                    <div style="margin-top:12px;">
+                        <button id="wc-clawbot-login-btn" class="btn-primary" style="width:100%;">扫码登录</button>
+                    </div>
+                    <div id="wechat-qr-section" style="display:none; text-align:center; margin-top:16px;">
+                        <p style="color:var(--text-secondary); font-size:13px; margin-bottom:8px;">请使用微信扫描二维码登录</p>
+                        <div id="wechat-qr-container" style="background:white; padding:12px; border-radius:8px; display:inline-block;">
+                            <img id="wechat-qr-img" src="" alt="QR Code" style="display:none; width:200px; height:200px;">
+                        </div>
+                        <p id="wechat-qr-status" style="color:var(--text-secondary); font-size:12px; margin-top:8px;">等待扫码...</p>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="wechat-config-close-btn" class="btn-secondary">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 飞书配置模态框 -->
+    <div id="feishu-config-modal" class="modal">
+        <div class="modal-content" style="max-width: 480px;">
+            <div class="modal-header">
+                <h2>🔵 飞书配置</h2>
+                <button class="btn-icon-sm modal-close" id="feishu-config-close" title="关闭">✕</button>
+            </div>
+            <div class="modal-body">
+                <div id="feishu-status" class="channel-status-bar">
+                    <span class="status-dot disconnected" id="feishu-status-dot"></span>
+                    <span id="feishu-status-text">未连接</span>
+                </div>
+                <div class="channel-config-form">
+                    <div class="form-group">
+                        <label class="form-label">App ID</label>
+                        <input type="text" id="fs-app-id" class="form-input" placeholder="cli_xxxxxxxxxxxxxxxx">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">App Secret</label>
+                        <input type="password" id="fs-app-secret" class="form-input" placeholder="飞书自建应用密钥">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Encrypt Key（可选）</label>
+                        <input type="text" id="fs-encrypt-key" class="form-input" placeholder="加密密钥">
+                    </div>
+                    <div style="display:flex; gap:8px; margin-top:12px;">
+                        <button id="fs-connect-btn" class="btn-primary" style="flex:1;">连接并保存</button>
+                        <button id="fs-disconnect-btn" class="btn-secondary" style="flex:1; display:none;">断开</button>
+                    </div>
+                    <div id="feishu-help-section" style="margin-top:16px; padding:12px; background:var(--bg-secondary); border-radius:8px;">
+                        <p style="font-size:13px; font-weight:600; margin-bottom:8px;">📖 配置步骤</p>
+                        <ol style="font-size:12px; color:var(--text-secondary); padding-left:16px; line-height:1.8;">
+                            <li>前往 <a href="https://open.feishu.cn" target="_blank" style="color:var(--accent)">飞书开放平台</a> 创建自建应用</li>
+                            <li>在应用能力中开启「机器人」</li>
+                            <li>在事件订阅中选择「使用长连接接收事件」</li>
+                            <li>添加事件：im.message.receive_v1（接收消息）</li>
+                            <li>填写 App ID 和 App Secret</li>
+                            <li>点击「连接并保存」</li>
+                        </ol>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="feishu-config-close-btn" class="btn-secondary">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 第三方库（vendor目录） -->
+    <script src="/static/vendor/xterm.min.js?v=1"></script>
+    <script src="/static/vendor/xterm-addon-fit.min.js?v=202603171331"></script>
+    <script src="/static/vendor/xterm-addon-unicode11.min.js?v=202603231316"></script>
+    <script src="/static/vendor/xterm-addon-serialize.min.js?v=20260409170000"></script>
+    <!-- 应用入口（自动加载modules/下所有模块） -->
+    <script>
+      if (sessionStorage.getItem('__peng_force_reload')) {
+        sessionStorage.removeItem('__peng_force_reload');
+        window.__peng_cache_v = Date.now().toString();
+      }
+    </script>
+    <script src="/static/js/app.js?v={{ cache_v }}"></script>
+</body>
+</html>

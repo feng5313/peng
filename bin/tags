@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""
+bin/tags.py - 为工作目录中的工程代码生成tags文件（不依赖大模型）
+
+利用LSP工具相关代码和正则表达式，在nest远端的data目录生成<workdir>_tags文件，
+包含工作目录中工程代码的变量、函数、类、宏定义、包名、namespace等tag。
+
+用法:
+  tags <workdir> [--output <output_dir>] [-l <lang> ...]
+
+示例:
+  tags /home/user/project
+  tags /home/user/project --output /tmp/tags_output
+  tags /home/user/project -l python -l go
+  tags /home/user/project -l .py -l .rs
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# 设置项目路径
+_SCRIPT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_SCRIPT_DIR / "src"))
+
+# 统一入口
+from peng.tags import main
+
+if __name__ == "__main__":
+    sys.exit(main())

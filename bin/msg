@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""
+鹏的消息系统 - CLI 命令行接口（入口脚本）
+
+master与鹏的通信管道，支持消息状态：未读 → 处理中 → 处理完成
+
+连接优先级：
+1. 本地 peng service (localhost:PENG_PORT) → 本地模式直接执行
+2. config/nest.json 中默认 nest 的 host → 通过 WebSocket 远程执行
+
+子命令结构：
+  msg [全局选项] <子命令> [子命令选项]
+
+  全局选项：
+    --local         强制本地模式执行
+
+  子命令：
+    send         发送消息给鹏（默认子命令）
+    list         列出消息
+    show         显示消息详情
+    reply        回复消息
+    delete       删除消息
+    status       显示消息状态统计或设置消息状态（status <id> [read|processing|done|failed]）
+    clean        清理已完成消息
+    pause        暂停消息关联的事务
+    cancel       取消消息关联的事务
+    restart      重启消息关联的事务
+    resume       恢复消息关联的事务
+    up           提高消息关联的事务优先级
+    down         降低消息关联的事务优先级
+    control      控制消息事务
+    search       搜索消息
+    workdir      消息工作目录操作（无参数=显示，有内容=设置，-d=清空）
+    archive      归档消息（归档后不在 trees 列表中显示）
+    unarchive    取消归档消息
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+# 脚本目录
+_SCRIPT_DIR = Path(__file__).resolve().parent.parent
+# 跨平台虚拟环境路径
+_VENV_PYTHON = (
+    _SCRIPT_DIR / ".venv" / "Scripts" / "python.exe"
+    if sys.platform == "win32"
+    else _SCRIPT_DIR / ".venv" / "bin" / "python"
+)
+
+# 提前处理 --no-think 参数：设置环境变量（不再覆盖peng.json中的thinking_mode）
+# 🔧 Task#597: 删除强制写入peng.json的逻辑，让thinking_mode由WebUI/用户控制
+_no_think = "--no-think" in sys.argv or os.environ.get("PENG_NO_THINK") == "1"
+if "--no-think" in sys.argv:
+    sys.argv.remove("--no-think")
+os.environ["PENG_NO_THINK"] = "1" if _no_think else ""
+
+# 添加项目路径（确保能导入 peng 模块）
+sys.path.insert(0, str(_SCRIPT_DIR / "src"))
+
+# 确保依赖已同步（在检查虚拟环境之前）
+from peng.common.platform import ensure_uv_sync
+
+ensure_uv_sync(_SCRIPT_DIR)
+
+# 只在直接运行时切换虚拟环境
+if __name__ == "__main__" and _VENV_PYTHON.exists() and sys.executable != str(_VENV_PYTHON):
+    import subprocess
+
+    result = subprocess.run([str(_VENV_PYTHON), __file__] + sys.argv[1:])
+    sys.exit(result.returncode)
+
+# 提前检测 --local 参数和远程模式
+# --local 需要在数据库初始化之前处理，远程模式不需要本地数据库
+_force_local = "--local" in sys.argv
+_clean_args = [a for a in sys.argv[1:] if a != "--local"]
+
+# 对于 send/reply 子命令和无子命令模式，自动注入 --nest 和 --workdir
+# 连接优先级：本地服务优先，无本地服务时连接默认 nest 的 host
+_msg_subcommands_needing_defaults = {"send", "reply"}
+_msg_all_subcommands = {
+    "list",
+    "trees",
+    "show",
+    "content",
+    "title",
+    "nest",
+    "workdir",
+    "delete",
+    "status",
+    "pause",
+    "cancel",
+    "restart",
+    "resume",
+    "up",
+    "down",
+    "search",
+    "tree",
+    "full-tree",
+    "context",
+    "move",
+    "archive",
+    "unarchive",
+}
+_first_arg = _clean_args[0] if _clean_args else None
+
+# 无参数时等同于 msg trees 子命令
+if _first_arg is None:
+    _clean_args = ["trees"]
+    _first_arg = "trees"
+
+_needs_defaults = _first_arg in _msg_subcommands_needing_defaults or (
+    _first_arg is not None
+    and not _first_arg.startswith("-")
+    and _first_arg not in _msg_all_subcommands
+)
+
+# 优先检测本地服务
+sys.path.insert(0, str(_SCRIPT_DIR / "src"))
+from peng.cli.remote import is_local_service_running
+
+_local_running = is_local_service_running()
+
+_nest_auto_injected = False
+
+if _needs_defaults:
+    _has_nest = "--nest" in _clean_args or "-n" in _clean_args
+    _has_workdir = "--workdir" in _clean_args or "-w" in _clean_args
+    # --workdir 始终注入（无论远程/本地模式）
+    if not _has_workdir:
+        _clean_args.extend(["--workdir", os.getcwd()])
+    # --nest 根据本地/远程模式决定值
+    if not _has_nest:
+        # 统一的 nest 身份检测：优先 self 字段，fallback 从 instances 推断
+        from peng.cli.remote import get_self_nest_name
+
+        _self_nest = get_self_nest_name()
+        if _self_nest:
+            # 成功识别本机 nest 身份（self 字段或 instances 推断）
+            _clean_args.extend(["--nest", _self_nest])
+            _nest_auto_injected = True
+        elif _force_local or _local_running:
+            # 本地模式但无法识别 nest 身份 → 默认 local
+            _clean_args.extend(["--nest", "local"])
+            _nest_auto_injected = True
+        else:
+            # 无本地服务，检查默认 nest
+            from peng.cli.remote import get_default_nest_name, is_default_nest_local
+
+            _default_nest = get_default_nest_name()
+            if _default_nest and not is_default_nest_local():
+                # 默认 nest 的 host 是远程机器，使用 nest 名称
+                _clean_args.extend(["--nest", _default_nest])
+                _nest_auto_injected = True
+            else:
+                # 无默认 nest，或默认 nest 的 host 是本机 → 用 local
+                _clean_args.extend(["--nest", "local"])
+                _nest_auto_injected = True
+
+if _force_local or _local_running:
+    # 本地模式：本地服务运行中 或 强制 --local
+    pass
+else:
+    # 无本地服务，尝试远程模式（连接默认 nest 的 host）
+    from peng.cli.remote import try_remote_mode
+
+    _remote_result = try_remote_mode("msg", _clean_args, force_local=False)
+    if _remote_result is not None:
+        sys.exit(_remote_result)
+    # 远程模式也不可用
+    # 如果 --nest 是自动注入的非 local 值，改为 local 再试本地
+    if _nest_auto_injected:
+        for _i, _arg in enumerate(_clean_args):
+            if _arg in ("--nest", "-n") and _i + 1 < len(_clean_args):
+                if _clean_args[_i + 1] != "local":
+                    _clean_args[_i + 1] = "local"
+                break
+    if _needs_defaults and not is_local_service_running():
+        print("无本地服务，且无法连接默认nest。", file=sys.stderr)
+        sys.exit(1)
+
+# 以下是本地模式逻辑
+# 初始化日志系统（最早初始化，确保所有日志都能记录）
+from peng.common.logging_config import setup_logging_from_config
+
+setup_logging_from_config()
+
+# 确保PostgreSQL可用（仅检测，不自动部署）
+from peng.db.postgres_auto_deploy import check_postgresql_ready
+
+_ok, _err = check_postgresql_ready()
+if not _ok:
+    print(f"PostgreSQL数据库异常，{_err}，建议尝试重新安装。", file=sys.stderr)
+    sys.exit(1)
+
+# 导入并运行主函数（本地模式）
+from peng.cli._msg_impl import main
+
+# 使用去除 --local 的参数
+sys.argv = [sys.argv[0]] + _clean_args
+sys.exit(main())

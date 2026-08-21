@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""
+鹏测试运行器 - PENG TEST RUNNER
+
+用途：运行一切命令，保证不死等、不忽略报错
+
+特性：
+- 防死等机制
+- 实时监控输出
+- 超时检测
+- 完整的错误捕获
+- 进程管理
+- 日志记录
+
+用法：
+    bin/test <命令> [选项]
+
+示例：
+    bin/test "bin/fly service"
+    bin/test pytest tests/unit/
+    bin.test python -c "print('test')"
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import signal
+import time
+from pathlib import Path
+from typing import List, Optional, Set
+import threading
+import json
+
+
+# 白名单文件路径
+WHITELIST_FILE = Path(__file__).parent.parent / "tests" / "services.json"
+
+
+def load_whitelist() -> Set[str]:
+    """加载白名单"""
+    try:
+        if WHITELIST_FILE.exists():
+            with open(WHITELIST_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return set(data.get('services', []))
+    except Exception as e:
+        print(f"⚠️  加载白名单失败: {e}")
+    return set()
+
+
+def save_whitelist(services: Set[str]):
+    """保存白名单"""
+    try:
+        # 确保目录存在
+        WHITELIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        # 读取现有数据（保留description和version）
+        existing_data = {}
+        if WHITELIST_FILE.exists():
+            with open(WHITELIST_FILE, 'r', encoding='utf-8') as f:
+                existing_data = json.load(f)
+
+        # 更新services
+        existing_data['services'] = sorted(list(services))
+        if 'description' not in existing_data:
+            existing_data['description'] = "白名单：允许长时间无输出的后台服务命令"
+        if 'version' not in existing_data:
+            existing_data['version'] = "1.0"
+
+        # 写入文件
+        with open(WHITELIST_FILE, 'w', encoding='utf-8') as f:
+            json.dump(existing_data, f, indent=2, ensure_ascii=False)
+
+        print(f"✅ 白名单已更新: {WHITELIST_FILE}")
+    except Exception as e:
+        print(f"❌ 保存白名单失败: {e}")
+
+
+def add_to_whitelist(command: str):
+    """添加命令到白名单"""
+    whitelist = load_whitelist()
+    if command not in whitelist:
+        whitelist.add(command)
+        save_whitelist(whitelist)
+        print(f"✅ 命令已添加到白名单: {command}")
+        return True
+    return False
+
+
+class TestRunner:
+    """测试运行器 - 防死等、不忽略报错"""
+
+    def __init__(self, command: str, timeout: int = 120, silence_timeout: int = 20, error_timeout: int = 10, allow_silence: bool = False, whitelist: Set[str] = None):
+        """
+        初始化测试运行器
+
+        Args:
+            command: 要运行的命令
+            timeout: 总超时时间（秒）
+            silence_timeout: 静默超时时间（秒），无输出则退出，默认20秒
+            error_timeout: 检测到错误后的退出时间（秒），默认10秒
+            allow_silence: 是否允许静默（用于后台服务），默认False
+            whitelist: 白名单集合（允许静默的命令）
+        """
+        self.command = command
+        self.timeout = timeout
+        self.silence_timeout = silence_timeout
+        self.error_timeout = error_timeout
+        self.allow_silence = allow_silence
+        self.whitelist = whitelist or set()
+        self.process: Optional[subprocess.Popen] = None
+        self.output_file = Path("/tmp/test-output.log")
+        self.pid_file = Path("/tmp/test.pid")
+        self.is_running = False
+        self.current_line: List[str] = []  # 当前行字符列表
+        self.output_lines: List[str] = []  # 完整输出行列表
+        self.error_detected = False
+        self.error_messages: List[str] = []
+        self.first_error_time: Optional[float] = None
+        self.last_output_time: Optional[float] = None
+        self.should_exit_on_error = False
+        self.should_exit_on_silence = False
+
+    def _monitor_output(self):
+        """监控进程输出"""
+        if not self.process:
+            return
+
+        # 初始化最后输出时间为启动时间
+        self.last_output_time = time.time()
+
+        try:
+            # 实时读取输出（逐字符读取，不等待行）
+            while self.is_running and self.process.poll() is None:
+                try:
+                    char = self.process.stdout.read(1)
+                    if not char:
+                        break
+
+                    char_str = char.decode('utf-8', errors='ignore')
+
+                    # 更新最后输出时间
+                    self.last_output_time = time.time()
+
+                    # 写入输出文件
+                    with open(self.output_file, 'a') as f:
+                        f.write(char_str)
+
+                    # 构建行并检测错误
+                    if char_str == '\n':
+                        # 遇到换行符，检测当前行
+                        if self.current_line:
+                            line_str = ''.join(self.current_line)
+                            self.output_lines.append(line_str)
+                            self._detect_errors(line_str)
+                            self.current_line = []
+                    elif char_str == '\r':
+                        # 遇到回车符，清空当前行
+                        if self.current_line:
+                            self.current_line = []
+                    else:
+                        # 添加到当前行
+                        self.current_line.append(char_str)
+
+                except Exception as e:
+                    print(f"❌ 监控输出异常: {e}", file=sys.stderr)
+                    time.sleep(0.1)
+
+        except Exception as e:
+            print(f"❌ 监控线程异常: {e}", file=sys.stderr)
+
+    def _detect_errors(self, line: str):
+        """检测错误信息"""
+        error_keywords = [
+            'error', 'exception', 'traceback', 'failed', 'failure',
+            '❌', '错误', '异常', '失败',
+            'ValueError', 'TypeError', 'AttributeError',
+            'KeyError', 'IndexError', 'RuntimeError',
+            'OSError', 'IOError', 'AssertionError'
+        ]
+
+        line_lower = line.lower()
+        for keyword in error_keywords:
+            if keyword.lower() in line_lower:
+                if not self.error_detected:
+                    # 第一次检测到错误，记录时间戳
+                    self.error_detected = True
+                    self.first_error_time = time.time()
+                    print(f"🔍 首次检测到错误: {line}")
+                    print(f"⏱️  将在 {self.error_timeout} 秒内退出...")
+                self.error_messages.append(line)
+                break
+
+    def _run_command(self):
+        """运行命令（后台执行）"""
+        print(f"🚀 执行命令: {self.command}")
+        print(f"📝 输出文件: {self.output_file}")
+        print(f"📝 PID文件: {self.pid_file}")
+        print(f"⏱️  超时时间: {self.timeout}秒")
+        print("")
+
+        # 清空输出文件
+        if self.output_file.exists():
+            self.output_file.unlink()
+
+        # 后台运行命令
+        try:
+            self.process = subprocess.Popen(
+                self.command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=False
+            )
+
+            # 记录PID
+            with open(self.pid_file, 'w') as f:
+                f.write(str(self.process.pid))
+
+            print(f"✅ 进程已启动，PID: {self.process.pid}")
+            print(f"✅ 使用 'kill -9 {self.process.pid}' 终止进程")
+            print(f"✅ 输出实时监控中...")
+            print("")
+
+        except Exception as e:
+            print(f"❌ 启动进程失败: {e}", file=sys.stderr)
+            print(f"❌ 异常详情: {type(e).__name__}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            return False
+
+        return True
+
+    def _monitor_process(self):
+        """监控进程状态"""
+        self.is_running = True
+
+        # 启动输出监控线程
+        monitor_thread = threading.Thread(target=self._monitor_output, daemon=True)
+        monitor_thread.start()
+
+        # 高频监控循环（检查间隔1秒）
+        start_time = time.time()
+        last_progress_time = start_time
+
+        while self.is_running:
+            current_time = time.time()
+            elapsed = current_time - start_time
+
+            # 检查是否超时
+            if elapsed >= self.timeout:
+                break
+
+            # 检查进程是否结束
+            if self.process.poll() is not None:
+                print(f"\n📊 进程已结束，退出码: {self.process.returncode}")
+                self.is_running = False
+                break
+
+            # 高频检查1：静默超时检测（20秒无输出则退出，除非允许静默）
+            if not self.allow_silence and self.last_output_time is not None:
+                elapsed_since_output = current_time - self.last_output_time
+                if elapsed_since_output >= self.silence_timeout:
+                    print(f"\n❌ 无输出已超过 {self.silence_timeout} 秒，强制退出！")
+                    print(f"⏱️  最后输出时间: {elapsed_since_output:.2f} 秒前")
+                    self.should_exit_on_silence = True
+                    self.is_running = False
+                    break
+
+            # 高频检查2：检测到错误后10秒内必须退出
+            if self.error_detected and self.first_error_time is not None:
+                elapsed_since_error = current_time - self.first_error_time
+                if elapsed_since_error >= self.error_timeout:
+                    print(f"\n❌ 检测到错误已超过 {self.error_timeout} 秒，强制退出！")
+                    print(f"⏱️  错误检测时间: {elapsed_since_error:.2f} 秒")
+                    self.should_exit_on_error = True
+                    self.is_running = False
+                    break
+
+            # 每5秒输出进度
+            if current_time - last_progress_time >= 5:
+                print(f"\n⏱️  已运行 {int(elapsed)} 秒...")
+                self._show_recent_output()
+                last_progress_time = current_time
+
+            # 检查间隔1秒，确保及时响应
+            time.sleep(1)
+
+        # 超时/错误/静默检查
+        if self.is_running:
+            if self.should_exit_on_error:
+                print(f"\n⚠️  因检测到错误而终止！")
+                print(f"🔪 正在终止进程 (PID: {self.process.pid})...")
+            elif self.should_exit_on_silence:
+                print(f"\n⚠️  因长时间无输出而终止！")
+                print(f"🔪 正在终止进程 (PID: {self.process.pid})...")
+            else:
+                print(f"\n⚠️  超时！已运行 {self.timeout} 秒")
+                print(f"🔪 正在终止进程 (PID: {self.process.pid})...")
+
+            try:
+                self.process.kill()
+                self.process.wait(timeout=5)
+                print(f"✅ 进程已终止")
+            except subprocess.TimeoutExpired:
+                print(f"❌ 进程终止超时，强制杀死...")
+                try:
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                    print(f"✅ 进程组已强制杀死")
+                except Exception as e:
+                    print(f"❌ 强制杀死失败: {e}")
+
+            self.is_running = False
+
+        # 清理PID文件
+        if self.pid_file.exists():
+            self.pid_file.unlink()
+
+    def _show_recent_output(self, lines: int = 10):
+        """显示最近的输出"""
+        if len(self.output_lines) > 0:
+            recent_lines = self.output_lines[-lines:]
+            print("📋 最近输出:")
+            for line in recent_lines:
+                print(f"   {line}")
+            print("")
+
+    def _analyze_results(self):
+        """分析执行结果"""
+        print("\n" + "=" * 70)
+        print("📊 执行结果分析")
+        print("=" * 70 + "\n")
+
+        # 检查退出码
+        if self.process.returncode is None:
+            print("❌ 进程状态未知")
+        elif self.process.returncode == 0:
+            print("✅ 进程正常退出")
+        else:
+            print(f"❌ 进程异常退出，退出码: {self.process.returncode}")
+
+        # 检查错误
+        if self.error_detected:
+            print(f"\n❌ 检测到 {len(self.error_messages)} 个错误:")
+            for i, error_msg in enumerate(self.error_messages[-10:], 1):
+                print(f"  {i}. {error_msg}")
+        else:
+            print(f"\n✅ 未检测到明显错误")
+
+        # 显示输出文件路径
+        print(f"\n📝 完整输出: {self.output_file}")
+        print(f"📝 使用 'tail -100 {self.output_file}' 查看详细输出")
+
+    def run(self) -> int:
+        """运行命令并监控"""
+        # 运行命令
+        if not self._run_command():
+            return 1
+
+        # 监控进程
+        self._monitor_process()
+
+        # 分析结果
+        self._analyze_results()
+
+        # 返回退出码
+        if self.process.returncode is None:
+            return 1
+        elif self.process.returncode != 0:
+            return self.process.returncode
+        elif self.error_detected:
+            return 1
+        else:
+            return 0
+
+
+def main():
+    """主函数"""
+    parser = argparse.ArgumentParser(
+        description="鹏测试运行器 - 防死等、不忽略报错",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  bin/test "bin/fly service"                    运行后台服务（自动允许静默）
+  bin/test pytest tests/unit/                    运行pytest测试
+  bin/test "python -c print('test')"            运行Python代码
+  bin/test "sleep 60" --timeout 30             运行sleep 60秒，超时30秒
+  bin/test "pytest tests/" --error-timeout 5   检测到错误后5秒内退出
+  bin/test "long_cmd" --allow-silence          显式允许长时间无输出（自动加入白名单）
+
+ 特性:
+   - 防死等机制（超时自动终止）
+   - 实时监控输出
+   - 自动检测错误（检测到错误后10秒内退出）
+   - 静默超时检测（20秒无输出则退出）
+   - 白名单机制（tests/services.json，后台服务自动允许静默）
+   - 自动白名单（使用--allow-silence自动添加到白名单）
+   - 完整的错误捕获
+   - 进程管理（记录PID、支持kill）
+   - 日志记录
+        """
+    )
+
+    parser.add_argument(
+        "command",
+        help="要运行的命令"
+    )
+
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=120,
+        help="总超时时间（秒），默认120秒"
+    )
+
+    parser.add_argument(
+        "--silence-timeout",
+        type=int,
+        default=20,
+        help="静默超时时间（秒），无输出则退出，默认20秒"
+    )
+
+    parser.add_argument(
+        "--error-timeout",
+        type=int,
+        default=10,
+        help="检测到错误后的退出时间（秒），默认10秒"
+    )
+
+    parser.add_argument(
+        "--allow-silence",
+        action="store_true",
+        help="允许静默（用于后台服务，自动添加到tests/services.json白名单）"
+    )
+
+    parser.add_argument(
+        "--show-output",
+        action="store_true",
+        help="运行结束后显示完整输出"
+    )
+
+    args = parser.parse_args()
+
+    # 加载白名单
+    whitelist = load_whitelist()
+
+    # 检查命令是否在白名单中（查找白名单token序列是否在命令token序列中）
+    def matches_whitelist(command: str, whitelist_item: str) -> bool:
+        """检查命令是否匹配白名单项
+
+        匹配规则：白名单的token序列必须作为子序列出现在命令中
+        例如：
+        - "uv run bin/fly service" 匹配 "bin/fly service"
+        - "python bin/fly service" 匹配 "bin/fly service"
+        - "nohup bin/fly service" 匹配 "bin/fly service"
+        - "bin/fly service --force" 匹配 "bin/fly service"
+        """
+        # 去除首尾空格，分割成token
+        cmd_tokens = command.strip().split()
+        whitelist_tokens = whitelist_item.strip().split()
+
+        # 如果白名单项token数量多于命令token数量，不匹配
+        if len(whitelist_tokens) > len(cmd_tokens):
+            return False
+
+        # 在命令token中查找白名单token序列（子序列匹配）
+        for i in range(len(cmd_tokens) - len(whitelist_tokens) + 1):
+            # 检查从位置i开始的token是否与白名单完全匹配
+            match = True
+            for j in range(len(whitelist_tokens)):
+                if cmd_tokens[i + j] != whitelist_tokens[j]:
+                    match = False
+                    break
+            if match:
+                return True
+
+        return False
+
+    in_whitelist = False
+    matched_whitelist_item = None
+    for whitelist_item in whitelist:
+        if matches_whitelist(args.command, whitelist_item):
+            in_whitelist = True
+            matched_whitelist_item = whitelist_item
+            break
+
+    # 允许静默：显式指定 或 在白名单中
+    allow_silence = args.allow_silence or in_whitelist
+
+    if allow_silence:
+        print("🔇 已启用静默模式（允许长时间无输出）")
+        if in_whitelist:
+            print(f"   命令在白名单中（匹配: {matched_whitelist_item}），自动允许静默")
+        else:
+            print("   用户显式指定允许静默，将添加到白名单")
+            # 显式指定--allow-silence，自动添加到白名单
+            add_to_whitelist(args.command)
+        print("")
+
+    # 创建测试运行器
+    runner = TestRunner(
+        command=args.command,
+        timeout=args.timeout,
+        silence_timeout=args.silence_timeout,
+        error_timeout=args.error_timeout,
+        allow_silence=allow_silence,
+        whitelist=whitelist
+    )
+
+    # 运行命令
+    return_code = runner.run()
+
+    # 显示完整输出
+    if args.show_output and runner.output_file.exists():
+        print("\n" + "=" * 70)
+        print("📝 完整输出")
+        print("=" * 70 + "\n")
+        with open(runner.output_file, 'r') as f:
+            print(f.read())
+
+    # 退出
+    sys.exit(return_code)
+
+
+if __name__ == "__main__":
+    main()

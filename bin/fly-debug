@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""
+fly 调试脚本 - 带超时和死循环检测
+
+功能:
+- 异步运行 bin/fly 命令，超时 3 分钟自动终止
+- 实时监控 stdout/stderr 输出并原样输出
+- 60 秒无 stdout 输出自动杀进程（检测死循环/卡住）
+- 捕获异常和错误并退出
+
+用法:
+    ./fly_debug.py [传递给 fly 的参数...]
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+import traceback
+from pathlib import Path
+
+# 超时配置（秒）
+CMD_TIMEOUT = 3 * 60      # 命令总超时：3 分钟
+OUTPUT_TIMEOUT = 60       # 输出超时：60 秒无输出则杀进程
+
+
+async def run_fly_with_watchdog(args: list[str]) -> int:
+    """异步运行 fly 命令，带看门狗监控"""
+
+    # 获取 bin/fly 脚本路径
+    script_dir = Path(__file__).resolve().parent
+    fly_script = script_dir / "fly"
+
+    # 构建命令
+    cmd = [sys.executable, str(fly_script)] + args
+    env = os.environ.copy()
+
+    print(f"[fly_debug] 启动命令：{' '.join(cmd)}", flush=True)
+    print(f"[fly_debug] 总超时：{CMD_TIMEOUT}秒，输出超时：{OUTPUT_TIMEOUT}秒", flush=True)
+    print("-" * 60, flush=True)
+
+    # 启动子进程
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+
+    last_output_time = asyncio.get_event_loop().time()
+    killed = False
+
+    async def watch_output(stream, prefix: str):
+        """监控并输出流内容"""
+        nonlocal last_output_time, killed
+
+        try:
+            while True:
+                if process.returncode is not None:
+                    break
+
+                line = await stream.readline()
+                if not line:
+                    break
+
+                # 原样输出
+                decoded = line.decode('utf-8', errors='replace')
+                print(f"{prefix}{decoded}", end='', flush=True)
+
+                # 更新最后输出时间
+                last_output_time = asyncio.get_event_loop().time()
+
+        except asyncio.CancelledError:
+            pass
+
+    async def timeout_watcher():
+        """超时监控"""
+        nonlocal killed
+
+        start_time = asyncio.get_event_loop().time()
+
+        while True:
+            await asyncio.sleep(1)
+
+            current_time = asyncio.get_event_loop().time()
+            elapsed = current_time - start_time
+            since_output = current_time - last_output_time
+
+            # 检查总超时
+            if elapsed >= CMD_TIMEOUT:
+                print(f"\n[fly_debug] ❌ 总超时 ({CMD_TIMEOUT}秒)，终止进程...", flush=True)
+                killed = True
+                process.kill()
+                return
+
+            # 检查输出超时（只在进程运行时检查）
+            if process.returncode is None and since_output >= OUTPUT_TIMEOUT:
+                print(f"\n[fly_debug] ❌ {OUTPUT_TIMEOUT}秒无输出，检测到死循环/卡住，终止进程...", flush=True)
+                killed = True
+                process.kill()
+                return
+
+            # 进程已结束
+            if process.returncode is not None:
+                return
+
+    # 创建监控事务
+    stdout_task = asyncio.create_task(watch_output(process.stdout, ""))
+    stderr_task = asyncio.create_task(watch_output(process.stderr, "[stderr] "))
+    watchdog_task = asyncio.create_task(timeout_watcher())
+
+    try:
+        # 等待进程结束
+        await process.wait()
+
+        # 取消监控事务
+        stdout_task.cancel()
+        stderr_task.cancel()
+        watchdog_task.cancel()
+
+        # 等待事务清理
+        await asyncio.gather(stdout_task, stderr_task, watchdog_task, return_exceptions=True)
+
+    except asyncio.CancelledError:
+        killed = True
+        process.kill()
+        await process.wait()
+
+    # 输出结果
+    print("-" * 60, flush=True)
+
+    if killed:
+        print(f"[fly_debug] 进程被强制终止", flush=True)
+        return 124  # 超时退出码
+
+    if process.returncode == 0:
+        print(f"[fly_debug] 成功退出 (code={process.returncode})", flush=True)
+    else:
+        print(f"[fly_debug] 异常退出 (code={process.returncode})", flush=True)
+
+    return process.returncode or 0
+
+
+def main() -> int:
+    """主函数"""
+    args = sys.argv[1:]
+
+    try:
+        return asyncio.run(run_fly_with_watchdog(args))
+    except KeyboardInterrupt:
+        print(f"\n[fly_debug] 用户中断\n{traceback.format_exc()}", flush=True)
+        return 130
+    except Exception as e:
+        print(f"[fly_debug] 错误：{e}\n{traceback.format_exc()}", flush=True)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

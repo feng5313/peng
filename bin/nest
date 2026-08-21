@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""
+Nest（鹏窝）- 远程控制服务
+
+统一入口：导入 peng.nest._cli_main 模块
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# 设置项目路径
+_SCRIPT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_SCRIPT_DIR / "src"))
+
+# 统一入口
+from peng.nest._cli_main import main
+
+if __name__ == "__main__":
+    sys.exit(main())
