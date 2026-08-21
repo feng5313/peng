@@ -20,7 +20,6 @@
 - 事务通知（info）机制，大模型运行期消息/通知处理。
 - 支持功能性tag。（定时器：@timer=300；上下文长短控制：@max=128K；事务依赖：@wait#23；指定大模型API：@🐥；指定远端：@nest=wsl；指定工作目录：@workdir=/tmp）
 - json配置，目录config/
-- 纯Python开发。
 - 本项目由鹏🐣（本项目）辅助开发完成。
 
 ![WebUI界面](res/peng_shot01.png)
