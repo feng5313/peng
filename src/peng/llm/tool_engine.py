@@ -14,6 +14,7 @@
 """
 
 import sys
+import os
 import asyncio
 import hashlib
 import logging
@@ -251,7 +252,9 @@ class MessageHistory:
                 content = f"{timestamp} {content}"
             elif isinstance(content, list):
                 # 多模态：时间戳写入首个text part（无text part则前置一个）
-                text_part = next((p for p in content if isinstance(p, dict) and p.get("type") == "text"), None)
+                text_part = next(
+                    (p for p in content if isinstance(p, dict) and p.get("type") == "text"), None
+                )
                 if text_part is not None:
                     text_part["text"] = f"{timestamp} {text_part.get('text', '')}"
                 else:
@@ -589,6 +592,71 @@ class MessageHistory:
                 self._messages.pop()
             else:
                 break
+
+    # 多模态附件 part 类型集合（OpenAI/qwen 兼容格式的多模态 content part）
+    _ATTACHMENT_PART_TYPES = frozenset(
+        {
+            "image_url",
+            "video_url",
+            "input_audio",
+            "input_image",
+            "input_video",
+            "input_file",
+            "file",
+            "audio",
+        }
+    )
+
+    # 附件清除后的占位说明（告知模型附件只发送一次，需重看时用read工具）
+    _ATTACHMENT_REMOVED_NOTICE = (
+        "[系统提示：本消息附带的多模态附件（图片/视频/音频/PDF）已随上一轮请求发送给你，"
+        "现已从上下文清除（多模态数据只允许发送一次以节省token）。"
+        "请基于此前已查看的附件内容继续工作；如需再次查看，请重新调用read工具读取原文件。]"
+    )
+
+    # _inject_multimodal_files 注入时附加的系统提示前缀（清除附件时同步替换，避免误导）
+    _INJECT_NOTICE_PREFIX = "[系统提示：上方/下方附加的多模态文件"
+
+    def strip_sent_attachments(self) -> int:
+        """清除history中已发送的多模态附件part（只发送一次机制）
+
+        多模态附件（base64图片/视频/音频/PDF）体积大且多数provider的视觉token
+        不享受缓存折扣，留在history中会导致后续每轮LLM调用重复发送。
+        在LLM调用成功完成后调用本方法，将已随本次请求发送的附件part移除：
+
+        1. text part保留，追加附件清除说明（同步替换原"已直接注入"提示，
+           避免清除附件后误导模型以为仍能看到附件）
+        2. 只剩单个text part时content简化为str（与普通消息格式一致）
+        3. 纯附件消息content替换为清除说明（防御性，正常总有text part）
+
+        Returns:
+            清除的附件part总数（0表示无附件被清除）
+        """
+        removed = 0
+        for msg in self._messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            attachment_parts = [
+                p
+                for p in content
+                if isinstance(p, dict) and p.get("type") in self._ATTACHMENT_PART_TYPES
+            ]
+            if not attachment_parts:
+                continue
+            removed += len(attachment_parts)
+            texts = [
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            text = "\n".join(t for t in texts if t)
+            # 替换注入时的"已直接注入"提示：附件已清除，原提示会误导模型幻觉图片内容
+            if self._INJECT_NOTICE_PREFIX in text:
+                text = text.split(self._INJECT_NOTICE_PREFIX, 1)[0].rstrip()
+            text = (text + "\n" if text else "") + self._ATTACHMENT_REMOVED_NOTICE
+            msg["content"] = text
+        return removed
 
     # 多模态附件 part 的估算 token 数（qwen-vl 图像约数百token，
     # base64字符长度/3.5 会严重高估，按每附件固定值估算）
@@ -934,9 +1002,7 @@ class MessageHistory:
                         and len(part["text"]) > self._COMPACT_CONTENT_MAX
                     ):
                         part = dict(part)
-                        part["text"] = self._truncate_str(
-                            part["text"], self._COMPACT_CONTENT_MAX
-                        )
+                        part["text"] = self._truncate_str(part["text"], self._COMPACT_CONTENT_MAX)
                     new_parts.append(part)
                 msg["content"] = new_parts
                 new_size = len(json.dumps(msg, ensure_ascii=False))
@@ -1049,6 +1115,10 @@ class ToolExecutionEngine:
         self._thinking_overload_bytes: int = 0  # 累积thinking字节数
         self._force_thinking_disabled: bool = False  # 是否强制关闭思考模式（仅影响当前事务）
 
+        # thinking回顾扫描游标：上次已消费的输出文件行号（提醒时从游标后扫描thinking行，
+        # run_stream 每轮开始重置为当前文件行数以跳过历史内容）
+        self._thinking_scan_line: int = 0
+
     @property
     def _error_dedup_rounds(self) -> int:
         """动态获取报错去重轮数（从最新配置读取，支持热更新）"""
@@ -1127,7 +1197,11 @@ class ToolExecutionEngine:
         """检测流式文本中连续N个完全相同的英文单词或中文词语（含单字）。
 
         分词策略：
-        - 英文单词：连续ASCII字母序列（不区分大小写）
+        - 英文token：连续ASCII字母+数字混合序列（如"c0"、"x1"、"v2"整体为一个token）
+          （事务#1653修复：原先只取字母序列，技术文本"c0=0-15, c1=16-31, c2=32-47..."
+          中的c0/c1/c2被切成6个连续"c"token→误判重复词语→正常内容被丢弃）
+          字母数字混合后：数字变化的标识符（c0,c1,c2...）token各不相同不再误报；
+          完全相同的标识符复读（c0 c0 c0...）仍可检出。
         - 中文单字：单个CJK字符作为一个token
         - 中文短词组（2-4字）：通过正则检测重复模式
 
@@ -1160,19 +1234,32 @@ class ToolExecutionEngine:
         while i < n:
             c = buf[i]
 
-            if c.isascii() and c.isalpha():
-                # 英文单词：消费连续ASCII字母
+            if c.isascii() and (c.isalpha() or c.isdigit()):
+                # 英文token：消费连续ASCII字母+数字（c0/x1/rgb8整体，#1653修复）
                 j = i + 1
-                while j < n and buf[j].isascii() and buf[j].isalpha():
+                while j < n and buf[j].isascii() and (buf[j].isalpha() or buf[j].isdigit()):
                     j += 1
 
                 if j == n:
-                    # chunk边界截断英文单词，保留尾部等待下轮补全
+                    # chunk边界截断英文token，保留尾部等待下轮补全
+                    # （注意：纯数字前缀如"16bytes"也暂存，下轮若仍是数字字母混合
+                    # 仍是一个token；不完整时宁可暂存也不误切分）
                     pending_tail = buf[i:]
                     break
 
                 token = buf[i:j].lower()
                 i = j
+
+                # 纯数字token视为"其他内容"打断重复链（#1688修复，替代#1653二轮的skip）：
+                # 数学/代码文本中数字常量会隔在同名变量之间（如#1688实测误判
+                # "√drive) + 6000×drive³? drive=0.033"中drive连续3次、中间夹6000），
+                # 跳过不重置→误判复读→正常思考被丢弃。数字token重置计数后：
+                # 数字常量自然重复（"2/(0.58*ext)*(2/2.2)"中"2"多次）不会累积
+                # （重置后count重新从1开始），真正的字母/中文复读仍可检出。
+                if token.isdigit():
+                    last = ""
+                    count = 0
+                    continue
 
                 # 更新连续计数（分隔符不重置计数，允许"the the the"中间有空格）
                 if token == last:
@@ -1277,11 +1364,7 @@ class ToolExecutionEngine:
             buf = buf[-max_buf:]
 
         def is_word_char(c: str) -> bool:
-            return (
-                c.isalpha()
-                or c.isdigit()
-                or ToolExecutionEngine._is_cjk_char(c)
-            )
+            return c.isalpha() or c.isdigit() or ToolExecutionEngine._is_cjk_char(c)
 
         n = len(buf)
         # unit至少2字符且至少能重复threshold次
@@ -1333,7 +1416,6 @@ class ToolExecutionEngine:
             state["buf"] = buf
 
         return detected
-
 
     def _detect_duplicate_lines(
         self,
@@ -1982,7 +2064,9 @@ class ToolExecutionEngine:
             base_url = (prov_cfg.get("base_url") or "").strip().rstrip("/")
             provider = getattr(self.llm, "provider", None) or "unknown"
             if not base_url:
-                logger.debug(f"[ToolEngine] 事务#{task_id} 空响应flush跳过: provider={provider} 无base_url")
+                logger.debug(
+                    f"[ToolEngine] 事务#{task_id} 空响应flush跳过: provider={provider} 无base_url"
+                )
                 return
             # 域名白名单校验：云端API不支持flush且不应触碰
             host = httpx.URL(base_url).host or ""
@@ -2018,9 +2102,7 @@ class ToolExecutionEngine:
                 resp = await client.post(flush_url)
                 body = (resp.text or "")[:100]
             if resp.status_code == 200:
-                logger.info(
-                    f"✅ [ToolEngine] 事务#{task_id} 推理服务缓存清除成功: {body}"
-                )
+                logger.info(f"✅ [ToolEngine] 事务#{task_id} 推理服务缓存清除成功: {body}")
                 get_output_manager().write_output(
                     task_id=task_id,
                     content=(
@@ -2305,7 +2387,7 @@ class ToolExecutionEngine:
                     "text": (
                         content
                         + "\n[系统提示：上方/下方附加的多模态文件（图片/视频/音频/PDF）已直接注入本消息，"
-                        "请直接查看分析其中的内容，禁止调用vision等视觉工具重复识别。]"
+                        "请直接查看分析其中的内容。]"
                     ),
                 }
             ]
@@ -2345,7 +2427,7 @@ class ToolExecutionEngine:
                     content=f"\n🖼️ [多模态] 已注入 {loaded} 个多模态文件到上下文\n",
                 )
             elif notes:
-                # 全部失败：保留文本并追加提示（模型可自行用read/vision工具处理）
+                # 全部失败：保留文本并追加提示（模型可自行用read工具处理）
                 msg["content"] = content + "\n[多模态注入提示]\n" + "\n".join(notes)
 
         self._mm_scan_cursor = cursor
@@ -2409,18 +2491,20 @@ class ToolExecutionEngine:
             # checklist 纳入指纹：用户经webui修改checklist（无工具调用）时仍能重新备份。
             try:
                 _ctx = json.loads(history_context)
-                _fingerprint_source = json.dumps(
-                    _ctx.get("messages", _ctx) if isinstance(_ctx, dict) else _ctx,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ) + "\x00" + checklist
+                _fingerprint_source = (
+                    json.dumps(
+                        _ctx.get("messages", _ctx) if isinstance(_ctx, dict) else _ctx,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\x00"
+                    + checklist
+                )
             except Exception:
                 _fingerprint_source = history_context + "\x00" + checklist
             fingerprint = hashlib.sha256(_fingerprint_source.encode("utf-8")).hexdigest()
             if self._last_backup_fingerprint == fingerprint:
-                logger.debug(
-                    f"迭代备份跳过(task#{task_id}): history/checklist与上次备份相同"
-                )
+                logger.debug(f"迭代备份跳过(task#{task_id}): history/checklist与上次备份相同")
                 return
 
             task_nest = self._task.get("nest") if self._task else None
@@ -2456,38 +2540,78 @@ class ToolExecutionEngine:
         except Exception as e:
             logger.debug(f"迭代备份失败(task#{task_id}): {e}", exc_info=True)
 
-    def _save_thinking_to_file(self, thinking: str, history: MessageHistory) -> None:
-        """将思考内容追加写入文件，并通知模型（用于不支持thinking持久化的模型）
+    def _count_output_lines(self, task_id: int) -> int:
+        """统计事务输出文件当前总行数"""
+        try:
+            file_path = get_output_manager().get_output_file_path(task_id)
+            with open(file_path, "rb") as f:
+                return sum(1 for _ in f)
+        except FileNotFoundError:
+            return 0
+        except Exception as e:
+            logger.warning(f"[ToolEngine] 事务#{task_id} 统计输出文件行数失败: {e}")
+            return 0
+
+    def _find_thinking_lines(self, task_id: int) -> tuple[int, int]:
+        """扫描输出文件游标之后的行，返回thinking内容行号范围（1-based闭区间）
+
+        输出文件为TSV格式：{timestamp}\\t{source}\\t{task_id}\\t{content}，
+        只认 source=thinking 的行，避免行缓冲时序误差把 system/answer 等
+        非思考内容行误算进范围。
+
+        Returns:
+            (start_line, end_line)；范围内无thinking行时返回 (0, 0)
+        """
+        try:
+            file_path = get_output_manager().get_output_file_path(task_id)
+            with open(file_path, encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return (0, 0)
+        except Exception as e:
+            logger.warning(f"[ToolEngine] 事务#{task_id} 扫描thinking行失败: {e}")
+            return (0, 0)
+        start_line, end_line = 0, 0
+        for i in range(self._thinking_scan_line, len(lines)):
+            parts = lines[i].split("\t", 2)
+            if len(parts) >= 2 and parts[1] == "thinking":
+                if not start_line:
+                    start_line = i + 1
+                end_line = i + 1
+        return (start_line, end_line)
+
+    def _remind_thinking_in_output(self, history: MessageHistory) -> None:
+        """提醒模型上次思考内容在事务输出文件中的行号范围（用于不支持thinking持久化的模型）
 
         对于 thinking_persistence=False 的模型（如GLM系列），模型不会复用 history 中的
         reasoning_content，每次都重新思考，导致重复思考浪费 token。
-        通过将思考内容写入文件，并通知模型文件路径，模型可通过 read 工具按需查看，
-        避免重复思考。
+        思考内容已经由流式输出链路（ThinkingEvent→executor.write_output source=thinking）
+        实时写入事务输出文件（task-{id}.out）。
+        此处直接扫描文件中的 thinking 标记行得到精确行号范围：
+        扫描不到 thinking 行（本迭代实际没有思考内容）则不提醒。
 
         Args:
-            thinking: 思考内容文本
             history: 消息历史对象（用于 add_user 通知模型）
         """
-        if not thinking or not thinking.strip():
-            return
         if not self._task_id:
             return
         try:
-            thinking_file = get_output_manager().get_output_file_path(self._task_id)
-            thinking_file = thinking_file.parent / f"task-{self._task_id}-thinking.txt"
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with open(thinking_file, "a", encoding="utf-8") as f:
-                f.write(f"\n{'='*60}\n[{timestamp}] 思考内容\n{'='*60}\n")
-                f.write(thinking)
-                f.write("\n")
-            logger.debug(
-                f"[ToolEngine] 事务#{self._task_id} 思考内容已写入 {thinking_file}"
-            )
+            start_line, end_line = self._find_thinking_lines(self._task_id)
+            if not start_line or end_line < start_line:
+                return
+            # 消费后推进游标到当前文件末尾，避免下轮重复扫描已回顾的内容
+            self._thinking_scan_line = self._count_output_lines(self._task_id)
             history.add_user(
-                f"思考过程已记录：{thinking_file}，切勿重复思考相同内容，否则将被投诉欺诈token费用！"
+                f"上次思考内容已记录在事务输出文件第{start_line}-{end_line}行，"
+                f"可用 task 工具的 output 子命令回顾：task output {self._task_id} "
+                f"--begin {start_line} --end {end_line}，"
+                "切勿重复思考相同内容，否则将被投诉欺诈token费用！"
+            )
+            logger.debug(
+                f"[ToolEngine] 事务#{self._task_id} 已提醒思考内容行号范围 {start_line}-{end_line}"
             )
         except Exception as e:
-            logger.warning(f"[ToolEngine] 事务#{self._task_id} 写入思考文件失败: {e}")
+            logger.warning(f"[ToolEngine] 事务#{self._task_id} 注入思考内容回顾提醒失败: {e}")
 
     def _restore_history(self, history: MessageHistory):
         task = self.task_manager.get_task(self._task_id)
@@ -2501,12 +2625,12 @@ class ToolExecutionEngine:
 
     @staticmethod
     def _parse_compact_override(text: str) -> int | None:
-        """从文本中解析 @compact=<number>[K|M] 指令
+        """从文本中解析 @max=<number>[K|M] 指令
 
         支持格式：
-        - @compact=128K   → 128 * 1024 = 131072
-        - @compact=1M     → 1 * 1048576 = 1048576
-        - @compact=300000 → 300000（无后缀=原值）
+        - @max=128K   → 128 * 1024 = 131072
+        - @max=1M     → 1 * 1048576 = 1048576
+        - @max=300000 → 300000（无后缀=原值）
 
         如果有多个匹配，取最后一个（最新的）。
 
@@ -2531,7 +2655,7 @@ class ToolExecutionEngine:
         """获取有效的 compact_threshold：检查 @compact 指令覆盖
 
         每轮迭代开始时调用。查询事务最新 content 和所有 info（已读+未读）文本，
-        如果包含 @compact=<number>[K|M] 则以此值替代 provider 的 compact_threshold。
+        如果包含 @max=<number>[K|M] 则以此值替代 provider 的 compact_threshold。
 
         优先级：info 中最新的 > content 中的 > provider 默认值
 
@@ -2656,6 +2780,9 @@ class ToolExecutionEngine:
         self._last_injected_workdir: str | None = None
         # 多模态注入游标：记录已扫描过的 history 消息索引（run_stream 重入时重置）
         self._mm_scan_cursor: int = 0
+        # thinking回顾扫描游标：重置为当前输出文件行数，跳过历史迭代内容，
+        # 本轮提醒只扫描游标之后的 thinking 行（_remind_thinking_in_output 消费后推进）
+        self._thinking_scan_line: int = self._count_output_lines(task_id)
         # 检测 nest+workdir 冲突并向冲突事务发送 info 提示（start/restart/resume 时均触发）
         self._check_workdir_conflicts()
         if len(self._history._messages) == 0:
@@ -2700,7 +2827,7 @@ class ToolExecutionEngine:
                 if action == "block":
                     # flow==prompt 时，block 则结束 run_stream
                     if reason:
-                        history.add_user("@compact! " + reason)
+                        history.add_user(reason)
                     yield CompleteEvent(
                         content=reason or "钩子阻止了 LLM 调用",
                         iterations=self._iteration,
@@ -2722,7 +2849,9 @@ class ToolExecutionEngine:
                 history = metadata["history"]
                 for action, reason in results:
                     if action == "block":
-                        msg_content = f"[ToolEngine] @compact! 钩子在流调用后阻止了流程继续: prompt, 原因: {reason}"
+                        msg_content = (
+                            f"[ToolEngine] 钩子在流调用后阻止了流程继续: prompt, 原因: {reason}"
+                        )
                         logger.debug(msg_content)
                         history.add_user(msg_content)
                         should_complete = True
@@ -2842,10 +2971,7 @@ class ToolExecutionEngine:
                             thinking += chunk.thinking
                             yield ThinkingEvent(content=chunk.thinking)
                             # 纯符号无效输出检测：连续threshold个非字母字符判定无效
-                            if (
-                                _symbol_threshold > 0
-                                and not symbol_output_detected
-                            ):
+                            if _symbol_threshold > 0 and not symbol_output_detected:
                                 thinking_symbol_run = self._scan_consecutive_symbols(
                                     chunk.thinking, thinking_symbol_run, _symbol_threshold
                                 )
@@ -2864,7 +2990,9 @@ class ToolExecutionEngine:
                                 and not symbol_output_detected
                             ):
                                 if self._scan_repeated_words(
-                                    chunk.thinking, thinking_repeated_state, _repeated_word_threshold
+                                    chunk.thinking,
+                                    thinking_repeated_state,
+                                    _repeated_word_threshold,
                                 ):
                                     repeated_word_detected = True
                                     should_skip_iteration = True
@@ -2972,10 +3100,7 @@ class ToolExecutionEngine:
                             content += chunk.content
                             yield ContentEvent(content=chunk.content)
                             # 纯符号无效输出检测：连续threshold个非字母字符判定无效
-                            if (
-                                _symbol_threshold > 0
-                                and not symbol_output_detected
-                            ):
+                            if _symbol_threshold > 0 and not symbol_output_detected:
                                 content_symbol_run = self._scan_consecutive_symbols(
                                     chunk.content, content_symbol_run, _symbol_threshold
                                 )
@@ -3410,6 +3535,25 @@ class ToolExecutionEngine:
                         await asyncio.sleep(min(1, remaining))
                 continue  # 回到外层 while True 循环重试
 
+            # === 多模态只发送一次机制 ===
+            # 本次LLM调用已成功完成，请求中实际携带的多模态附件（user消息注入的
+            # @file=/[附件] 与 read等工具结果附件）立即从history清除，防止同一
+            # 附件在后续每轮迭代重复发送（视觉token通常无缓存折扣，重复发送
+            # 成倍浪费token/费用）。
+            # 仅当实际使用的provider具备vision能力时清除（chat_stream已把
+            # provider_config更新为本次实际provider的配置）；若请求中provider
+            # 切换为非vision导致附件被降级未发送，则保留附件待下一轮发送。
+            # 历史被重写，重置增量检测基线（与compact后的处理一致）。
+            if self._is_multimodal_provider():
+                _removed = history.strip_sent_attachments()
+                if _removed:
+                    logger.info(
+                        f"[ToolEngine] 事务#{task_id} 已从history清除{_removed}个"
+                        f"已发送的多模态附件（只发送一次机制）"
+                    )
+                    history_list = []  # 跳过增量异常检测
+                    self._save_history(history)
+
             # === 思考过载检测：累积thinking字节数，超阈值且无有效编辑时强制关闭思考模式 ===
             # 注意：此检测必须在 should_skip_iteration 检查之前执行，
             # 否则被跳过的迭代中的thinking字节数不会被统计。
@@ -3554,9 +3698,11 @@ class ToolExecutionEngine:
                 # 干预提示作为 user 消息注入（user 消息有指令权威，assistant 消息会被忽略）
                 if intervention:
                     history.add_user(intervention)
-                # 对于不支持thinking持久化的模型（如GLM），将思考内容写入文件并通知模型
-                if thinking_to_save and not getattr(self.llm, "provider_config", {}).get("thinking_persistence", True):
-                    self._save_thinking_to_file(thinking_to_save, history)
+                # 对于不支持thinking持久化的模型（如GLM），提醒模型按行号回顾输出文件中的思考内容
+                if thinking_to_save and not getattr(self.llm, "provider_config", {}).get(
+                    "thinking_persistence", True
+                ):
+                    self._remind_thinking_in_output(history)
                 continue
             # 6. 更新历史：添加助手消息
             # 当有 tool_calls 时，将 reasoning_content 合并到同一个 assistant 消息中
@@ -3618,7 +3764,7 @@ class ToolExecutionEngine:
                         if action == "block":
                             # 阻止工具调用，reason 不为空则加入 history
                             if reason:
-                                history.add_user(" @compact! 工具调用被阻止，原因: " + reason)
+                                history.add_user(" 工具调用被阻止，原因: " + reason)
                             logger.debug(
                                 f"[ToolEngine] 钩子阻止工具调用: {tool_name}, 原因: {reason}"
                             )
@@ -3847,13 +3993,15 @@ class ToolExecutionEngine:
                             elif mime.startswith("audio/"):
                                 b64 = att["url"].split("base64,", 1)[-1]
                                 fmt = (
-                                    att["url"].split("data:audio/", 1)[-1]
-                                    .split(";", 1)[0]
+                                    att["url"].split("data:audio/", 1)[-1].split(";", 1)[0]
                                     if "data:audio/" in att["url"]
                                     else "mp3"
                                 )
                                 parts.append(
-                                    {"type": "input_audio", "input_audio": {"data": b64, "format": fmt}}
+                                    {
+                                        "type": "input_audio",
+                                        "input_audio": {"data": b64, "format": fmt},
+                                    }
                                 )
                             elif mime == "application/pdf":
                                 parts.append({"type": "file", "file": {"url": att["url"]}})
@@ -3894,15 +4042,19 @@ class ToolExecutionEngine:
                     history = metadata["history"]
                     for action, reason in results:
                         if action == "block":
-                            msg_content = f"🪝  @compact! {tool_name}钩子在工具调用后阻止了流程继续 , 原因: {reason}"
+                            msg_content = (
+                                f"🪝  {tool_name}钩子在工具调用后阻止了流程继续 , 原因: {reason}"
+                            )
                             logger.debug(msg_content)
                             history.add_user(msg_content)
                             hook_block = True
-            # 对于不支持thinking持久化的模型（如GLM），将思考内容写入文件并通知模型
+            # 对于不支持thinking持久化的模型（如GLM），提醒模型按行号回顾输出文件中的思考内容
             # 注意：必须在所有 tool 结果添加到 history 之后执行，否则 add_user 会插入到
             # assistant(tool_calls) 和 tool 结果之间，破坏 API 对话格式
-            if thinking and not getattr(self.llm, "provider_config", {}).get("thinking_persistence", True):
-                self._save_thinking_to_file(thinking, history)
+            if thinking and not getattr(self.llm, "provider_config", {}).get(
+                "thinking_persistence", True
+            ):
+                self._remind_thinking_in_output(history)
             # 跨迭代死循环检测：比较本轮与最近几轮的工具调用签名+返回结果指纹
             # 🔧 修复BUG：使用 tool_exec_results（工具执行结果），而非 results（可能被hook覆盖）
             self._check_cross_iteration_loop(
@@ -4307,6 +4459,7 @@ class ToolExecutionEngine:
         "read": "📃 读取文件",
         "write": "📝 写入文件",
         "edit": "✏️ 编辑文件",
+        "line_edit": "✏️ 按行编辑",
         "glob": "🔍 文件搜索",
         "grep": "🔎 内容搜索",
         "bash": "🚩 执行命令",
@@ -4324,9 +4477,69 @@ class ToolExecutionEngine:
     _TOOL_RESULT_HAS_PATH: frozenset[str] = frozenset({"write", "edit"})
 
     def _format_tool_call_info(self, tool_name: str, arguments: dict) -> str:
-        """格式化工具调用信息（始终显示完整参数）"""
+        """格式化工具调用信息（始终显示完整参数）
+
+        write/edit/line_edit 工具的文件内容参数按扩展名做语法高亮、以
+        人类易读的多行格式显示；report/checklist 的 markdown 内容参数
+        同样做高亮易读显示（详见 peng.common.code_display）；其余工具
+        保持单行 JSON 格式。
+        """
 
         tool_type = self._TOOL_TYPE_NAMES.get(tool_name, f"🛠️ {tool_name}")
+
+        if isinstance(arguments, dict):
+            # write/edit/line_edit：文件内容人类易读+语法高亮显示
+            if tool_name in ("write", "edit", "line_edit"):
+                try:
+                    from peng.common.code_display import (
+                        format_edit_display,
+                        format_line_edit_display,
+                        format_write_display,
+                    )
+
+                    file_path = arguments.get("filePath", "") or ""
+                    if tool_name == "write":
+                        content = arguments.get("content", "")
+                        if file_path and isinstance(content, str):
+                            return (
+                                f"{tool_type} {format_write_display(file_path, content)}"
+                            )
+                    elif tool_name == "edit":
+                        old_string = arguments.get("oldString", "")
+                        new_string = arguments.get("newString", "")
+                        if (
+                            file_path
+                            and isinstance(old_string, str)
+                            and isinstance(new_string, str)
+                        ):
+                            return (
+                                f"{tool_type} "
+                                f"{format_edit_display(file_path, old_string, new_string)}"
+                            )
+                    else:  # line_edit
+                        if file_path:
+                            return (
+                                f"{tool_type} "
+                                f"{format_line_edit_display(file_path, arguments)}"
+                            )
+                except Exception as e:
+                    # 格式化失败不影响主流程，回退到通用 JSON 显示
+                    logger.debug(f"write/edit 参数易读格式化失败，回退JSON显示: {e}")
+
+            # report/checklist：markdown 内容人类易读+高亮显示
+            elif tool_name in ("report", "checklist"):
+                try:
+                    from peng.common.code_display import format_markdown_display
+
+                    content = (
+                        arguments.get("summary")
+                        or arguments.get("checklist_content")
+                        or ""
+                    )
+                    if isinstance(content, str) and content.strip():
+                        return f"{tool_type} {format_markdown_display(content)}"
+                except Exception as e:
+                    logger.debug(f"report/checklist 参数易读格式化失败，回退JSON显示: {e}")
 
         # 显示完整参数
         try:

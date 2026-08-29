@@ -1,6 +1,6 @@
 import subprocess, sys, os
 
-msg = "用shot工具截取全屏并用vision工具识别有哪些在运行的程序窗口"
+msg = "用shot工具截取全屏并识别有哪些在运行的程序窗口"
 
 r = subprocess.run(
     [sys.executable, "D:/work/peng/bin/msg", "send", msg],

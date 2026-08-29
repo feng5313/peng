@@ -1151,6 +1151,24 @@ function editTaskField(taskId, field) {
 }
 
 /**
+ * 🔧 Task#1680：更新可折叠区块标题的标题文字和提示文字
+ * 状态驱动：直接更新 span.textContent，绝不重写 innerHTML（旧实现用字符串替换+追加，反复点击会导致"(点击展开)"超链接不断累积）
+ * @param {HTMLElement} h3 - 标题元素
+ * @param {string} collapsedTitle - 收起态的标题文字（如 '📜 当前上下文'）
+ * @param {string} expandedTitle - 展开态的标题文字（如 '📜 当前上下文（收起）'）
+ * @param {string} collapsedHint - 收起态的提示文字（如 '(点击展开)'），空串表示该区块无提示文字
+ * @param {string} expandedHint - 展开态的提示文字（如 '(点击收起)'），空串表示该区块无提示文字
+ */
+function _updateToggleHeading(h3, collapsedTitle, expandedTitle, collapsedHint, expandedHint) {
+  if (!h3) return;
+  const expanded = h3.classList.contains('expanded');
+  const titleEl = h3.querySelector(':scope > .toggle-title');
+  const hintEl = h3.querySelector(':scope > .toggle-hint');
+  if (titleEl) titleEl.textContent = expanded ? expandedTitle : collapsedTitle;
+  if (hintEl && collapsedHint) hintEl.textContent = expanded ? expandedHint : collapsedHint;
+}
+
+/**
  * 切换事务注入信息的显示：点击超链接后，替换当前 info 内容为全部 info 列表（已读灰色，未读绿色）
  * @param {number} taskId - 事务 ID
  * @param {HTMLElement} toggleEl - 被点击的标题元素
@@ -1161,27 +1179,14 @@ function toggleTaskInfo(taskId, toggleEl) {
 
   const defaultEl = section.querySelector('.task-info-default');
   const fullEl = section.querySelector('.task-info-full');
+  const h3 = section.querySelector('.task-info-toggle');
 
-  if (defaultEl && fullEl) {
-    if (defaultEl.style.display !== 'none') {
-      // 显示全部 info，隐藏默认内容
-      defaultEl.style.display = 'none';
-      fullEl.style.display = '';
-      // 更新标题：添加收起提示
-      const h3 = section.querySelector('.task-info-toggle');
-      if (h3) {
-        h3.innerHTML = h3.innerHTML.replace('💡 注入信息', '💡 注入信息（收起）');
-      }
-    } else {
-      // 收起全部，显示默认内容（最后已读+所有未读）
-      defaultEl.style.display = '';
-      fullEl.style.display = 'none';
-      // 恢复标题：移除收起提示
-      const h3 = section.querySelector('.task-info-toggle');
-      if (h3) {
-        h3.innerHTML = h3.innerHTML.replace('💡 注入信息（收起）', '💡 注入信息').replace('（点击收起）', '');
-      }
-    }
+  if (defaultEl && fullEl && h3) {
+    const expanded = h3.classList.toggle('expanded');
+    defaultEl.style.display = expanded ? 'none' : '';
+    fullEl.style.display = expanded ? '' : 'none';
+    // 标题：展开态追加"（收起）"；注入信息无独立提示文字（有"清除"超链接，不追加 hint）
+    _updateToggleHeading(h3, '💡 注入信息', '💡 注入信息（收起）', '', '');
   }
 }
 
@@ -1198,17 +1203,9 @@ function toggleContext(taskId, toggleEl) {
   const h3 = section.querySelector('.context-toggle');
 
   if (fullEl && h3) {
-    if (fullEl.style.display === 'none') {
-      // 显示完整上下文
-      fullEl.style.display = '';
-      // 更新标题：添加收起提示
-      h3.innerHTML = h3.innerHTML.replace('📜 当前上下文', '📜 当前上下文（收起）') + '<span style="font-size:0.75em;color:#58a6ff;">(点击收起)</span>';
-    } else {
-      // 收起完整上下文
-      fullEl.style.display = 'none';
-      // 恢复标题：移除收起提示，恢复展开提示
-      h3.innerHTML = h3.innerHTML.replace('📜 当前上下文（收起）', '📜 当前上下文').replace('(点击收起)', '(点击展开)');
-    }
+    const expanded = h3.classList.toggle('expanded');
+    fullEl.style.display = expanded ? '' : 'none';
+    _updateToggleHeading(h3, '📜 当前上下文', '📜 当前上下文（收起）', '(点击展开)', '(点击收起)');
   }
 }
 
@@ -1756,17 +1753,9 @@ function toggleSystemPrompt(taskId, toggleEl) {
   const h3 = section.querySelector('.system-prompt-toggle');
 
   if (fullEl && h3) {
-    if (fullEl.style.display === 'none') {
-      // 显示完整系统提示词
-      fullEl.style.display = '';
-      // 更新标题：添加收起提示
-      h3.innerHTML = h3.innerHTML.replace('🤖 系统提示词', '🤖 系统提示词（收起）') + '<span style="font-size:0.75em;color:#58a6ff;">(点击收起)</span>';
-    } else {
-      // 收起完整系统提示词
-      fullEl.style.display = 'none';
-      // 恢复标题：移除收起提示，恢复展开提示
-      h3.innerHTML = h3.innerHTML.replace('🤖 系统提示词（收起）', '🤖 系统提示词').replace('(点击收起)', '(点击展开)');
-    }
+    const expanded = h3.classList.toggle('expanded');
+    fullEl.style.display = expanded ? '' : 'none';
+    _updateToggleHeading(h3, '🤖 系统提示词', '🤖 系统提示词（收起）', '(点击展开)', '(点击收起)');
   }
 }
 

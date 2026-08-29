@@ -20,6 +20,7 @@ def output_manager(tmp_path):
     manager._write_lock = manager._lock  # 使用类级别的锁
     manager._buffers = {}
     manager._last_source = {}
+    manager._consecutive_empty = {}
     manager._output_dir = tmp_path
     manager._ensure_output_dir()
     return manager

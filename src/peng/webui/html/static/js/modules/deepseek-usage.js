@@ -1,9 +1,12 @@
 // ==================== DeepSeek 用量徽章 ====================
 // 底部状态栏显示 DeepSeek provider 的余额、今日费用、累计费用、高峰状态
 // 每分钟刷新，仅在存在 DeepSeek provider 时显示
+// 容错：单次失败保留上次数据；连续多次失败（约5分钟）才隐藏
 
 let _dsPollTimer = null;
 let _dsHasDeepseek = false;
+let _dsFailCount = 0;   // 连续失败计数
+const _DS_MAX_FAILS = 5; // 连续失败5次（约5分钟）才隐藏徽章
 
 async function _dsFetchUsage() {
   try {
@@ -63,7 +66,7 @@ function _dsRender(data) {
     parts.push(`<span style="color:var(--text-secondary)">累计</span><b id="ds-total-cost" style="color:var(--accent-color);cursor:pointer;text-decoration:underline dotted" title="点击更正" onclick="_dsEditTotalCost(${data.total_cost})">¥${_dsFmt(data.total_cost)}</b>`);
   }
 
-  el.innerHTML = parts.join(' ');
+  el.innerHTML = parts.join(' ') + (data.stale ? ' <span style="color:#ff9800" title="数据更新延迟（上游暂时不可用），显示最近一次成功数据">⚠️</span>' : '');
   el.style.display = 'inline-flex';
 }
 
@@ -162,9 +165,12 @@ async function _dsTick() {
   }
   const data = await _dsFetchUsage();
   if (data) {
+    _dsFailCount = 0;
     _dsRender(data);
   } else {
-    _dsHide();
+    // 失败容忍：保留上次显示，连续多次失败才隐藏
+    _dsFailCount++;
+    if (_dsFailCount >= _DS_MAX_FAILS) _dsHide();
   }
 }
 

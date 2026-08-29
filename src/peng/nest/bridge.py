@@ -774,6 +774,14 @@ async def _handle_forward_request(websocket, forward_msg):
     conn = None
     if nest_name:
         conn = manager.get_connection(nest_name)
+        if not conn:
+            await websocket.send(json.dumps({
+                "type": "error",
+                "error": f"nest '{nest_name}' 未连接（可用: "
+                         + ", ".join(c.display_key for c in manager._connections) + ")",
+            }, ensure_ascii=True))
+            await websocket.close()
+            return
     if not conn:
         conn = manager.get_default_connection()
     

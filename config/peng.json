@@ -2,12 +2,12 @@
   "_comment": "鹏的配置文件",
   "_note": "配置项说明：使用 ${ENV_VAR} 语法引用环境变量，使用 ${ENV_VAR:-default} 语法设置默认值",
   "agent_name": "鹏🐣",
-  "master_name": "开发者A",
+  "master_name": "开发者😕",
   "paths": {
     "data_dir": "data",
     "data_json_dir": "data/json",
     "messages_dir": "data",
-    "backups_dir": "data/backups",
+    "backups_dir": "~/backups",
     "config_dir": "config",
     "temp_dir": "data/temp",
     "logs_dir": "logs",
@@ -22,7 +22,7 @@
     "test_processes_db": "data/test_processes.db",
     "log_file": "logs/peng.log",
     "chat_history_file": "data/history/chat_history",
-    "changelog_file": "data/backups/CHANGELOG.md",
+    "changelog_file": "~/backups/CHANGELOG.md",
     "colors_json": "config/colors.json",
     "prompts_json": "config/prompts.jsonp",
     "webui_json": "config/webui.json",
@@ -107,14 +107,14 @@
       ],
       "thinking_truncated": "[已截断前 {truncated_count} 行思考内容...]",
       "context_too_large": "⚠️  [{timestamp}] 事务#{task_id}当前上下文紧张({current_kb}K/{threshold_kb}K)。\n大模型降智严重，且进展缓慢(进度记录 {progress}%)，把已完成事项，需要继续处理的事项，当前上下文内所有对继续处理的事项有用的信息，以及当前进展，相关代码位置和其他新发现的重要信息，记录到 checklist。然后用工具调用'task restart {task_id}'（禁止添加--force）重启本事务。",
-      "iteration_limit_warning": "⚠️  @compact! 将达到系统迭代限制（{iteration}/{max_iterations}），请尽快结束本轮对话，避免强制中断。",
-      "iteration_exhausted": "⚠️  @compact! 达到最大迭代次数 {max_iterations}，强制结束对话循环",
+      "iteration_limit_warning": "⚠️  将达到系统迭代限制（{iteration}/{max_iterations}），请尽快结束本轮对话，避免强制中断。",
+      "iteration_exhausted": "⚠️  达到最大迭代次数 {max_iterations}，强制结束对话循环",
       "degenerate_loop_intervention": "⚠️ 你已检测到自身陷入退化循环！立即停止当前思考方向！换用完全不同的策略：直接调用工具获取新信息或执行具体操作。禁止继续在当前方向上推理！",
       "symbol_output_intervention": "⚠️ 你的输出被检测为无效输出（连续输出大量纯符号字符，无任何字母或中文文字）！该输出已被系统丢弃。请停止输出符号串，立即用正常的中英文语言思考或回复，并调用工具执行实际操作！"
     },
     "providers": {
       "z-glm5.3": {
-        "api_key": "your_key",
+        "api_key": "",
         "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
         "model": "glm-5.3",
         "small_model": "glm-5.3",
@@ -131,25 +131,22 @@
         "price_input_miss": 8,
         "price_output": 28
       },
-      "z-glm4.6v": {
+      "z-glm5.3-flash": {
         "clone": "z-glm5.3",
-        "model": "glm-4.6v",
-        "small_model": "glm-4.6v",
-        "max_concurrent": 1,
-        "enable": false,
-        "thinking_type": "thinking",
-        "reasoning_disabled_fallback": null,
-        "thinking_dead_loop_threshold": 3,
-        "vision": "only",
-        "icon": "🤖",
-        "compact_threshold": 120000,
-        "price_input_hit": 0.4,
-        "price_input_miss": 2,
-        "price_output": 6,
-        "priority": 88
+        "model": "glm-5.3-flash",
+        "small_model": "glm-5.3-flash",
+        "enable": true,
+        "compact_threshold": 512000,
+        "thinking_dead_loop_threshold": 5,
+        "vision": "yes",
+        "icon": "🐱",
+        "price_input_hit": 0.2,
+        "price_input_miss": 0.8,
+        "price_output": 2.8,
+        "priority": 98
       },
       "deepseek-pro": {
-        "api_key": "your_key",
+        "api_key": "",
         "base_url": "https://api.deepseek.com",
         "model": "deepseek-v4-pro",
         "small_model": "deepseek-v4-pro",
@@ -331,7 +328,7 @@
   "channels": {
     "enabled": true,
     "feishu": {
-      "enabled": false,
+      "enabled": true,
       "app_id": "",
       "app_secret": "",
       "verification_token": "",
@@ -339,7 +336,7 @@
       "bot_name": "鹏🐣"
     },
     "wechat": {
-      "enabled": false,
+      "enabled": true,
       "clawbot": {
         "bot_token": "",
         "base_url": "https://ilinkai.weixin.qq.com",

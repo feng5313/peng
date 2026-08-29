@@ -589,7 +589,27 @@ class LocalExecutor:
                 nest_data = json.load(f)
 
             instances = nest_data.setdefault("instances", {})
-            instance = instances.setdefault(nest_name, {})
+
+            # 🔧 事务#1665 修复：nest_name 为空时禁止 setdefault("", {}) 写入空字符串实例键，
+            # 否则 nest restart/start/stop 遍历到 "" 会因任务名回退为默认名而整体失败。
+            # 回退策略：优先 config["self"]（本机 nest 身份），其次首个合法实例键。
+            target_name = (nest_name or "").strip()
+            if not target_name:
+                self_name = (nest_data.get("self") or "").strip()
+                if self_name and self_name in instances:
+                    target_name = self_name
+                else:
+                    target_name = next(
+                        (k for k in instances if isinstance(k, str) and k.strip()), ""
+                    )
+                if not target_name:
+                    return NestResponse.make_error(
+                        params.get("_request_id", ""),
+                        "nest_name为空且nest.json中无可用实例，无法保存workdir",
+                    )
+                logger.warning(f"set_workdir nest_name为空，回退使用实例: {target_name}")
+
+            instance = instances.setdefault(target_name, {})
             instance["workdir"] = workdir
 
             with open(nest_json_path, "w", encoding="utf-8") as f:
@@ -985,6 +1005,63 @@ class LocalExecutor:
         except Exception as e:
             return NestResponse.make_error(params.get("_request_id", ""), f"写入文件失败: {e}")
 
+    async def _handle_write_bytes(self, params: dict) -> NestResponse:
+        """
+        分块写入二进制文件（base64 编码传输，二进制安全）
+
+        params:
+            path: str - 文件路径
+            data_b64: str - base64 编码的数据块（可为空）
+            mode: str - 写入模式 "create"（默认，新建/覆盖）或 "append"（追加）
+            mtime: float - 可选，写入后设置文件修改时间（同步保序用）
+        """
+        import base64 as _b64
+
+        file_path = params.get("path", "")
+        data_b64 = params.get("data_b64", "")
+        mode = params.get("mode", "create")
+
+        # 安全检查
+        if self.security:
+            allowed, reason = self.security.check_path_access(file_path)
+            if not allowed:
+                return NestResponse.make_error(
+                    params.get("_request_id", ""), f"路径访问被安全策略拒绝: {reason}"
+                )
+
+        path = Path(file_path).expanduser().resolve()
+
+        try:
+            data = _b64.b64decode(data_b64) if data_b64 else b""
+            ensure_dir_with_owner(path.parent)
+            if mode == "append":
+                with open(path, "ab") as f:
+                    f.write(data)
+            else:
+                with open(path, "wb") as f:
+                    f.write(data)
+            chown_to_project_owner(path)
+
+            # 可选：恢复源文件 mtime（用于增量同步比较）
+            mtime = params.get("mtime")
+            if mtime is not None:
+                try:
+                    os.utime(path, (float(mtime), float(mtime)))
+                except Exception:
+                    pass
+
+            return NestResponse.make_result(
+                params.get("_request_id", ""),
+                {
+                    "path": str(path),
+                    "written": True,
+                    "size": len(data),
+                    "mode": mode,
+                },
+            )
+        except Exception as e:
+            return NestResponse.make_error(params.get("_request_id", ""), f"写入文件失败: {e}")
+
     async def _handle_edit(self, params: dict) -> NestResponse:
         """
         编辑文件（精确替换）
@@ -1284,16 +1361,21 @@ class LocalExecutor:
 
     async def _handle_read_bytes(self, params: dict) -> NestResponse:
         """
-        字节级分块读取文件
+        字节级分块读取文件（base64 编码传输，二进制安全）
 
         params:
             path: str - 文件路径
             offset: int - 字节偏移（默认0）
             chunk_size: int - 读取字节数（默认1MB）
+            encoding: str - 可选，"base64" 时返回 base64 编码（二进制安全）；
+                          未指定时保持旧行为返回 utf-8 文本（WebUI read-chunk 兼容）
         """
+        import base64 as _b64
+
         file_path = params.get("path", "")
         offset = params.get("offset", 0)
         chunk_size = params.get("chunk_size", 1048576)
+        use_b64 = params.get("encoding") == "base64"
 
         path = Path(file_path).expanduser().resolve()
 
@@ -1304,6 +1386,24 @@ class LocalExecutor:
 
         try:
             file_size = path.stat().st_size
+            if use_b64:
+                # 二进制安全：直接按字节读取并 base64 编码
+                with open(path, "rb") as f:
+                    f.seek(offset)
+                    raw = f.read(chunk_size)
+                actual_size = len(raw)
+                return NestResponse.make_result(
+                    params.get("_request_id", ""),
+                    {
+                        "content_b64": _b64.b64encode(raw).decode("ascii"),
+                        "path": str(path),
+                        "offset": offset,
+                        "chunk_size": actual_size,
+                        "total_size": file_size,
+                        "has_more": (offset + actual_size) < file_size,
+                    },
+                )
+            # 兼容旧行为：文本模式（WebUI read-chunk 使用）
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 f.seek(offset)
                 content = f.read(chunk_size)
@@ -1331,6 +1431,100 @@ class LocalExecutor:
             path: str - 目录路径
         """
         return await self._handle_read(params)
+
+    async def _handle_list_tree(self, params: dict) -> NestResponse:
+        """
+        递归列出目录树（sync 同步用）
+
+        params:
+            path: str - 目录路径
+        返回:
+            files: [{path, size, mtime}] 相对路径列表（仅文件）
+            total: 文件总数
+            total_size: 总字节数
+        """
+        base = Path(params.get("path", "")).expanduser().resolve()
+
+        # 安全检查
+        if self.security:
+            allowed, reason = self.security.check_path_access(str(base))
+            if not allowed:
+                return NestResponse.make_error(
+                    params.get("_request_id", ""), f"路径访问被安全策略拒绝: {reason}"
+                )
+
+        if not base.exists():
+            return NestResponse.make_result(
+                params.get("_request_id", ""),
+                {"exists": False, "files": [], "total": 0, "total_size": 0},
+            )
+        if not base.is_dir():
+            return NestResponse.make_error(
+                params.get("_request_id", ""), f"不是目录: {base}"
+            )
+
+        files = []
+        total_size = 0
+        # os.walk 收集所有文件（跳过符号链接避免循环）
+        for root, dirs, names in os.walk(base):
+            dirs[:] = [d for d in dirs if not Path(root, d).is_symlink()]
+            for name in names:
+                p = Path(root) / name
+                try:
+                    if p.is_symlink():
+                        continue
+                    st = p.stat()
+                except OSError:
+                    continue
+                rel = p.relative_to(base).as_posix()
+                files.append({"path": rel, "size": st.st_size, "mtime": st.st_mtime})
+                total_size += st.st_size
+
+        return NestResponse.make_result(
+            params.get("_request_id", ""),
+            {
+                "exists": True,
+                "path": str(base),
+                "files": files,
+                "total": len(files),
+                "total_size": total_size,
+            },
+        )
+
+    async def _handle_delete(self, params: dict) -> NestResponse:
+        """
+        删除文件或目录（sync --delete 用）
+
+        params:
+            path: str - 文件或目录路径
+        """
+        target = Path(params.get("path", "")).expanduser().resolve()
+
+        # 安全检查
+        if self.security:
+            allowed, reason = self.security.check_path_access(str(target))
+            if not allowed:
+                return NestResponse.make_error(
+                    params.get("_request_id", ""), f"路径访问被安全策略拒绝: {reason}"
+                )
+
+        if not target.exists():
+            return NestResponse.make_result(
+                params.get("_request_id", ""), {"path": str(target), "deleted": False, "note": "不存在"}
+            )
+
+        try:
+            if target.is_dir() and not target.is_symlink():
+                import shutil
+
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+            return NestResponse.make_result(
+                params.get("_request_id", ""), {"path": str(target), "deleted": True}
+            )
+        except Exception as e:
+            return NestResponse.make_error(params.get("_request_id", ""), f"删除失败: {e}")
 
     async def _handle_list_drives(self, params: dict) -> NestResponse:
         """

@@ -1,9 +1,12 @@
 // ==================== Coding Plan 用量徽章 ====================
 // 底部状态栏显示智谱 Coding Plan 的周额度使用率
 // 每分钟刷新，仅在 GLM provider enable 时显示
+// 容错：单次失败保留上次数据；连续多次失败（约5分钟）才隐藏
 
 let _cpPollTimer = null;
 let _cpHasGlm = false;  // 是否有 enabled 的 GLM provider
+let _cpFailCount = 0;   // 连续失败计数
+const _CP_MAX_FAILS = 5; // 连续失败5次（约5分钟）才隐藏徽章
 
 async function _cpFetchUsage() {
   try {
@@ -54,6 +57,9 @@ function _cpRender(data) {
   const level = (data.level || '').toUpperCase();
   const color = _cpColorForPct(wp);
   const resetStr = data.weekly_reset ? ` ♻️${data.weekly_reset}` : '';
+  // 后端 stale-if-error 降级数据：加 ⚠️ 提示数据更新延迟
+  const staleMark = data.stale ? ' ⚠️' : '';
+  const staleTitle = data.stale ? ' title="数据更新延迟（上游暂时不可用），显示最近一次成功数据"' : '';
 
   const icon = '<img src="/static/img/bigmodel.png" alt="bigmodel" ' +
     'style="width:14px;height:14px;vertical-align:middle;margin-right:4px">';
@@ -63,7 +69,7 @@ function _cpRender(data) {
     (level ? `<span style="color:#42a5f5;font-weight:600">${level}</span>` : '') +
     `<b style="color:${color}">${wp}%</b>` +
     `<span class="cp-bar"><span class="cp-bar-fill" style="width:${Math.min(wp, 100)}%;background:${color}"></span></span>` +
-    `<span style="color:${color}">${resetStr}</span>`;
+    `<span style="color:${color}"${staleTitle}>${staleMark}${resetStr}</span>`;
   el.style.display = 'inline-flex';
 }
 
@@ -79,9 +85,12 @@ async function _cpTick() {
   }
   const data = await _cpFetchUsage();
   if (data) {
+    _cpFailCount = 0;
     _cpRender(data);
   } else {
-    _cpHide();
+    // 失败容忍：保留上次显示，连续多次失败才隐藏
+    _cpFailCount++;
+    if (_cpFailCount >= _CP_MAX_FAILS) _cpHide();
   }
 }
 

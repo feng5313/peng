@@ -1643,12 +1643,12 @@ def do_start() -> int:
     """启动服务"""
     if sys.platform == "win32":
         config = _load_nest_config()
-        instances = config.get("instances", {})
-        if not instances:
+        instance_names = _valid_instance_names(config)
+        if not instance_names:
             _safe_print("[FAIL] 请先运行 nest install 安装服务")
             return 1
         all_ok = True
-        for name in instances:
+        for name in instance_names:
             success, msg = start_service_windows(name)
             _safe_print(f"  {'[OK]' if success else '[FAIL]'} {name} - {msg}")
             if not success:
@@ -1664,12 +1664,12 @@ def do_stop() -> int:
     """停止服务"""
     if sys.platform == "win32":
         config = _load_nest_config()
-        instances = config.get("instances", {})
-        if not instances:
+        instance_names = _valid_instance_names(config)
+        if not instance_names:
             _safe_print("[FAIL] 没有配置任何实例")
             return 1
         all_ok = True
-        for name in instances:
+        for name in instance_names:
             success, msg = stop_service_windows(name)
             _safe_print(f"  {'[OK]' if success else '[FAIL]'} {name} - {msg}")
             if not success:
@@ -1688,13 +1688,12 @@ def do_restart() -> int:
     Windows 下将所有需要 UAC 提权的操作合并到一次 UAC 弹窗中执行。
     """
     config = _load_nest_config()
-    instances = config.get("instances", {})
+    instance_names = _valid_instance_names(config)
 
-    if not instances:
+    if not instance_names:
         _safe_print("[INFO] config/nest.json 中没有配置任何实例")
         return 0
 
-    instance_names = list(instances.keys())
     _safe_print(f"[INFO] 准备重启 {len(instance_names)} 个实例: {', '.join(instance_names)}")
 
     if sys.platform == "win32":
@@ -1899,6 +1898,26 @@ def _load_nest_config() -> dict:
 
     # 默认配置
     return {"instances": {}}
+
+
+def _valid_instance_names(config: dict) -> list[str]:
+    """返回配置中合法的实例名列表（过滤空字符串等非法键）
+
+    历史缺陷：webui set-workdir 在 nest 连接 name 为空时，远程
+    _handle_set_workdir 会用 instances.setdefault("", {}) 写入空字符串实例键，
+    导致 restart/start/stop 遍历到 "" 时 _get_task_name("") 回退为默认任务名，
+    查不到任务而整体失败（事务#1665）。此处统一过滤非法键。
+    """
+    names = []
+    for key in config.get("instances", {}):
+        if isinstance(key, str) and key.strip():
+            names.append(key)
+        else:
+            _safe_print(
+                f"[WARN] 跳过非法实例键 {key!r}（疑似历史脏数据，请检查 config/nest.json）",
+                file=sys.stderr,
+            )
+    return names
 
 
 def _setup_nest_logging(name: str | None = None) -> None:

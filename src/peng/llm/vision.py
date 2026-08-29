@@ -1,7 +1,7 @@
 """
 Vision 大模型调用模块
 
-为 VisionTool 提供专用的大模型异步调用流程。
+提供专用的大模型异步视觉调用流程。
 从 config.llm.providers 中选取支持 vision 且优先级最高的 provider，
 构建包含图片的 OpenAI 格式消息，异步调用大模型 API 并返回文本结果。
 """

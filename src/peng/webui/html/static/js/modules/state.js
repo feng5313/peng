@@ -104,6 +104,10 @@ const state = {
   // 🔧 远程nest相关状态
   remoteNest: null,        // 当前选中的远程nest名称（null表示本地）
   remoteNestRoot: null,    // 远程nest的根路径（如 '/' 或 'C:/'）
+  // 🔧 Task#1641：当前选中nest的确定性平台标识（'windows'/'linux'/null未知）
+  // 由 _prepareNestState/_updateWorkdirForNest 等nest状态切换点同步维护，
+  // isCurrentNestWindows() 优先使用，避免依赖 DOM 异步更新时序导致误判
+  nestPlatform: null,
   // 文件浏览器是否从编辑器打开
   isFileBrowserFromEditor: false,
   // 文件浏览器是否处于"另存为"模式

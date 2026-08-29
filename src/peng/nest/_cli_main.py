@@ -14,7 +14,12 @@ bin/nest 也导入此模块，确保只有一个入口。
     nest stop                                                 停止系统服务
     nest restart                                              重启所有 config/nest.json 中的 nest 实例
     nest status                                               查看服务状态
+    nest list                                                 查看服务状态（status 别名）
     nest exec --nest NAME [--timeout N] [--stream] CMD [ARGS...]  在远端 nest 上执行命令
+    nest push --nest NAME LOCAL_PATH [REMOTE_PATH]            推送文件/目录到远端 nest（递归）
+    nest pull --nest NAME REMOTE_PATH [LOCAL_PATH]            从远端 nest 拉取文件/目录（递归）
+    nest sync --nest NAME [--direction push|pull] [--delete] [--dry-run] LOCAL_DIR REMOTE_DIR
+                                                              目录递归增量同步（mtime 比对）
 
 配置文件: config/nest.json（install/uninstall 等命令使用）
     nest connect/serve 的 --host 必填，--name 未指定时自动使用系统 hostname
@@ -27,6 +32,7 @@ import json
 import sys
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 
@@ -205,6 +211,205 @@ def _do_exec_stream(nest_name: str, command: str, timeout: int, port: int, api_h
     return 1
 
 
+def _make_ws_transport(nest_name: str):
+    """构建通过 peng 服务端 ws (bridge 8899) 转发的传输 transport
+
+    供 push/pull/sync 使用：CLI 可运行在 peng 主机或远端 nest 机器上，
+    统一连接 nest server 的 forward_request 通道。
+    """
+    import asyncio
+
+    try:
+        import websockets
+    except ImportError as e:
+        raise RuntimeError(f"缺少 websockets 库: {e}")
+
+    nest_server_port = 8899
+    try:
+        from peng.config.loader import load_config
+
+        config = load_config()
+        nest_cfg = getattr(config, "nest", None)
+        if nest_cfg:
+            nest_server_port = getattr(nest_cfg, "port", 8899)
+    except Exception:
+        pass
+
+    from peng.nest.protocol import NestResponse
+
+    class _WsTransport:
+        async def request(self, request_type: str, params: dict, timeout: float = 120.0):
+            uri = f"ws://localhost:{nest_server_port}"
+            async with websockets.connect(uri, max_size=50 * 1024 * 1024) as ws:
+                forward_msg = json.dumps(
+                    {
+                        "type": "forward_request",
+                        "request": {"id": str(uuid.uuid4()), "type": request_type, "params": params},
+                        "timeout": timeout,
+                        "nest_name": nest_name,
+                    },
+                    ensure_ascii=True,
+                )
+                await ws.send(forward_msg)
+                raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                resp_data = json.loads(raw)
+                if resp_data.get("type") == "error":
+                    from peng.nest.protocol import NestError
+
+                    raise NestError(resp_data.get("error", "转发请求失败"))
+                return NestResponse.from_dict(resp_data)
+
+    return _WsTransport()
+
+
+def _fmt_size(n: float) -> str:
+    """人类可读字节数"""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def _cli_push(nest_name: str, local_path: str, remote_path: str | None) -> int:
+    """推送文件/目录到远端 nest"""
+    import asyncio
+    from pathlib import Path
+
+    from peng.nest.transfer import TransferError, push_file, sync_tree
+
+    src = Path(local_path).expanduser()
+    if not src.exists():
+        print(f"错误: 本地路径不存在: {local_path}", file=sys.stderr)
+        return 1
+
+    # 默认远端路径：远端工作目录下同名文件/目录（由 workdir 决定，CLI 端无法预知，
+    # 使用相对路径让 nest 端按其 cwd 解析）
+    rpath = remote_path
+
+    async def _run():
+        transport = _make_ws_transport(nest_name)
+        if src.is_dir():
+            if rpath is None:
+                rpath_ = src.name
+            else:
+                rpath_ = rpath
+            stats = await sync_tree(transport, local_path, rpath_, direction="push")
+            return [
+                f"✅ 目录已推送到 {nest_name}:{rpath_}",
+                f"   检查 {stats['checked']} 个文件: 复制 {stats['copied']}, 跳过 {stats['skipped']}, "
+                f"删除 {stats['deleted']}, 失败 {stats['failed']}",
+                f"   传输量: {_fmt_size(stats['total_bytes'])}",
+            ] + ([f"⚠️ 有 {stats['failed']} 个文件失败"] if stats["failed"] else [])
+        rpath_f = rpath or src.name
+        result = await push_file(transport, local_path, rpath_f)
+        speed = result.get("speed", 0)
+        return [
+            f"✅ 文件已推送到 {nest_name}:{rpath_f} ({_fmt_size(result['size'])}, {_fmt_size(speed)}/s)"
+        ]
+
+    try:
+        lines = asyncio.run(_run())
+        for line in lines:
+            print(line)
+        return 0
+    except TransferError as e:
+        print(f"错误: 推送失败: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\n传输已中断", file=sys.stderr)
+        return 130
+    except Exception as e:
+        print(f"错误: {e}", file=sys.stderr)
+        return 1
+
+
+def _cli_pull(nest_name: str, remote_path: str, local_path: str | None) -> int:
+    """从远端 nest 拉取文件/目录"""
+    import asyncio
+    from pathlib import Path
+
+    from peng.nest.transfer import TransferError, pull_file, sync_tree
+
+    async def _run():
+        transport = _make_ws_transport(nest_name)
+        # 先探测远端类型
+        resp = await transport.request("stat", {"path": remote_path}, timeout=30.0)
+        if resp.error:
+            raise TransferError(f"远端路径不可访问: {resp.error}")
+        is_dir = bool((resp.data or {}).get("is_dir"))
+        if is_dir:
+            lpath = local_path or Path(remote_path.rstrip("/\\")).name or "pull_dir"
+            stats = await sync_tree(transport, lpath, remote_path, direction="pull")
+            return [
+                f"✅ 目录已从 {nest_name}:{remote_path} 同步到 {lpath}",
+                f"   检查 {stats['checked']} 个文件: 复制 {stats['copied']}, 跳过 {stats['skipped']}, "
+                f"删除 {stats['deleted']}, 失败 {stats['failed']}",
+                f"   传输量: {_fmt_size(stats['total_bytes'])}",
+            ] + ([f"⚠️ 有 {stats['failed']} 个文件失败"] if stats["failed"] else [])
+        lpath = local_path or Path(remote_path).name
+        result = await pull_file(transport, remote_path, lpath)
+        speed = result.get("speed", 0)
+        return [
+            f"✅ 文件已拉取到 {lpath} ({_fmt_size(result['size'])}, {_fmt_size(speed)}/s)"
+        ]
+
+    try:
+        lines = asyncio.run(_run())
+        for line in lines:
+            print(line)
+        return 0
+    except TransferError as e:
+        print(f"错误: 拉取失败: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\n传输已中断", file=sys.stderr)
+        return 130
+    except Exception as e:
+        print(f"错误: {e}", file=sys.stderr)
+        return 1
+
+
+def _cli_sync(nest_name: str, direction: str, delete: bool, dry_run: bool,
+              local_dir: str, remote_dir: str) -> int:
+    """目录递归增量同步"""
+    import asyncio
+
+    from peng.nest.transfer import TransferError, sync_tree
+
+    async def _run():
+        transport = _make_ws_transport(nest_name)
+        stats = await sync_tree(
+            transport, local_dir, remote_dir, direction=direction,
+            delete=delete, dry_run=dry_run,
+        )
+        verb = "预演同步" if dry_run else "同步"
+        arrow = "→" if direction == "push" else "←"
+        src_desc = local_dir if direction == "push" else f"{nest_name}:{remote_dir}"
+        dst_desc = f"{nest_name}:{remote_dir}" if direction == "push" else local_dir
+        return [
+            f"✅ {verb}完成: {src_desc} {arrow} {dst_desc}",
+            f"   检查 {stats['checked']} 个文件: 复制 {stats['copied']}, 跳过 {stats['skipped']}, "
+            f"删除 {stats['deleted']}, 失败 {stats['failed']}",
+            f"   传输量: {_fmt_size(stats['total_bytes'])}",
+        ] + ([f"⚠️ 有 {stats['failed']} 个文件失败"] if stats["failed"] else [])
+
+    try:
+        lines = asyncio.run(_run())
+        for line in lines:
+            print(line)
+        return 0
+    except TransferError as e:
+        print(f"错误: 同步失败: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\n传输已中断", file=sys.stderr)
+        return 130
+    except Exception as e:
+        print(f"错误: {e}", file=sys.stderr)
+        return 1
+
+
 def main() -> int:
     """Nest 主入口"""
     parser = argparse.ArgumentParser(
@@ -255,7 +460,10 @@ def main() -> int:
     
     # status 子命令
     subparsers.add_parser("status", help="查看服务状态")
-    
+
+    # list 子命令（status 别名）
+    subparsers.add_parser("list", help="查看服务状态（status 别名）")
+
     # default 子命令
     default_parser = subparsers.add_parser("default", help="设置默认 nest 实例")
     default_parser.add_argument("--name", required=True, help="设置为默认的实例名称")
@@ -267,7 +475,33 @@ def main() -> int:
     exec_parser.add_argument("--stream", action="store_true", default=False,
                               help="流式模式：实时显示输出（适用于长时间运行的命令）")
     exec_parser.add_argument("cmd", nargs="+", help="要执行的命令及参数")
-    
+
+    # push 子命令：推送文件/目录到远端 nest
+    push_parser = subparsers.add_parser("push", help="推送文件/目录到远端 nest（目录递归）")
+    push_parser.add_argument("--nest", required=True, help="目标 nest 名称")
+    push_parser.add_argument("local_path", help="本地文件或目录路径")
+    push_parser.add_argument("remote_path", nargs="?", default=None,
+                              help="远端目标路径（可选，默认为远端工作目录下同名文件/目录）")
+
+    # pull 子命令：从远端 nest 拉取文件/目录
+    pull_parser = subparsers.add_parser("pull", help="从远端 nest 拉取文件/目录（目录递归）")
+    pull_parser.add_argument("--nest", required=True, help="目标 nest 名称")
+    pull_parser.add_argument("remote_path", help="远端文件或目录路径")
+    pull_parser.add_argument("local_path", nargs="?", default=None,
+                              help="本地保存路径（可选，默认当前目录下同名文件/目录）")
+
+    # sync 子命令：目录递归增量同步
+    sync_parser = subparsers.add_parser("sync", help="目录递归增量同步（mtime 比对，push/pull 方向）")
+    sync_parser.add_argument("--nest", required=True, help="目标 nest 名称")
+    sync_parser.add_argument("--direction", choices=["push", "pull"], default="push",
+                              help="同步方向：push=本地→远端（默认），pull=远端→本地")
+    sync_parser.add_argument("--delete", action="store_true", default=False,
+                              help="镜像模式：删除目标端源端没有的文件")
+    sync_parser.add_argument("--dry-run", action="store_true", default=False,
+                              help="预演模式：只报告将执行的变更，不实际传输")
+    sync_parser.add_argument("local_dir", help="本地目录路径")
+    sync_parser.add_argument("remote_dir", help="远端目录路径")
+
     args = parser.parse_args()
     
     if not args.command:
@@ -282,7 +516,17 @@ def main() -> int:
     if args.command == "exec":
         stream = getattr(args, 'stream', False)
         return _do_exec(nest_name=args.nest, command=" ".join(args.cmd), timeout=args.timeout, stream=stream)
-    
+
+    if args.command == "push":
+        return _cli_push(args.nest, args.local_path, args.remote_path)
+
+    if args.command == "pull":
+        return _cli_pull(args.nest, args.remote_path, args.local_path)
+
+    if args.command == "sync":
+        return _cli_sync(args.nest, args.direction, args.delete, args.dry_run,
+                         args.local_dir, args.remote_dir)
+
     from peng.nest.cli import (
         do_install,
         do_uninstall,
@@ -292,7 +536,7 @@ def main() -> int:
         do_status,
         do_default,
     )
-    
+
     if args.command == "install":
         daemon = getattr(args, 'daemon', False)
         ssh = getattr(args, 'ssh', None)
@@ -308,6 +552,8 @@ def main() -> int:
     elif args.command == "restart":
         return do_restart()
     elif args.command == "status":
+        return do_status()
+    elif args.command == "list":
         return do_status()
     else:
         parser.print_help()

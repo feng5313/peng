@@ -1267,7 +1267,8 @@ html, body {
     height: 0;
     border-left: 4px solid transparent;
     border-right: 4px solid transparent;
-    border-top: 5px solid var(--text-secondary);
+    /* 上弹方向指示 */
+    border-bottom: 5px solid var(--text-secondary);
     margin-left: 4px;
     opacity: 0.6;
 }
@@ -1275,7 +1276,8 @@ html, body {
 .nest-dropdown-list {
     display: none;
     position: absolute;
-    top: calc(100% + 2px);
+    /* 输入栏位于页面底部，向上弹出避免被视口底边裁剪 */
+    bottom: calc(100% + 2px);
     left: 0;
     z-index: 1000;
     min-width: 100%;
@@ -1283,8 +1285,9 @@ html, body {
     background-color: var(--bg-secondary);
     border: 1px solid var(--border-color);
     border-radius: 4px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-    max-height: 300px;
+    box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.3);
+    /* 上弹时留出顶边余量，超长时可滚动而不超出视口 */
+    max-height: min(300px, calc(100dvh - 80px));
     overflow-y: auto;
     padding: 2px 0;
 }

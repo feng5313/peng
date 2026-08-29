@@ -242,6 +242,10 @@ function _syncNestDropdownValue(nestName) {
   if (hiddenInput) {
     hiddenInput.value = nestName;
   }
+  // 🔧 Task#1641：同步维护确定性平台状态（DOM更新与state同步，消除时序依赖）
+  if (typeof _resolveNestPlatform === 'function') {
+    state.nestPlatform = _resolveNestPlatform(nestName);
+  }
   _updateNestDropdownDisplay(nestName, window._latestNests);
   // 同步后端状态并保存到 config.webui.nest
   fetch('/api/nest/select', {
@@ -266,6 +270,10 @@ function _updateWorkdirForNest(selectedNest, nests) {
   state.remoteNest = selectedNest;
   state.remoteNestRoot = remoteWorkdir;
   state.workdir = remoteWorkdir;
+  // 🔧 Task#1641：同步维护确定性平台状态（供 isCurrentNestWindows/toNativeDisplayPath 使用）
+  if (typeof _resolveNestPlatform === 'function') {
+    state.nestPlatform = _resolveNestPlatform(selectedNest);
+  }
   const workdirInput = document.getElementById('workdir-input');
   if (workdirInput) {
     workdirInput.value = toNativeDisplayPath(remoteWorkdir);

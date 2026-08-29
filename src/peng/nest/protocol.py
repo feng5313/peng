@@ -39,10 +39,13 @@ class RequestType(str, enum.Enum):
     # 文件操作
     READ = "read"          # 读取文件/目录
     WRITE = "write"        # 写入文件
+    WRITE_BYTES = "write_bytes"  # 分块写入二进制文件（base64，支持 create/append）
+    DELETE = "delete"      # 删除文件或目录（sync --delete 用）
     EDIT = "edit"          # 编辑文件（精确替换）
     LINE_EDIT = "line_edit"  # 按行编辑（删除/替换/插入）
     STAT = "stat"          # 获取文件信息
     LIST_DIR = "list_dir"  # 列出目录内容
+    LIST_TREE = "list_tree"  # 递归列出目录树（sync 同步用）
     LIST_DRIVES = "list_drives"  # 列出盘符（Windows平台）
     
     # 搜索

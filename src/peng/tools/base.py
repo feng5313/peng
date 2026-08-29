@@ -50,6 +50,13 @@ class DualOutput:
         return self.summary
 
 
+# report 工具成功时的 summary 标记（单一事实源）
+# hooks/report.py 的 after-hook 依赖此标记判断"工作汇报成功，强制结束事务"。
+# ⚠️ 修改此值必须保持钩子与工具两端一致，否则会导致 report 后事务
+#    永远不结束（无限循环，参见事务#1711 对 task#2 无限循环的修复）。
+REPORT_SUCCESS_SUMMARY = "✅  report工具调用成功。"
+
+
 class Tool(ABC):
     """工具基类"""
 

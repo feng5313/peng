@@ -200,3 +200,95 @@ class TestToolEngineEmptyResponseSource:
             ):
                 found = True
         assert found, "compact分支缺少 should_complete = False"
+
+
+# ==================== 事务#1711回归：report成功标记尾空格漂移导致无限循环 ====================
+
+import pytest  # noqa: E402
+
+from peng.tools.base import REPORT_SUCCESS_SUMMARY  # noqa: E402
+
+
+class _FakeHistory:
+    """最小history桩：仅提供钩子用到的 _messages"""
+
+    def __init__(self, messages):
+        self._messages = messages
+
+
+class TestReportSuccessMarkerConsistency:
+    """report成功标记必须单一事实源，钩子能精确匹配（否则事务无限循环）"""
+
+    def test_task_summary_uses_shared_constant(self):
+        """tools/task.py 的 report 成功 summary 必须引用共享常量，禁止内联硬编码
+
+        历史bug：07-18 提交把 summary 尾空格去掉，而钩子标记尾带空格，
+        after-hook 永远匹配失败 → task#2（timer事务总管）report后不结束无限循环。
+        """
+        from pathlib import Path
+
+        src = (
+            Path(__file__).parent.parent.parent / "src" / "peng" / "tools" / "task.py"
+        ).read_text(encoding="utf-8")
+        assert '"✅  report工具调用成功。"' not in src, (
+            "task.py 中禁止内联硬编码 report 成功标记，必须使用 tools.base.REPORT_SUCCESS_SUMMARY"
+        )
+        assert "REPORT_SUCCESS_SUMMARY" in src
+
+    def test_hook_matches_exact_task_summary(self):
+        """钩子标记必须与 task.py 实际返回的 summary 精确匹配（含 históric尾空格场景）"""
+        hook = ReportHook()
+        assert REPORT_SUCCESS_SUMMARY in hook._REPORT_SUCCESS_MARKER or (
+            hook._REPORT_SUCCESS_MARKER == REPORT_SUCCESS_SUMMARY
+        ), "钩子标记与 task.py summary 常量不一致"
+
+    def test_hook_action_blocks_on_report_success(self, monkeypatch):
+        """report成功（content=共享常量）→ after-hook 必须返回 block（强制结束事务）"""
+        hook = ReportHook()
+        # 无未读info（staticmethod经类patch后实例调用会绑定self）
+        monkeypatch.setattr(ReportHook, "_get_unread_info", staticmethod(lambda tid: []))
+
+        history = _FakeHistory(
+            [
+                {"role": "user", "content": "干活"},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "name": "report",
+                    "content": REPORT_SUCCESS_SUMMARY,
+                },
+            ]
+        )
+        action, reason = hook.hook_action(
+            message_id=1,
+            task_id=2,
+            category="tools",
+            name="report",
+            metadata={"task": {"id": 2}, "history": history},
+        )
+        assert action == "block", f"report成功后必须结束事务，实际返回 {action}"
+        assert reason and "结束" in reason
+
+    def test_hook_action_continues_with_unread_info(self, monkeypatch):
+        """report成功但有未读info → 不结束，提示继续"""
+        hook = ReportHook()
+        monkeypatch.setattr(ReportHook, "_get_unread_info", staticmethod(lambda tid: [{"id": 1}]))
+
+        history = _FakeHistory(
+            [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "name": "report",
+                    "content": REPORT_SUCCESS_SUMMARY,
+                }
+            ]
+        )
+        action, reason = hook.hook_action(
+            message_id=1,
+            task_id=2,
+            category="tools",
+            name="report",
+            metadata={"task": {"id": 2}, "history": history},
+        )
+        assert action == "continue"

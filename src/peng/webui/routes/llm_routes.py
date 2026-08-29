@@ -747,6 +747,10 @@ async def save_input_history(request: SaveInputHistoryRequest) -> dict[str, Any]
 # 缓存：避免每分钟都请求智谱 API
 _coding_plan_cache: dict[str, Any] = {}
 _CODING_PLAN_CACHE_TTL = 55  # 秒，略小于前端 60s 轮询
+_CODING_PLAN_STALE_MAX = 600  # 秒，请求失败时允许降级返回旧缓存的最长时间（10分钟）
+_CODING_PLAN_RETRIES = 2  # 单轮请求失败后的重试次数（总共最多尝试 3 次）
+_CODING_PLAN_TIMEOUT = (5, 10)  # (连接超时, 读超时) 秒
+_coding_plan_lock = asyncio.Lock()  # 合并发刷新：防止多标签页同时穿透缓存打智谱 API
 
 
 def _get_coding_plan_api_key() -> str | None:
@@ -783,12 +787,61 @@ def _generate_jwt(api_key: str) -> str:
     )
 
 
+def _fetch_coding_plan_raw(api_key: str) -> dict[str, Any] | None:
+    """带重试地请求智谱 quota API，返回原始 dict，失败返回 None。"""
+    import requests
+
+    token = _generate_jwt(api_key)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    base = "https://open.bigmodel.cn"
+
+    last_err: Exception | None = None
+    for attempt in range(_CODING_PLAN_RETRIES + 1):
+        if attempt > 0:
+            time.sleep(1.5)  # 重试间隔，避开瞬时抖动
+        try:
+            r = requests.get(
+                f"{base}/api/monitor/usage/quota/limit",
+                headers=headers,
+                timeout=_CODING_PLAN_TIMEOUT,
+            )
+            if r.status_code == 200 and r.text:
+                data = r.json()
+                if data.get("success"):
+                    return data
+                last_err = RuntimeError(f"智谱返回业务失败: {str(data)[:200]}")
+            else:
+                last_err = RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+        except Exception as e:  # 网络超时/连接失败
+            last_err = e
+    if last_err:
+        logger.warning(f"查询智谱 Coding Plan 用量失败（已重试 {_CODING_PLAN_RETRIES} 次）: {last_err}")
+    return None
+
+
+def _stale_coding_plan_result(now: float) -> dict[str, Any] | None:
+    """请求失败时的降级：返回旧缓存数据（stale-if-error），超时太久则返回 None。"""
+    ts = _coding_plan_cache.get("ts")
+    data = _coding_plan_cache.get("data")
+    if not ts or not data:
+        return None
+    age = now - ts
+    if age > _CODING_PLAN_STALE_MAX:
+        return None
+    result = dict(data)
+    result["stale"] = True  # 标记为旧数据，前端可提示"更新延迟"
+    return result
+
+
 @router.get("/llm/coding-plan-usage")
 async def get_coding_plan_usage() -> dict[str, Any]:
     """查询智谱 Coding Plan 的当前用量数据。
 
     返回套餐等级、5h窗口额度、周额度使用率等信息。
-    数据缓存 55 秒，避免频繁请求。
+    数据缓存 55 秒，避免频繁请求；请求失败自动重试并降级返回旧缓存（stale-if-error）。
     """
     # 检查缓存
     now = time.time()
@@ -797,34 +850,26 @@ async def get_coding_plan_usage() -> dict[str, Any]:
         if cached:
             return cached
 
-    api_key = _get_coding_plan_api_key()
-    if not api_key:
-        return {"success": False, "message": "未找到 Coding Plan API Key"}
+    # 合并发刷新：同一时刻多个标签页/客户端只触发一次上游请求
+    async with _coding_plan_lock:
+        # 双重检查：等锁期间可能已被其他协程刷新
+        now = time.time()
+        if _coding_plan_cache.get("ts") and now - _coding_plan_cache["ts"] < _CODING_PLAN_CACHE_TTL:
+            cached = _coding_plan_cache.get("data")
+            if cached:
+                return cached
 
-    try:
-        token = _generate_jwt(api_key)
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
-        base = "https://open.bigmodel.cn"
+        api_key = _get_coding_plan_api_key()
+        if not api_key:
+            return {"success": False, "message": "未找到 Coding Plan API Key"}
 
-        # 在线程池中执行同步 HTTP 请求
         loop = asyncio.get_event_loop()
-
-        def _do_request():
-            import requests
-            r = requests.get(
-                f"{base}/api/monitor/usage/quota/limit",
-                headers=headers,
-                timeout=10,
-            )
-            if r.status_code != 200 or not r.text:
-                return None
-            return r.json()
-
-        raw = await loop.run_in_executor(None, _do_request)
-        if not raw or not raw.get("success"):
+        raw = await loop.run_in_executor(None, _fetch_coding_plan_raw, api_key)
+        if not raw:
+            # 全部重试失败 → 降级返回旧缓存
+            stale = _stale_coding_plan_result(now)
+            if stale:
+                return stale
             return {"success": False, "message": "智谱 API 返回异常"}
 
         data = raw.get("data", {})
@@ -864,16 +909,16 @@ async def get_coding_plan_usage() -> dict[str, Any]:
         _coding_plan_cache["ts"] = now
         return result
 
-    except Exception as e:
-        logger.error(f"查询 Coding Plan 用量失败: {e}\n{traceback.format_exc()}")
-        return {"success": False, "message": f"查询失败: {e}"}
-
 
 # ==================== DeepSeek 用量查询 ====================
 
 # 缓存：避免每分钟都请求 DeepSeek API
 _deepseek_cache: dict[str, Any] = {}
 _DEEPSEEK_CACHE_TTL = 55  # 秒
+_DEEPSEEK_STALE_MAX = 600  # 秒，请求失败时允许降级返回旧缓存的最长时间（10分钟）
+_DEEPSEEK_RETRIES = 2  # 单轮请求失败后的重试次数
+_DEEPSEEK_TIMEOUT = (5, 10)  # (连接超时, 读超时) 秒
+_deepseek_lock = asyncio.Lock()  # 合并发刷新
 
 
 def _get_deepseek_api_key_and_base() -> tuple[str | None, str]:
@@ -1010,12 +1055,35 @@ def _is_deepseek_peak() -> bool:
     return (9 <= hour < 12) or (14 <= hour < 18)
 
 
+def _fetch_deepseek_raw(api_key: str, base_url: str) -> dict[str, Any] | None:
+    """带重试地请求 DeepSeek 余额 API，返回原始 dict，失败返回 None。"""
+    import requests
+
+    url = f"{base_url.rstrip('/')}/user/balance"
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    last_err: Exception | None = None
+    for attempt in range(_DEEPSEEK_RETRIES + 1):
+        if attempt > 0:
+            time.sleep(1.5)
+        try:
+            r = requests.get(url, headers=headers, timeout=_DEEPSEEK_TIMEOUT)
+            if r.status_code == 200 and r.text:
+                return r.json()
+            last_err = RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            last_err = e
+    if last_err:
+        logger.warning(f"查询 DeepSeek 余额失败（已重试 {_DEEPSEEK_RETRIES} 次）: {last_err}")
+    return None
+
+
 @router.get("/llm/deepseek-usage")
 async def get_deepseek_usage() -> dict[str, Any]:
     """查询 DeepSeek provider 的消耗数据。
 
     返回余额、今日费用、累计费用、是否高峰时段。
-    数据缓存 55 秒。
+    数据缓存 55 秒；请求失败自动重试并降级返回旧缓存（stale-if-error）。
     """
     # 检查缓存
     now = time.time()
@@ -1024,26 +1092,28 @@ async def get_deepseek_usage() -> dict[str, Any]:
         if cached:
             return cached
 
-    api_key, base_url = _get_deepseek_api_key_and_base()
-    if not api_key:
-        return {"success": False, "message": "未找到 DeepSeek provider"}
+    async with _deepseek_lock:
+        # 双重检查：等锁期间可能已被其他协程刷新
+        now = time.time()
+        if _deepseek_cache.get("ts") and now - _deepseek_cache["ts"] < _DEEPSEEK_CACHE_TTL:
+            cached = _deepseek_cache.get("data")
+            if cached:
+                return cached
 
-    try:
+        api_key, base_url = _get_deepseek_api_key_and_base()
+        if not api_key:
+            return {"success": False, "message": "未找到 DeepSeek provider"}
+
         loop = asyncio.get_event_loop()
-
-        def _do_request():
-            import requests
-            r = requests.get(
-                f"{base_url.rstrip('/')}/user/balance",
-                headers={"Authorization": f"Bearer {api_key}"},
-                timeout=10,
-            )
-            if r.status_code != 200 or not r.text:
-                return None
-            return r.json()
-
-        raw = await loop.run_in_executor(None, _do_request)
+        raw = await loop.run_in_executor(None, _fetch_deepseek_raw, api_key, base_url)
         if not raw:
+            # 全部重试失败 → 降级返回旧缓存
+            cached_ts = _deepseek_cache.get("ts")
+            cached = _deepseek_cache.get("data")
+            if cached_ts and cached and now - cached_ts <= _DEEPSEEK_STALE_MAX:
+                result = dict(cached)
+                result["stale"] = True
+                return result
             return {"success": False, "message": "DeepSeek API 返回异常"}
 
         # 提取 CNY 余额
@@ -1075,10 +1145,6 @@ async def get_deepseek_usage() -> dict[str, Any]:
         _deepseek_cache["data"] = result
         _deepseek_cache["ts"] = now
         return result
-
-    except Exception as e:
-        logger.error(f"查询 DeepSeek 用量失败: {e}\n{traceback.format_exc()}")
-        return {"success": False, "message": f"查询失败: {e}"}
 
 
 @router.put("/llm/deepseek-usage/correct")

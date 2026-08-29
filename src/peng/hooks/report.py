@@ -7,6 +7,7 @@
 import logging
 
 from peng.hooks.types import BaseHook, HookPattern, HookPatterns
+from peng.tools.base import REPORT_SUCCESS_SUMMARY
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,11 @@ class ReportHook(BaseHook):
                     last_msg = messages[-1]
                     if last_msg.get("name") == "report" and "content" in last_msg:
                         content: str = last_msg["content"]
-                        finish_output = "✅  report工具调用成功。 "
+                        # 🔧 修复无限循环：完成标记必须与 tools/task.py ReportTool
+                        # 成功时的 summary 精确一致（历史bug：此处旧代码尾带空格
+                        # "…成功。 "，而 task.py 的 summary 无尾空格，导致
+                        # after-hook 永远匹配失败→report后事务不结束→无限循环）
+                        finish_output = self._REPORT_SUCCESS_MARKER
                         done = finish_output in content
                         if done:
                             # 检查是否有未读info，如果有则不结束，继续迭代
@@ -123,8 +128,8 @@ class ReportHook(BaseHook):
             logger.error(f"[report] 检查失败: {e}", exc_info=True)
             return "continue", None  # 出错不阻止
 
-    # report 工具成功时返回的 summary 标记（与 tools/task.py 中一致）
-    _REPORT_SUCCESS_MARKER = "✅  report工具调用成功。"
+    # report 工具成功时返回的 summary 标记（单一事实源：tools/base.py）
+    _REPORT_SUCCESS_MARKER = REPORT_SUCCESS_SUMMARY
 
     @classmethod
     def _can_skip_report(cls, messages: list[dict], task: dict | None) -> bool:

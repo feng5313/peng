@@ -1,23 +1,44 @@
 // ==================== 路径格式工具 ====================
 
 /**
+ * 解析指定 nest 的平台标识（统一小写）
+ * @param {string} nestName - nest名称（'local' 或远程nest键名）
+ * @returns {string|null} 'windows'/'linux'/null（无法确定时）
+ */
+function _resolveNestPlatform(nestName) {
+  // 本地 nest：使用后端平台信息（/api/config 已返回，可靠）
+  if (!nestName || nestName === 'local') {
+    return state.platform || null;
+  }
+  // 远程 nest：从缓存的 nest 连接信息获取
+  if (window._latestNests) {
+    const info = window._latestNests[nestName];
+    if (info && info.platform) {
+      const p = String(info.platform).toLowerCase();
+      if (p === 'windows' || p === 'linux' || p === 'darwin') return p === 'windows' ? 'windows' : 'linux';
+    }
+  }
+  return null;
+}
+
+/**
  * 判断当前选中的 nest 是否为 Windows 平台
  * @returns {boolean}
  */
 function isCurrentNestWindows() {
-  // 🔧 优先使用 state.remoteNest（由 _prepareNestState 提前设置，比 DOM 更新更早）
+  // 🔧 Task#1641：优先使用确定性状态 state.nestPlatform（由 _prepareNestState /
+  // _updateWorkdirForNest 在nest切换时同步维护），避免 DOM 异步更新时序导致误判
+  if (state.nestPlatform) {
+    return state.nestPlatform === 'windows';
+  }
+  // 回退：动态解析（远程nest信息或后端平台）
   const nestName = state.remoteNest || (() => {
     const nestSelect = document.getElementById('nest-select');
     return nestSelect ? nestSelect.value : '';
   })();
-  // 远程 nest：从 nest 连接信息获取平台
-  if (nestName && nestName !== 'local' && window._latestNests) {
-    const info = window._latestNests[nestName];
-    if (info && info.platform) {
-      return info.platform.toLowerCase() === 'windows';
-    }
-  }
-  // 本地 nest：使用后端平台信息
+  const platform = _resolveNestPlatform(nestName);
+  if (platform) return platform === 'windows';
+  // 最后回退：后端平台信息
   return state.platform === 'windows';
 }
 

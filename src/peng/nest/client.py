@@ -382,6 +382,49 @@ async def write_file(
     )
 
 
+async def write_bytes(
+    file_path: str,
+    data_b64: str,
+    mode: str = "create",
+    mtime: float | None = None,
+    nest_name: str | None = None,
+) -> NestResponse:
+    """分块写入二进制文件（base64，nest 端二进制安全写入）"""
+    params: dict[str, Any] = {"path": file_path, "data_b64": data_b64, "mode": mode}
+    if mtime is not None:
+        params["mtime"] = mtime
+    return await send_request("write_bytes", params, nest_name=nest_name)
+
+
+async def read_bytes(
+    file_path: str,
+    offset: int = 0,
+    chunk_size: int = 1048576,
+    nest_name: str | None = None,
+) -> NestResponse:
+    """字节级分块读取文件（base64 返回，二进制安全）"""
+    return await send_request(
+        "read_bytes",
+        {
+            "path": file_path,
+            "offset": offset,
+            "chunk_size": chunk_size,
+            "encoding": "base64",
+        },
+        nest_name=nest_name,
+    )
+
+
+async def list_tree(path: str, nest_name: str | None = None) -> NestResponse:
+    """递归列出目录树（sync 同步用）"""
+    return await send_request("list_tree", {"path": path}, nest_name=nest_name)
+
+
+async def delete_path(path: str, nest_name: str | None = None) -> NestResponse:
+    """删除文件或目录（sync --delete 用）"""
+    return await send_request("delete", {"path": path}, nest_name=nest_name)
+
+
 async def edit_file(
     file_path: str,
     old_string: str,
@@ -597,6 +640,31 @@ class _NestClientCompat:
 
     async def write_file(self, file_path: str, content: str, **kw) -> NestResponse:
         return await write_file(file_path, content, nest_name=self._nest_name)
+
+    async def write_bytes(
+        self,
+        file_path: str,
+        data_b64: str,
+        mode: str = "create",
+        mtime: float | None = None,
+        **kw,
+    ) -> NestResponse:
+        """分块写入二进制文件（base64）"""
+        return await write_bytes(file_path, data_b64, mode=mode, mtime=mtime, nest_name=self._nest_name)
+
+    async def read_bytes(
+        self, file_path: str, offset: int = 0, chunk_size: int = 1048576, **kw
+    ) -> NestResponse:
+        """字节级分块读取文件（base64 返回）"""
+        return await read_bytes(file_path, offset, chunk_size, nest_name=self._nest_name)
+
+    async def list_tree(self, path: str, **kw) -> NestResponse:
+        """递归列出目录树（sync 同步用）"""
+        return await list_tree(path, nest_name=self._nest_name)
+
+    async def delete_path(self, path: str, **kw) -> NestResponse:
+        """删除文件或目录（sync --delete 用）"""
+        return await delete_path(path, nest_name=self._nest_name)
 
     async def write(self, file_path: str, content: str, **kw) -> NestResponse:
         """write_file 的别名，供工具层调用"""

@@ -609,14 +609,14 @@ def trim_diff(diff: str) -> str:
     return "\n".join(trimmed_lines)
 
 
-
-
 def _extract_raw_content(read_resp) -> str:
     """从 nest read 响应中提取原始文本内容（去掉行号前缀）"""
     if not read_resp or not read_resp.data:
         return ""
     lines_list = read_resp.data.get("lines", [])
     return "\n".join(re.sub(r"^\d+: ", "", ln, count=1) for ln in lines_list)
+
+
 # ============================================================
 # 二进制文件检测 - 完全照搬 opencode read.ts
 # ============================================================
@@ -745,6 +745,94 @@ def is_pdf_file(file_path: str) -> bool:
 
 
 # ============================================================
+# 图片缩放 - read 工具读取多模态图片时降低分辨率（不修改原图）
+# ============================================================
+
+# read 附件图片的最大像素数（1M 像素）
+MAX_IMAGE_PIXELS = 1024 * 1024
+MAX_IMAGE_PIXELS_LABEL = f"{MAX_IMAGE_PIXELS // (1024 * 1024)}M 像素"
+
+# 本地 fallback 时补充 mimetypes 不识别的图片扩展名（与 nest local.py 保持一致）
+_EXTRA_IMAGE_EXTENSIONS = {".webp", ".ico", ".tiff", ".tif", ".avif", ".heic", ".heif"}
+
+
+def downscale_image_bytes(data: bytes, mime: str) -> tuple[bytes, str, bool]:
+    """
+    将图片缩放到 MAX_IMAGE_PIXELS（1M 像素）以内。
+
+    仅在内存中处理，不修改磁盘上的原图文件。
+
+    Args:
+        data: 原始图片字节流
+        mime: 原始 MIME 类型
+
+    Returns:
+        (图片字节流, MIME 类型, 是否发生了缩放)。
+        未超过像素上限时原样返回；无法解码时由调用方容错处理。
+    """
+    import io
+
+    from PIL import Image, ImageOps
+
+    with Image.open(io.BytesIO(data)) as src:
+        # 按 EXIF orientation 摆正像素方向（重编码后 EXIF 会丢失，避免方向错误）
+        src = ImageOps.exif_transpose(src) or src
+        width, height = src.size
+        if width * height <= MAX_IMAGE_PIXELS:
+            return data, mime, False
+
+        # 等比缩放到 1M 像素以内
+        scale = (MAX_IMAGE_PIXELS / (width * height)) ** 0.5
+        new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        img = src.resize(new_size, Image.LANCZOS)
+
+    # 重新编码：JPEG/WEBP 有损压缩控制体积，其余格式统一转 PNG（支持 alpha 等全部模式）
+    if mime == "image/webp":
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA")
+        fmt, save_kwargs, out_mime = "WEBP", {"quality": 85}, "image/webp"
+    elif mime == "image/jpeg":
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        fmt, save_kwargs, out_mime = "JPEG", {"quality": 85}, "image/jpeg"
+    else:
+        fmt, save_kwargs, out_mime = "PNG", {}, "image/png"
+
+    buf = io.BytesIO()
+    img.save(buf, format=fmt, **save_kwargs)
+    return buf.getvalue(), out_mime, True
+
+
+def _build_binary_attachment(file_path: str, b64_data: str, mime: str) -> DualOutput:
+    """
+    构建图片/PDF 附件输出。
+
+    图片会缩放到 MAX_IMAGE_PIXELS（1M 像素）以内（仅内存中处理，不修改原图），
+    缩放失败时保留原始数据并记录日志。
+    """
+    import base64
+
+    note = ""
+    if mime.startswith("image/"):
+        try:
+            data, mime, downscaled = downscale_image_bytes(base64.b64decode(b64_data), mime)
+            if downscaled:
+                b64_data = base64.b64encode(data).decode("utf-8")
+                note = f"（已缩放至 ≤{MAX_IMAGE_PIXELS_LABEL}，原图未修改）"
+        except Exception as e:
+            logger.warning(f"read 图片缩放失败，保留原始数据: {e}")
+
+    kind = "图片" if mime.startswith("image/") else "PDF"
+    msg = f"{kind} 读取成功{note}"
+    data_url = f"data:{mime};base64,{b64_data}"
+    return DualOutput(
+        summary=msg,
+        display=f"📄 {msg}: {file_path}",
+        attachments=[{"type": "file", "mime": mime, "url": data_url}],
+    )
+
+
+# ============================================================
 # 文件不存在时的建议功能 - 照搬 opencode read.ts
 # ============================================================
 
@@ -792,7 +880,8 @@ READ_DESCRIPTION = """从远程 nest 读取文件或目录。如果路径不存�
 - 超过 2000 个字符的行会被截断。
 - 当您知道要读取多个文件时，请并行调用此工具。
 - 避免重复的小切片（30 行块）。如果需要更多上下文，请读取更大的窗口。
-- 此工具可以读取图像文件和 PDF 并将其作为文件附件返回。"""
+- 多模态大模型可以用此工具可以读取支持的图片、音频、视频、PDF等文件格式，并将其作为文件附件返回，然后识别。
+- 读取图片时自动等比缩放到 1M 像素以内后再返回（仅在内存中处理，原图不会被修改）。"""
 
 
 class ReadTool(Tool):
@@ -919,19 +1008,10 @@ class ReadTool(Tool):
                 return DualOutput(summary=output, display=output)
 
             if result.get("type") == "binary":
-                # 二进制文件（图片/PDF）
-                import base64
-
+                # 二进制文件（图片/PDF）；图片缩放到 1M 像素以内（不修改原图）
                 data = result.get("data", "")
                 mime = result.get("mime", "application/octet-stream")
-                data_url = f"data:{mime};base64,{data}"
-                is_image = mime.startswith("image/")
-                msg = f"{'图片' if is_image else 'PDF'} 读取成功"
-                return DualOutput(
-                    summary=msg,
-                    display=f"📄 {msg}: {file_path}",
-                    attachments=[{"type": "file", "mime": mime, "url": data_url}],
-                )
+                return _build_binary_attachment(file_path, data, mime)
 
             # 文本文件
             lines = result.get("lines", [])
@@ -990,6 +1070,21 @@ class ReadTool(Tool):
             output = "\n".join(output_parts)
             return DualOutput(summary=output, display=output)
 
+        # 图片/PDF：作为附件返回（图片缩放到 1M 像素以内，不修改原图）
+        mime = get_mime_type(str(path))
+        is_image = mime.startswith("image/") or path.suffix.lower() in _EXTRA_IMAGE_EXTENSIONS
+        if is_image or is_pdf_file(str(path)):
+            import base64
+
+            try:
+                raw = path.read_bytes()
+            except Exception as e:
+                return DualOutput(
+                    summary=f"读取文件失败: {e}",
+                    display=f"❌ 读取文件失败: {file_path}\n{e}",
+                )
+            return _build_binary_attachment(file_path, base64.b64encode(raw).decode("utf-8"), mime)
+
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except Exception as e:
@@ -1032,7 +1127,8 @@ class ReadTool(Tool):
         output_parts.append("</content>")
         output = "\n".join(output_parts)
         return DualOutput(
-            summary=output, display=f"📄 [本地] 文件读取 {file_path} (行 {start}-{end}, 共 {total_lines} 行):\n"
+            summary=output,
+            display=f"📄 [本地] 文件读取 {file_path} (行 {start}-{end}, 共 {total_lines} 行):\n",
         )
 
 
@@ -1476,7 +1572,9 @@ def _build_local_context(
     # 如果替换/插入了多行，确保窗口覆盖整个新内容
     if affected_lines:
         if operation == "replace" and start_line:
-            ctx_end = max(ctx_end, min(new_total, start_line + len(affected_lines) + CONTEXT_PAD - 1))
+            ctx_end = max(
+                ctx_end, min(new_total, start_line + len(affected_lines) + CONTEXT_PAD - 1)
+            )
         elif operation == "insert" and insert_line is not None:
             ctx_end = max(ctx_end, min(new_total, insert_line + len(affected_lines) + CONTEXT_PAD))
 
@@ -1768,7 +1866,9 @@ class LineEditTool(Tool):
                 from peng.common.line_edit_check import detect_line_edit_duplication
 
                 # 本地分支各操作变量名不同(replacement_lines/insert_lines)，统一重建
-                _affected = content.split("\n") if (content and operation in ("replace", "insert")) else []
+                _affected = (
+                    content.split("\n") if (content and operation in ("replace", "insert")) else []
+                )
                 dup_warning = detect_line_edit_duplication(
                     lines_before=lines_before_snapshot,
                     operation=operation,
@@ -1789,7 +1889,9 @@ class LineEditTool(Tool):
                     affected = content.split("\n") if content else []
                 else:  # insert
                     affected = content.split("\n") if content else []
-                context_preview = _build_local_context(lines, operation, start_line, end_line, line, affected)
+                context_preview = _build_local_context(
+                    lines, operation, start_line, end_line, line, affected
+                )
             except Exception:
                 context_preview = []
 

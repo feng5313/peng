@@ -6,7 +6,7 @@
     "host": "0.0.0.0",
     "port": 6688,
     "theme": "dark",
-    "workdir": "/tmp",
+    "workdir": "",
     "nest": "local",
     "jwt_secret_key": "${JWT_SECRET_KEY:-peng-dev-secret-key-change-in-production}",
     "output_source_filters": {

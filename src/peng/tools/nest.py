@@ -20,6 +20,7 @@ import json
 import urllib.parse
 import urllib.request
 import urllib.error
+from pathlib import Path
 from typing import Any
 
 from peng.tools.base import DualOutput, Tool, ToolError
@@ -396,7 +397,7 @@ class NestTool(Tool):
 
     @property
     def description(self) -> str:
-        return """获取所有nest信息、在远程nest上运行命令、从远程nest传输文件到本地。
+        return """获取所有nest信息、在远程nest上运行命令、与远程nest传输文件。
 
 通过nest服务管理远程nest连接。
 
@@ -404,13 +405,18 @@ class NestTool(Tool):
 1. list: 列出所有nest连接信息（标明哪个是自身nest）
 2. exec: 在指定nest上运行bash命令，禁止用nest exec操作自身nest（应直接调用read/edit/write/bash工具）！
 3. pull: 从远程nest传输文件到本地nest
+4. push: 推送本地文件/目录到远程nest（二进制安全，目录递归）
+5. sync: 目录递归同步（增量mtime比对，支持push/pull方向、--delete镜像、dry-run预演）
 
 参数：
-- action: 操作类型 list/exec/pull（必填）
-- nest: 目标nest名称（exec/pull时必填）
+- action: 操作类型 list/exec/pull/push/sync（必填）
+- nest: 目标nest名称（exec/pull/push/sync时必填）
 - command: bash命令（exec时必填）
-- remote_path: 远程文件路径（pull时必填）
-- local_path: 本地保存路径（pull时可选，默认为当前工作目录）"""
+- remote_path: 远程文件/目录路径（pull/push/sync时必填）
+- local_path: 本地文件/目录路径（pull时可选默认工作目录；push/sync时必填）
+- direction: 同步方向 push（默认，本地→远端）或 pull（远端→本地），仅sync
+- delete: 镜像删除目标端多余文件，仅sync（可选，默认false）
+- dry_run: 只预演不实际传输，仅sync（可选，默认false）"""
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -419,12 +425,12 @@ class NestTool(Tool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "exec", "pull"],
-                    "description": "操作类型：list=列出所有nest, exec=远程执行命令, pull=拉取文件。",
+                    "enum": ["list", "exec", "pull", "push", "sync"],
+                    "description": "操作类型：list=列出所有nest, exec=远程执行命令, pull=拉取文件, push=推送文件, sync=目录递归同步。",
                 },
                 "nest": {
                     "type": "string",
-                    "description": "目标nest的display_key（exec/pull时必填）",
+                    "description": "目标nest的display_key（exec/pull/push/sync时必填）",
                 },
                 "command": {
                     "type": "string",
@@ -432,11 +438,26 @@ class NestTool(Tool):
                 },
                 "remote_path": {
                     "type": "string",
-                    "description": "远程nest上的文件路径（pull时必填）",
+                    "description": "远程nest上的文件/目录路径（pull/push/sync时必填；push目录时为远端目标目录）",
                 },
                 "local_path": {
                     "type": "string",
-                    "description": "本地保存路径（pull时可选，默认为当前工作目录下同名文件）",
+                    "description": "本地文件/目录路径（pull时可选默认当前工作目录；push/sync时必填）",
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": ["push", "pull"],
+                    "description": "sync同步方向：push=本地→远端（默认），pull=远端→本地",
+                },
+                "delete": {
+                    "type": "boolean",
+                    "description": "sync时删除目标端源端没有的文件（镜像模式，默认false）",
+                    "default": False,
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "sync时只预演变更不实际传输（默认false）",
+                    "default": False,
                 },
             },
             "required": ["action"],
@@ -451,8 +472,12 @@ class NestTool(Tool):
             return await self._exec_command(kwargs)
         elif action == "pull":
             return await self._pull_file(kwargs)
+        elif action == "push":
+            return await self._push_file(kwargs)
+        elif action == "sync":
+            return await self._sync_tree(kwargs)
         else:
-            raise ToolError(f"不支持的操作: {action}，支持: list/exec/pull")
+            raise ToolError(f"不支持的操作: {action}，支持: list/exec/pull/push/sync")
 
     def _get_webui_port(self) -> int:
         """获取webui端口"""
@@ -563,8 +588,22 @@ class NestTool(Tool):
         except Exception as e:
             raise ToolError(f"远程命令执行失败(nest={nest_name}): {e}") from e
 
+    def _make_transport(self, nest_name: str):
+        """构建传输 transport（基于 nest client 协议请求）"""
+        from peng.nest.client import send_request as _client_send_request
+
+        class _Transport:
+            async def request(self, request_type: str, params: dict, timeout: float = 120.0):
+                return await _client_send_request(
+                    request_type, params, timeout=timeout, nest_name=nest_name
+                )
+
+        return _Transport()
+
     async def _pull_file(self, kwargs: dict) -> DualOutput:
-        """从远程nest拉取文件（通过HTTP API转发到nest连接）"""
+        """从远程nest拉取文件/目录（协议分块传输，二进制安全，目录递归）"""
+        from peng.nest.transfer import TransferError, pull_file, sync_tree
+
         nest_name = kwargs.get("nest", "")
         remote_path = kwargs.get("remote_path", "")
         local_path = kwargs.get("local_path", "")
@@ -574,40 +613,119 @@ class NestTool(Tool):
         if not remote_path:
             raise ToolError("pull操作需要提供remote_path参数（远程文件路径）")
 
+        transport = self._make_transport(nest_name)
+
+        # 先 stat 判断远端是文件还是目录
+        stat_resp = await transport.request("stat", {"path": remote_path}, timeout=30.0)
+        if stat_resp.error:
+            raise ToolError(f"远端路径不可访问: {stat_resp.error}")
+        is_dir = bool((stat_resp.data or {}).get("is_dir"))
+
         try:
-            import base64
+            lines = []
+            if is_dir:
+                if not local_path:
+                    local_path = os.path.join(os.getcwd(), os.path.basename(remote_path.rstrip("/\\")) or "pull_dir")
+                stats = await sync_tree(transport, local_path, remote_path, direction="pull")
+                lines.append(f"✅ 目录已从 {nest_name}:{remote_path} 同步到 {local_path}")
+                lines.append(
+                    f"   检查 {stats['checked']} 个文件: 复制 {stats['copied']}, "
+                    f"跳过 {stats['skipped']}, 删除 {stats['deleted']}, 失败 {stats['failed']}"
+                )
+                if stats["failed"]:
+                    raise ToolError(f"目录同步有 {stats['failed']} 个文件失败")
+            else:
+                if not local_path:
+                    local_path = os.path.join(os.getcwd(), os.path.basename(remote_path))
+                result = await pull_file(transport, remote_path, local_path)
+                lines.append(f"✅ 文件已拉取: {local_path} ({result['size']} 字节)")
 
-            # 通过/api/nest/exec在远端nest上base64编码文件内容
-            cmd = f"python3 -c \"import base64; f=open('{remote_path}','rb'); print(base64.b64encode(f.read()).decode()); f.close()\" 2>&1"
-            params = urllib.parse.urlencode({"nest": nest_name, "command": cmd, "timeout": 30})
-            resp = self._api_post(f"/api/nest/exec?{params}", {})
+            output = "\n".join(lines)
+            return DualOutput(summary=output, display=output)
+        except TransferError as e:
+            raise ToolError(f"拉取失败(nest={nest_name}): {e}") from e
 
-            if not resp.get("success"):
-                raise ToolError(f"读取远程文件失败: {resp.get('error', 'unknown')}")
+    async def _push_file(self, kwargs: dict) -> DualOutput:
+        """推送本地文件/目录到远程nest（协议分块传输，二进制安全，目录递归）"""
+        from peng.nest.transfer import TransferError, push_file, sync_tree
 
-            stdout = resp.get("stdout", "").strip()
-            stderr = resp.get("stderr", "")
-            exit_code = resp.get("exit_code", -1)
+        nest_name = kwargs.get("nest", "")
+        local_path = kwargs.get("local_path", "")
+        remote_path = kwargs.get("remote_path", "")
 
-            if exit_code != 0:
-                raise ToolError(f"读取远程文件失败: {stderr or stdout}")
+        if not nest_name:
+            raise ToolError("push操作需要提供nest参数（目标nest名称）")
+        if not local_path:
+            raise ToolError("push操作需要提供local_path参数（本地文件/目录路径）")
+        if not remote_path:
+            raise ToolError("push操作需要提供remote_path参数（远端目标路径）")
 
-            if not stdout:
-                raise ToolError("远程文件为空或读取失败")
+        src = Path(local_path).expanduser()
+        if not src.exists():
+            raise ToolError(f"本地路径不存在: {local_path}")
 
-            content_bytes = base64.b64decode(stdout)
-            if not local_path:
-                local_path = os.path.join(os.getcwd(), os.path.basename(remote_path))
-            os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-            with open(local_path, "wb") as f:
-                f.write(content_bytes)
+        transport = self._make_transport(nest_name)
 
-            size = len(content_bytes)
-            return DualOutput(
-                summary=f"文件已从 {nest_name}:{remote_path} 拉取到 {local_path} ({size} 字节)",
-                display=f"✅ 文件已拉取: {local_path} ({size} 字节)",
+        try:
+            lines = []
+            if src.is_dir():
+                stats = await sync_tree(transport, local_path, remote_path, direction="push")
+                lines.append(f"✅ 目录已推送到 {nest_name}:{remote_path}")
+                lines.append(
+                    f"   检查 {stats['checked']} 个文件: 复制 {stats['copied']}, "
+                    f"跳过 {stats['skipped']}, 删除 {stats['deleted']}, 失败 {stats['failed']}"
+                )
+                if stats["failed"]:
+                    raise ToolError(f"目录推送有 {stats['failed']} 个文件失败")
+            else:
+                result = await push_file(transport, local_path, remote_path)
+                lines.append(f"✅ 文件已推送到 {nest_name}:{remote_path} ({result['size']} 字节)")
+
+            output = "\n".join(lines)
+            return DualOutput(summary=output, display=output)
+        except TransferError as e:
+            raise ToolError(f"推送失败(nest={nest_name}): {e}") from e
+
+    async def _sync_tree(self, kwargs: dict) -> DualOutput:
+        """目录递归同步（增量mtime比对，支持push/pull方向与--delete）"""
+        from peng.nest.transfer import TransferError, sync_tree
+
+        nest_name = kwargs.get("nest", "")
+        local_path = kwargs.get("local_path", "")
+        remote_path = kwargs.get("remote_path", "")
+        direction = kwargs.get("direction", "push")
+        delete = bool(kwargs.get("delete", False))
+        dry_run = bool(kwargs.get("dry_run", False))
+
+        if not nest_name:
+            raise ToolError("sync操作需要提供nest参数（目标nest名称）")
+        if not local_path:
+            raise ToolError("sync操作需要提供local_path参数（本地目录路径）")
+        if not remote_path:
+            raise ToolError("sync操作需要提供remote_path参数（远端目录路径）")
+        if direction not in ("push", "pull"):
+            raise ToolError(f"无效的direction: {direction}（支持 push/pull）")
+
+        transport = self._make_transport(nest_name)
+
+        try:
+            stats = await sync_tree(
+                transport, local_path, remote_path, direction=direction,
+                delete=delete, dry_run=dry_run,
             )
-        except ToolError:
-            raise
-        except Exception as e:
-            raise ToolError(f"拉取文件失败(nest={nest_name}): {e}") from e
+            verb = "预演同步" if dry_run else "同步"
+            arrow = "→" if direction == "push" else "←"
+            lines = [
+                f"✅ {verb}完成: {local_path if direction == 'push' else nest_name + ':' + remote_path} "
+                f"{arrow} {nest_name + ':' + remote_path if direction == 'push' else local_path}",
+                f"   检查 {stats['checked']} 个文件: 复制 {stats['copied']}, "
+                f"跳过 {stats['skipped']}, 删除 {stats['deleted']}, 失败 {stats['failed']}",
+            ]
+            if stats.get("total_bytes"):
+                lines.append(f"   传输量: {stats['total_bytes']} 字节")
+            output = "\n".join(lines)
+            if stats["failed"]:
+                output += f"\n⚠️ 有 {stats['failed']} 个失败，详见日志"
+            return DualOutput(summary=output, display=output)
+        except TransferError as e:
+            raise ToolError(f"同步失败(nest={nest_name}): {e}") from e

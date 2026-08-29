@@ -321,6 +321,196 @@ _HISTORY_FILE = "__history__/context.json"
 _EXCLUDE_DIRS = {".peng", ".git", "__pycache__", "node_modules", ".venv", "data"}
 
 
+# ==================== 备份排除规则（不备份未修改/无关产物文件） ====================
+#
+# 根因（事务#1660）：git 快照的 `add -A` 不理会任何排除规则，把 .gitignore 忽略的
+# 未修改产物（build/、*.dll、*.jpg 等）全部写入备份对象库，且这些文件在真实修改后
+# 几乎无内容重复，每次快照都新增整套 blob，导致大量硬盘空间浪费。
+#
+# 策略：git 快照只跟踪"用户源码"= git 真实跟踪的文件 + 快照后新增的同域文件：
+#   1. read-tree HEAD 载入 git 跟踪集（.gitignore 已由用户维护，天然排除产物）
+#   2. add -A 增量更新（捕获新增/修改文件）
+#   3. 从索引剔除 build/build_*/.peng 等产物目录条目（无论是否修改都不备份）
+#   4. write-tree —— 产物目录的既有 blob 已是 loose object 可被 gc 回收，
+#      新快照不再为产物文件创建任何新对象
+#
+# 非快照路径（变更检测/diff预览）必须使用同一剔除规则，保证 tree 比较一致性。
+# 剔除方式用 update-index --force-remove 逐条目移除（已实测验证：temp index 下
+# 正常工作，diff --cached 可正确报告差异，且对未在索引中的路径无副作用）。
+#
+# 注意：不能用 `git rm --cached <dir>`/`add exclude pathspec`——排除 pathspec 会使
+# add -A 失去全量删除检测能力（实测验证），语义变为"只更新匹配文件"。
+
+# 强制排除的目录名（匹配任意层级，仅匹配目录名本身）
+_FORCE_EXCLUDE_DIR_NAMES = {"build", ".peng", ".cache", "__pycache__", "node_modules"}
+
+# 强制排除的目录名前缀（如 build_x86、build_llvm）
+_FORCE_EXCLUDE_DIR_PREFIXES = ("build_",)
+
+
+def _is_excluded_dirname(name: str) -> bool:
+    """判断目录名是否命中强制排除规则（build/、build_*/等）"""
+    return (
+        name in _FORCE_EXCLUDE_DIR_NAMES
+        or name.startswith(_FORCE_EXCLUDE_DIR_PREFIXES)
+    )
+
+
+def _filter_excluded_paths(paths: list[str]) -> list[str]:
+    """过滤掉命中排除规则的索引路径（任意层级目录匹配）
+
+    Args:
+        paths: 索引中的路径列表（/ 分隔）
+
+    Returns:
+        排除规则命中的路径列表（用于 update-index --force-remove）
+    """
+    excluded: list[str] = []
+    for p in paths:
+        parts = p.split("/")
+        # 任意一级目录名命中即排除（文件名本身不参与匹配，build.c 不受影响）
+        if any(_is_excluded_dirname(part) for part in parts[:-1]):
+            excluded.append(p)
+    return excluded
+
+
+def _purge_excluded_from_index(git_args_env: dict, cwd: str, nest_name: str | None) -> int:
+    """从临时索引中剔除排除目录条目（本地执行）
+
+    用 git ls-files 列出索引条目，过滤命中排除规则的路径，
+    逐批 update-index --force-remove 移除。幂等：路径不在索引中时无副作用。
+
+    Returns:
+        移除的条目数（-1 表示失败，调用方可记录日志但不应中断）
+    """
+    result = _run_git(
+        ["ls-files", "-c"], cwd=cwd, env=git_args_env, nest_name=nest_name
+    )
+    if result.returncode != 0:
+        return -1
+    entries = [ln for ln in result.stdout.split("\n") if ln.strip()]
+    excluded = _filter_excluded_paths(entries)
+    if not excluded:
+        return 0
+    # 分批执行避免命令行长度限制（Windows ~32KB）
+    BATCH = 200
+    for i in range(0, len(excluded), BATCH):
+        batch = excluded[i : i + BATCH]
+        _run_git(
+            ["update-index", "--force-remove", "--"] + batch,
+            cwd=cwd, env=git_args_env, nest_name=nest_name,
+        )
+    return len(excluded)
+
+
+def _is_abs_path_excluded(abs_path: str) -> bool:
+    """判断绝对（或相对）路径的任意目录层级是否命中强制排除规则"""
+    parts = abs_path.replace("\\", "/").split("/")
+    # 末段是文件名（或目录名——目录名也参与判断，build 目录本身整个排除）
+    return any(_is_excluded_dirname(part) for part in parts)
+
+
+def _load_gitignore_spec(root: str) -> Any:
+    """加载目录顶层 .gitignore（非git工作目录场景；无文件返回 None）
+
+    使用 pathspec（gitwildmatch 语义与 git 一致）。失败仅记日志返回 None。
+    """
+    gi = Path(root) / ".gitignore"
+    if not gi.is_file():
+        return None
+    try:
+        import pathspec
+
+        return pathspec.PathSpec.from_lines("gitwildmatch", gi.read_text(encoding="utf-8", errors="replace").splitlines())
+    except Exception as e:
+        logger.debug(f"加载.gitignore失败({gi}): {e}")
+        return None
+
+
+def _iter_backup_files(root: Path) -> list[str]:
+    """遍历目录收集相对文件路径（跳过排除目录与 .git，不跟随目录符号链接）
+
+    Returns:
+        相对路径列表（POSIX 分隔符，与 git 索引一致）
+    """
+    files: list[str] = []
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for entry in entries:
+            name = entry.name
+            if name == ".git" or _is_excluded_dirname(name):
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                stack.append(Path(entry.path))
+            else:
+                files.append(str(Path(entry.path).relative_to(root)).replace(os.sep, "/"))
+    return files
+
+
+def _need_copy(src: str | Path, dst: str | Path) -> bool:
+    """判断是否需要复制：目标不存在，或 size/mtime 任一不同（未修改则跳过）"""
+    try:
+        s, d = os.stat(src), os.stat(dst)
+        return s.st_size != d.st_size or abs(s.st_mtime - d.st_mtime) > 1e-6
+    except OSError:
+        return True  # 目标不存在（或 stat 失败）→ 需要复制
+
+
+def _sync_dir_incremental(src_root: Path, dst_root: Path, spec: Any = None) -> tuple[int, int]:
+    """增量同步目录（本地）：只复制新增/修改文件，删除目标端多余文件
+
+    排除规则：
+    - 强制排除目录（build/、build_*/、.peng 等，任意层级）
+    - spec（.gitignore PathSpec，仅匹配顶层仓库相对路径，与 git 语义一致）
+
+    Returns:
+        (复制文件数, 删除条目数)
+    """
+    copied, removed = 0, 0
+
+    # 1. 收集源端应同步的文件集
+    all_files = _iter_backup_files(src_root)
+    keep_files: dict[str, None] = {}
+    for rel in all_files:
+        if spec is not None and spec.match_file(rel):
+            continue  # .gitignore 命中 → 不备份
+        keep_files[rel] = None
+
+    # 2. 清理目标端多余文件（源端不存在或被排除的），空目录一并删除
+    for rel in _iter_backup_files(dst_root):
+        if rel not in keep_files:
+            try:
+                (dst_root / rel).unlink()
+                removed += 1
+            except OSError:
+                pass
+    for dirpath, dirnames, filenames in os.walk(dst_root, topdown=False):
+        p = Path(dirpath)
+        if p == dst_root or p.name == ".git":
+            continue
+        if p.name == ".git":
+            continue
+        try:
+            if not any(p.iterdir()):
+                p.rmdir()
+        except OSError:
+            pass
+
+    # 3. 增量复制（仅 size/mtime 不同的文件）
+    for rel in keep_files:
+        src = src_root / rel
+        dst = dst_root / rel
+        if _need_copy(src, dst):
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            copied += 1
+    return copied, removed
+
 # ==================== git 命令执行（支持本地/远程） ====================
 
 
@@ -693,12 +883,14 @@ class ToolBackupManager:
         commit_msg = f"backup before {tool_name}: {args_summary}\n\nTask#{task_id} @ {timestamp}"
 
         try:
-            # 提取工具涉及的文件路径，区分 workdir 内/外
+            # 提取工具涉及的文件路径，区分 workdir 内/外（排除目录不进外部备份）
             all_paths = ToolBackupManager._extract_file_paths(tool_name, tool_args, workdir)
             external_files: list[str] = []
             for fp in all_paths:
                 fp_abs = fp if _is_abs_cross_platform(fp) else os.path.join(workdir, fp)
                 fp_norm = os.path.normpath(fp_abs)
+                if _is_abs_path_excluded(fp_norm):
+                    continue  # build/、build_*/等排除目录：不备份
                 wd_norm = os.path.normpath(workdir)
                 if not fp_norm.startswith(wd_norm):
                     external_files.append(fp_norm)
@@ -953,6 +1145,8 @@ class ToolBackupManager:
         try:
             _run_git(["read-tree", "HEAD"], cwd=workdir, env=env, nest_name=nest_name)
             _run_git(["add", "-A"], cwd=workdir, env=env, nest_name=nest_name)
+            # 🔧 排除产物目录（与快照路径同规则，保证 tree 比较一致性）
+            _purge_excluded_from_index(env, workdir, nest_name)
             result = _run_git(["write-tree"], cwd=workdir, env=env, nest_name=nest_name)
             if result.returncode != 0:
                 return rollback_meta
@@ -1047,6 +1241,8 @@ class ToolBackupManager:
             f"workdir = {workdir!r}\n"
             f"commit_hash = {commit_hash!r}\n"
             f"temp_prefix = {f'peng_backup_idx_'!r}\n"
+            f"excl_dirs = {sorted(_FORCE_EXCLUDE_DIR_NAMES)!r}\n"
+            f"excl_prefixes = {_FORCE_EXCLUDE_DIR_PREFIXES!r}\n"
             f"result_data = {{}}\n"
             "temp_index = None\n"
             "try:\n"
@@ -1055,6 +1251,15 @@ class ToolBackupManager:
             "        if env: full_env.update(env)\n"
             "        return subprocess.run(['git'] + list(args), cwd=workdir, env=full_env,\n"
             "                              capture_output=True, text=True, timeout=30)\n"
+            "    def purge_excluded(env_idx):\n"
+            "        r = git('ls-files', '-c', env=env_idx)\n"
+            "        if r.returncode != 0: return -1\n"
+            "        excluded = [p for p in (ln for ln in r.stdout.split(chr(10)) if ln.strip())\n"
+            "                    if any(x in excl_dirs or x.startswith(excl_prefixes)\n"
+            "                           for x in p.split('/')[:-1])]\n"
+            "        for i in range(0, len(excluded), 200):\n"
+            "            git('update-index', '--force-remove', '--', *excluded[i:i+200], env=env_idx)\n"
+            "        return len(excluded)\n"
             "    # 🔧 快速路径：先用 git diff HEAD 判断有无工作区变化\n"
             "    # 如果工作区相对HEAD无变化，且备份commit就是HEAD的祖先，则直接判定无变化\n"
             "    r = git('diff', 'HEAD', '--quiet')\n"
@@ -1093,6 +1298,8 @@ class ToolBackupManager:
             "            git('add', '-A', *excludes, env=env_idx)\n"
             "        else:\n"
             "            git('add', '-A', env=env_idx)\n"
+            "    # 🔧 排除产物目录（与快照路径同规则，保证 tree 比较一致性）\n"
+            "    purge_excluded(env_idx)\n"
             "    r = git('write-tree', env=env_idx)\n"
             "    if r.returncode != 0:\n"
             f"        result_data['error'] = 'write-tree failed'\n"
@@ -1304,6 +1511,9 @@ class ToolBackupManager:
         try:
             _run_git(["read-tree", "HEAD"], cwd=workdir, env=env, nest_name=nest_name)
             _run_git(["add", "-A"], cwd=workdir, env=env, nest_name=nest_name)
+            # 🔧 排除产物目录：build/、build_*/等无论是否修改都不进快照
+            # （未修改的 .gitignore 产物文件不再产生 blob 对象）
+            _purge_excluded_from_index(env, workdir, nest_name)
 
             result = _run_git(["write-tree"], cwd=workdir, env=env, nest_name=nest_name)
             if result.returncode != 0:
@@ -1399,6 +1609,8 @@ class ToolBackupManager:
             f"branch_name = {branch_name!r}\n"
             f"commit_msg = {commit_msg!r}\n"
             f"temp_prefix = {f'peng_backup_idx_'!r}\n"
+            f"excl_dirs = {sorted(_FORCE_EXCLUDE_DIR_NAMES)!r}\n"
+            f"excl_prefixes = {_FORCE_EXCLUDE_DIR_PREFIXES!r}\n"
             f"result_data = {{}}\n"
             "try:\n"
             "    def git(*args, env=None):\n"
@@ -1406,6 +1618,22 @@ class ToolBackupManager:
             "        if env: full_env.update(env)\n"
             "        return subprocess.run(['git'] + list(args), cwd=workdir, env=full_env,\n"
             "                              capture_output=True, text=True, timeout=30)\n"
+            "    def is_excluded(name):\n"
+            "        return name in excl_dirs or name.startswith(excl_prefixes)\n"
+            "    def filter_excluded(entries):\n"
+            "        out = []\n"
+            "        for p in entries:\n"
+            "            parts = p.split('/')\n"
+            "            if any(is_excluded(x) for x in parts[:-1]): out.append(p)\n"
+            "        return out\n"
+            "    def purge_excluded(env_idx):\n"
+            "        r = git('ls-files', '-c', env=env_idx)\n"
+            "        if r.returncode != 0: return -1\n"
+            "        entries = [ln for ln in r.stdout.split(chr(10)) if ln.strip()]\n"
+            "        excluded = filter_excluded(entries)\n"
+            "        for i in range(0, len(excluded), 200):\n"
+            "            git('update-index', '--force-remove', '--', *excluded[i:i+200], env=env_idx)\n"
+            "        return len(excluded)\n"
             "    # 获取git目录\n"
             "    r = git('rev-parse', '--git-dir')\n"
             "    if r.returncode != 0:\n"
@@ -1434,6 +1662,8 @@ class ToolBackupManager:
             "            git('add', '-A', *excludes, env=env_idx)\n"
             "        else:\n"
             "            git('add', '-A', env=env_idx)  # 无 .gitmodules，重试原命令\n"
+            "    # 🔧 排除产物目录：build/、build_*/等无论是否修改都不进快照\n"
+            "    purge_excluded(env_idx)\n"
             "    r = git('write-tree', env=env_idx)\n"
             "    if r.returncode != 0:\n"
             f"        result_data['error'] = 'write-tree failed: ' + r.stderr\n"
@@ -1539,6 +1769,8 @@ class ToolBackupManager:
             for fp in all_paths:
                 fp_abs = fp if _is_abs_cross_platform(fp) else os.path.join(workdir, fp)
                 fp_norm = os.path.normpath(fp_abs)
+                if _is_abs_path_excluded(fp_norm):
+                    continue  # build/、build_*/等排除目录：不备份
                 wd_norm = os.path.normpath(workdir)
                 if fp_norm.startswith(wd_norm):
                     rel = os.path.relpath(fp_norm, wd_norm)
@@ -1665,54 +1897,79 @@ class ToolBackupManager:
 
     @staticmethod
     def _sync_to_backup_repo_local(workdir: str, backup_repo: str) -> None:
-        """本地文件同步"""
-        wd = Path(workdir)
-        br = Path(backup_repo)
-        # 清空备份仓库（保留.git）
-        for item in br.iterdir():
-            if item.name == ".git":
-                continue
-            if item.is_dir():
-                shutil.rmtree(str(item))
-            else:
-                item.unlink()
-        # 复制工作目录内容
-        for item in wd.iterdir():
-            if item.name in _EXCLUDE_DIRS:
-                continue
-            dst = br / item.name
-            if item.is_dir():
-                shutil.copytree(str(item), str(dst), dirs_exist_ok=True)
-            else:
-                shutil.copy2(str(item), str(dst))
+        """本地文件同步（增量：只复制新增/修改文件，跳过排除目录与 .gitignore 命中文件）
+
+        🔧 事务#1660：不再"清空+全量复制"。未修改文件 mtime/size 不变直接跳过；
+        build/、build_*/等产物目录整个排除；.gitignore 忽略的文件不备份。
+        目标端多余文件（源端删除或被排除的）删除，保持镜像语义。
+        """
+        spec = _load_gitignore_spec(workdir)
+        copied, removed = _sync_dir_incremental(Path(workdir), Path(backup_repo), spec)
+        logger.debug(f"备份仓库增量同步: copied={copied} removed={removed}")
 
     @staticmethod
     def _sync_to_backup_repo_remote(workdir: str, backup_repo: str, nest_name: str) -> None:
-        """远程文件同步（跨平台，通过Python脚本）
-
-        先清空备份仓库内容（保留.git），再复制工作目录内容。
-        """
-        excludes = sorted(_EXCLUDE_DIRS)
+        """远程文件同步（跨平台，通过Python脚本；增量+排除规则，同本地语义）"""
         code = (
             "import shutil, os\n"
             f"workdir = {workdir!r}\n"
             f"backup_repo = {backup_repo!r}\n"
-            f"excludes = {excludes!r}\n"
-            "# 清空备份仓库（保留.git）\n"
-            "for item in os.listdir(backup_repo):\n"
-            "    if item == '.git': continue\n"
-            "    p = os.path.join(backup_repo, item)\n"
-            "    if os.path.isdir(p): shutil.rmtree(p)\n"
-            "    else: os.unlink(p)\n"
-            "# 复制工作目录内容\n"
-            "for item in os.listdir(workdir):\n"
-            "    if item in excludes: continue\n"
-            "    src = os.path.join(workdir, item)\n"
-            "    dst = os.path.join(backup_repo, item)\n"
-            "    if os.path.isdir(src): shutil.copytree(src, dst, dirs_exist_ok=True)\n"
-            "    else: shutil.copy2(src, dst)\n"
+            f"excl_dirs = {sorted(_FORCE_EXCLUDE_DIR_NAMES)!r}\n"
+            f"excl_prefixes = {_FORCE_EXCLUDE_DIR_PREFIXES!r}\n"
+            f"use_gitignore = {True!r}\n"
+            "def is_excluded(name):\n"
+            "    return name in excl_dirs or name.startswith(excl_prefixes)\n"
+            "spec = None\n"
+            "if use_gitignore:\n"
+            "    try:\n"
+            "        import pathspec\n"
+            "        gi = os.path.join(workdir, '.gitignore')\n"
+            "        if os.path.isfile(gi):\n"
+            "            spec = pathspec.PathSpec.from_lines('gitwildmatch', open(gi, encoding='utf-8', errors='replace').read().splitlines())\n"
+            "    except Exception:\n"
+            "        spec = None\n"
+            "def iter_files(root):\n"
+            "    stack = [root]\n"
+            "    out = []\n"
+            "    while stack:\n"
+            "        d = stack.pop()\n"
+            "        try: entries = list(os.scandir(d))\n"
+            "        except OSError: continue\n"
+            "        for e in entries:\n"
+            "            if e.name == '.git' or is_excluded(e.name): continue\n"
+            "            if e.is_dir(follow_symlinks=False): stack.append(e.path)\n"
+            "            else: out.append(os.path.relpath(e.path, root).replace(os.sep, '/'))\n"
+            "    return out\n"
+            "def need_copy(src, dst):\n"
+            "    try:\n"
+            "        s, d = os.stat(src), os.stat(dst)\n"
+            "        return s.st_size != d.st_size or abs(s.st_mtime - d.st_mtime) > 1e-6\n"
+            "    except OSError:\n"
+            "        return True\n"
+            "# 1. 源端应同步文件集（排除 .gitignore 命中）\n"
+            "keep = {}\n"
+            "for rel in iter_files(workdir):\n"
+            "    if spec is not None and spec.match_file(rel): continue\n"
+            "    keep[rel] = None\n"
+            "# 2. 清理目标端多余文件 + 空目录（保留.git）\n"
+            "for rel in iter_files(backup_repo):\n"
+            "    if rel not in keep:\n"
+            "        try: os.unlink(os.path.join(backup_repo, rel))\n"
+            "        except OSError: pass\n"
+            "for dirpath, dirnames, filenames in os.walk(backup_repo, topdown=False):\n"
+            "    if dirpath == backup_repo or os.path.basename(dirpath) == '.git': continue\n"
+            "    try:\n"
+            "        if not any(os.scandir(dirpath)): os.rmdir(dirpath)\n"
+            "    except OSError: pass\n"
+            "# 3. 增量复制\n"
+            "for rel in keep:\n"
+            "    src = os.path.join(workdir, rel)\n"
+            "    dst = os.path.join(backup_repo, rel)\n"
+            "    if need_copy(src, dst):\n"
+            "        os.makedirs(os.path.dirname(dst) or backup_repo, exist_ok=True)\n"
+            "        shutil.copy2(src, dst)\n"
         )
-        _run_python_remote(code, timeout=60, nest_name=nest_name)
+        _run_python_remote(code, timeout=120, nest_name=nest_name)
 
     @staticmethod
     def _sync_from_backup_repo(
@@ -1748,25 +2005,46 @@ class ToolBackupManager:
 
     @staticmethod
     def _copy_external_file(src_path: str, backup_repo: str, nest_name: str | None = None) -> None:
-        """复制外部文件到备份仓库的 __external__ 目录"""
+        """复制外部文件到备份仓库的 __external__ 目录
+
+        🔧 事务#1660：排除目录（build/等）直接跳过；size/mtime 未变化跳过复制。
+        """
+        # 排除规则命中（build/、build_*/等任意层级）→ 不备份
+        if _is_abs_path_excluded(src_path):
+            logger.debug(f"外部文件跳过（排除规则）: {src_path}")
+            return
         # 计算相对路径（去掉根目录分隔符）
         src_path_clean = src_path.replace("\\", "/")
         rel = src_path_clean.lstrip("/")
         dst = f"{backup_repo}/__external__/{rel}"
 
         if not nest_name or nest_name == "local":
+            # 未修改（size/mtime 相同）→ 跳过复制
+            if not _need_copy(src_path, dst):
+                return
             Path(dst).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_path, dst)
+            if os.path.isfile(src_path):
+                shutil.copy2(src_path, dst)
+            elif os.path.isdir(src_path):
+                shutil.copytree(src_path, dst, dirs_exist_ok=True)
         else:
             code = (
                 "import shutil, os\n"
                 f"src = {src_path!r}\n"
                 f"dst = {dst!r}\n"
-                "os.makedirs(os.path.dirname(dst), exist_ok=True)\n"
-                "if os.path.isfile(src): shutil.copy2(src, dst)\n"
+                "if os.path.isfile(src):\n"
+                "    need = True\n"
+                "    if os.path.exists(dst):\n"
+                "        try:\n"
+                "            s, d = os.stat(src), os.stat(dst)\n"
+                "            need = s.st_size != d.st_size or abs(s.st_mtime - d.st_mtime) > 1e-6\n"
+                "        except OSError: pass\n"
+                "    if need:\n"
+                "        os.makedirs(os.path.dirname(dst), exist_ok=True)\n"
+                "        shutil.copy2(src, dst)\n"
                 "elif os.path.isdir(src): shutil.copytree(src, dst, dirs_exist_ok=True)\n"
             )
-            _run_python_remote(code, timeout=10, nest_name=nest_name)
+            _run_python_remote(code, timeout=30, nest_name=nest_name)
 
     @staticmethod
     def rollback(rollback_meta: dict[str, Any]) -> tuple[bool, str, dict | None, bool]:
@@ -2353,6 +2631,8 @@ class ToolBackupManager:
             try:
                 _run_git(["read-tree", "HEAD"], cwd=cwd, env=env, nest_name=nest_name)
                 _run_git(["add", "-A"], cwd=cwd, env=env, nest_name=nest_name)
+                # 🔧 排除产物目录（与快照路径同规则）
+                _purge_excluded_from_index(env, cwd, nest_name)
                 result = _run_git(["write-tree"], cwd=cwd, env=env, nest_name=nest_name)
                 if result.returncode != 0:
                     return {"success": False, "diff": "", "changed_files": [], "truncated": False,
@@ -2440,6 +2720,8 @@ class ToolBackupManager:
             f"commit_hash = {commit_hash!r}\n"
             f"is_non_git = {backup_type == 'non_git'!r}\n"
             f"excludes = {sorted(_EXCLUDE_DIRS)!r}\n"
+            f"excl_dirs = {sorted(_FORCE_EXCLUDE_DIR_NAMES)!r}\n"
+            f"excl_prefixes = {_FORCE_EXCLUDE_DIR_PREFIXES!r}\n"
             f"max_diff_bytes = {_DIFF_PREVIEW_MAX_BYTES!r}\n"
             "result_data = {}\n"
             "temp_index = None\n"
@@ -2449,6 +2731,15 @@ class ToolBackupManager:
             "        if env: full_env.update(env)\n"
             "        return subprocess.run(['git'] + list(args), cwd=cwd, env=full_env,\n"
             "                              capture_output=True, timeout=120)  # bytes模式\n"
+            "    def purge_excluded(env_idx):\n"
+            "        r = git('ls-files', '-c', env=env_idx)\n"
+            "        if r.returncode != 0: return -1\n"
+            "        excluded = [p for p in (ln for ln in r.stdout.decode('utf-8','replace').split(chr(10)) if ln.strip())\n"
+            "                    if any(x in excl_dirs or x.startswith(excl_prefixes)\n"
+            "                           for x in p.split('/')[:-1])]\n"
+            "        for i in range(0, len(excluded), 200):\n"
+            "            git('update-index', '--force-remove', '--', *excluded[i:i+200], env=env_idx)\n"
+            "        return len(excluded)\n"
             "    # non_git：先同步当前工作区到备份仓库（清空保留.git，再复制）\n"
             "    if is_non_git:\n"
             "        for item in os.listdir(cwd):\n"
@@ -2479,6 +2770,8 @@ class ToolBackupManager:
             "        env_idx = {'GIT_INDEX_FILE': temp_index}\n"
             "        git('read-tree', 'HEAD', env=env_idx)\n"
             "        git('add', '-A', env=env_idx)\n"
+            "        # 🔧 排除产物目录（与快照路径同规则）\n"
+            "        purge_excluded(env_idx)\n"
             "        r = git('write-tree', env=env_idx)\n"
             "        if r.returncode != 0:\n"
             "            result_data['error'] = 'write-tree failed: ' + r.stderr.decode('utf-8','replace')[:200]\n"
@@ -3207,8 +3500,13 @@ class ExternalFileBackup:
         try:
             repo = ExternalFileBackup._get_backup_repo(task_id)
             backed_up = 0
+            skipped_excluded = 0
             for fp in file_paths:
                 if not os.path.exists(fp):
+                    continue
+                # 🔧 排除规则命中（build/、build_*/等，无论是否修改都不备份）
+                if _is_abs_path_excluded(fp):
+                    skipped_excluded += 1
                     continue
                 rel = ExternalFileBackup._to_repo_path(fp)
                 dst = os.path.join(repo, rel)
@@ -3219,6 +3517,10 @@ class ExternalFileBackup:
                     shutil.copytree(fp, dst, dirs_exist_ok=True)
                 backed_up += 1
 
+            if skipped_excluded:
+                logger.debug(
+                    f"外部文件备份: 跳过 {skipped_excluded} 个排除规则命中的路径(task#{task_id})"
+                )
             if backed_up == 0:
                 return None
 

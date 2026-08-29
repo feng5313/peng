@@ -16,6 +16,7 @@ import time
 import traceback
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -65,6 +66,163 @@ class StreamChunk:
     tool_calls: list[ToolCall] | None = None
     finish_reason: str | None = None
     usage: dict | None = None  # API返回的token用量 {prompt_tokens, completion_tokens, total_tokens}
+
+
+# ==================== AGENTS.md 加载（事务#1672） ====================
+
+# AGENTS.md 候选文件名（优先级从高到低）
+_AGENTS_MD_CANDIDATES = ("AGENTS.md", ".peng/AGENTS.md")
+
+# 远程 nest 读取 AGENTS.md 的超时（秒）：
+# nest client 的 _forward_with_retry 对连接类错误会无限重试，
+# 这里用 wait_for 限时保护，避免 nest 长时间不可用时阻塞事务启动
+_AGENTS_MD_READ_TIMEOUT = 30.0
+
+# (nest_name, workdir) -> (mtime_ns, size, content) 缓存
+_agents_md_cache: dict[tuple[str, str], tuple[int, int, str]] = {}
+
+
+def _read_agents_md_local(workdir: str) -> str | None:
+    """在本地文件系统读取 workdir 下的 AGENTS.md（local nest 场景，nest 与 peng 同机）"""
+    base = Path(workdir)
+    for name in _AGENTS_MD_CANDIDATES:
+        path = base / name
+        try:
+            if path.is_file():
+                return path.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"[LLM Client] 读取本地 {path} 失败(忽略): {e}")
+    return None
+
+
+# nest 端"文件/路径不存在"类业务错误关键词：
+# 子进程转发路径（_forward_via_server）会把 nest 业务错误也包装成 NestError
+# 抛出（与连接错误同形态），需按关键词识别为"候选文件不存在"→继续尝试下一候选，
+# 而非"nest 连接故障"→放弃。主进程路径正常返回 resp.error 不会进入该分支。
+_AGENTS_MD_NOT_FOUND_PATTERNS = ("文件未找到", "文件不存在", "路径访问被安全策略拒绝", "获取文件信息失败")
+
+
+def _is_agents_md_not_found(exc: Exception) -> bool:
+    """判断异常是否为 nest 端文件不存在类业务错误（而非连接层错误）"""
+    return any(p in str(exc) for p in _AGENTS_MD_NOT_FOUND_PATTERNS)
+
+
+async def _read_agents_md_remote(nest_name: str, workdir: str) -> str | None:
+    """通过 nest 协议读取远程 nest 工作目录下的 AGENTS.md
+
+    使用 stat+read 组合实现mtime缓存；stat/read 返回业务错误
+    （如"文件未找到"）时尝试下一候选；连接层错误经 wait_for 超时保护后放弃。
+    """
+    from peng.nest.client import send_request
+    from peng.nest.protocol import NestError
+
+    for name in _AGENTS_MD_CANDIDATES:
+        remote_path = str(Path(workdir) / name)
+        try:
+            # 1. stat 获取 mtime/size（用于缓存判断）
+            stat_resp = await asyncio.wait_for(
+                send_request(
+                    "stat", {"path": remote_path},
+                    timeout=_AGENTS_MD_READ_TIMEOUT, nest_name=nest_name,
+                ),
+                timeout=_AGENTS_MD_READ_TIMEOUT + 5,
+            )
+            if stat_resp.error or not isinstance(stat_resp.data, dict):
+                continue  # 文件不存在或stat失败 → 尝试下一候选
+            # nest stat 返回 mtime（float秒）/size；键归一化为 (mtime_ns, size)
+            try:
+                mtime_ns = int(float(stat_resp.data.get("mtime", 0) or 0) * 1e9)
+            except (TypeError, ValueError):
+                mtime_ns = 0
+            size = stat_resp.data.get("size", 0) or 0
+
+            # 2. 缓存命中（mtime+size 未变）直接返回缓存内容
+            cache_key = (nest_name, workdir)
+            cached = _agents_md_cache.get(cache_key)
+            if cached and cached[0] == mtime_ns and cached[1] == size:
+                logger.debug(f"[LLM Client] AGENTS.md 缓存命中: {nest_name}:{remote_path}")
+                return cached[2]
+
+            # 3. read 读取内容（lines 带行号前缀需剥离）
+            read_resp = await asyncio.wait_for(
+                send_request(
+                    "read", {"path": remote_path, "offset": 1, "limit": 2000},
+                    timeout=_AGENTS_MD_READ_TIMEOUT, nest_name=nest_name,
+                ),
+                timeout=_AGENTS_MD_READ_TIMEOUT + 5,
+            )
+            if read_resp.error or not isinstance(read_resp.data, dict):
+                continue
+            lines = read_resp.data.get("lines") or []
+            # nest _read_file 返回 "N: content" 格式（N=行号，与 offset 起始一致递增），
+            # 用确定性前缀匹配剥离行号（split(": ",1) 会误伤以数字开头的内容行）
+            content_lines = []
+            for i, line in enumerate(lines):
+                prefix = f"{i + 1}: "  # 请求 offset=1，前缀即 "1: "、"2: "... 与行号一致递增
+                content_lines.append(
+                    line[len(prefix):] if line.startswith(prefix) else line
+                )
+            content = "\n".join(content_lines)
+            # splitlines 丢失文件末尾换行，与本地 read_text 行为对齐补回，
+            # 避免注入后与后续 system 消息（如 skills 提示词）首行粘连
+            if read_resp.data.get("end", 0) >= read_resp.data.get("total_lines", 0):
+                content += "\n" if content else ""
+            if read_resp.data.get("total_lines", 0) > len(lines):
+                logger.warning(
+                    f"[LLM Client] AGENTS.md 超过2000行已截断: {nest_name}:{remote_path}"
+                )
+            _agents_md_cache[cache_key] = (mtime_ns, size, content)
+            logger.info(
+                f"[LLM Client] 已读取远程nest AGENTS.md: {nest_name}:{remote_path} "
+                f"({len(content)}字符)"
+            )
+            return content
+        except (NestError, asyncio.TimeoutError) as e:
+            if _is_agents_md_not_found(e):
+                continue  # nest端文件不存在（子进程转发包装形态）→ 尝试下一候选
+            # 连接层错误：AGENTS.md 读取失败不阻塞事务，记录警告后放弃
+            logger.warning(
+                f"[LLM Client] 读取远程nest AGENTS.md 失败(忽略): "
+                f"{nest_name}:{remote_path}: {e}"
+            )
+            return None
+        except Exception as e:
+            logger.warning(
+                f"[LLM Client] 读取远程nest AGENTS.md 异常(忽略): "
+                f"{nest_name}:{remote_path}: {e}"
+            )
+            return None
+    return None
+
+
+async def load_task_agents_md(task: dict | None) -> str | None:
+    """读取事务所在 nest 工作目录内的 AGENTS.md 或 .peng/AGENTS.md（事务#1672）
+
+    - local nest：nest 与 peng 同机，直接本地读取（不走网络，最快且最可靠）
+    - 远程 nest：经 nest 协议远程读取（带超时保护与 mtime 缓存）
+    - 任一失败静默返回 None（系统提示词回退旧逻辑），不影响事务执行
+
+    Args:
+        task: 事务字典（含 nest、workdir 字段）
+
+    Returns:
+        AGENTS.md 内容；不存在或读取失败返回 None
+    """
+    if not task:
+        return None
+    workdir = task.get("workdir")
+    if not workdir:
+        return None
+    nest_name = task.get("nest") or "local"
+
+    if nest_name == "local":
+        return _read_agents_md_local(workdir)
+
+    try:
+        return await _read_agents_md_remote(nest_name, workdir)
+    except Exception as e:
+        logger.warning(f"[LLM Client] load_task_agents_md 失败(忽略): {e}")
+        return None
 
 
 @dataclass
@@ -634,19 +792,6 @@ class GLMClient:
                 logger.debug(f"[LLM Client] 无thinking相关payload参数（auto模式或无参数）")
 
             if tools:
-                # 多模态provider：从工具列表移除vision工具
-                # provider自身具备视觉能力，图片已通过messages中的多模态content
-                # 直接传递（@file=/webui附件自动注入），vision工具反而会诱导模型
-                # 绕过多模态上下文发起独立调用（多花一次请求且丢失对话上下文）
-                if prefer_vision and provider_data:
-                    prov_vision = str(provider_data.get("vision", "disabled")).lower()
-                    if prov_vision in ("true", "yes", "on", "enabled"):
-                        filtered = [t for t in tools if t.get("function", {}).get("name") != "vision"]
-                        if len(filtered) < len(tools):
-                            logger.info(
-                                "[LLM Client] 多模态provider已移除vision工具（图片直接经上下文传递）"
-                            )
-                        tools = filtered
                 payload["tools"] = tools
 
         try:

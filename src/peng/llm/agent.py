@@ -330,8 +330,15 @@ class PengAgent:
 
         return self._hook_manager
 
-    def _prepare_prompt(self, task):
-        """准备系统提示词和用户提示词"""
+    async def _prepare_prompt(self, task):
+        """准备系统提示词和用户提示词
+
+        AGENTS.md 注入优先级（事务#1672）：
+        1. 事务所在 nest 工作目录的 AGENTS.md / .peng/AGENTS.md
+           （local nest 本地直读；远程 nest 经 nest 协议读取）
+        2. 回退旧逻辑：peng 进程 cwd 的 AGENTS.md / .peng/AGENTS.md
+        3. 再回退：prompts.jsonp 的 system_prompt
+        """
 
         # 直接读取 config/prompts.jsonp
         prompts_path = get_path("prompts_json")
@@ -340,12 +347,24 @@ class PengAgent:
 
         prompts_dict = prompts_config.get("prompts", prompts_config)
 
-        agent_md = self._load_agent_md()
-        if agent_md:
-            self.history.add_system(agent_md)
+        # 🔧 优先读取事务所在 nest 工作目录的 AGENTS.md（事务#1672）
+        task_agents_md = None
+        try:
+            from peng.llm.client import load_task_agents_md
+
+            task_agents_md = await load_task_agents_md(task)
+        except Exception as e:
+            logger.warning(f"[Agent] 读取事务AGENTS.md失败(回退旧逻辑): {e}")
+
+        if task_agents_md:
+            self.history.add_system(task_agents_md)
         else:
-            system_prompt = prompts_dict["system_prompt"]["content"]
-            self.history.add_system(system_prompt)
+            agent_md = self._load_agent_md()
+            if agent_md:
+                self.history.add_system(agent_md)
+            else:
+                system_prompt = prompts_dict["system_prompt"]["content"]
+                self.history.add_system(system_prompt)
 
         prompt = task.get("prompt") or "task_prompt"
         if prompt in prompts_dict:
@@ -398,7 +417,7 @@ class PengAgent:
             # 需要执行_prepare_prompt重新构建系统提示词
             # 但如果from_str已恢复累计统计（费用、token），需保留这些统计
             logger.debug(f"[Agent.run_stream] task.context不存在或消息为空，执行_prepare_prompt")
-            self._prepare_prompt(task=task)
+            await self._prepare_prompt(task=task)
         # 设置工具上下文
         workdir = task.get("workdir")
         if workdir:

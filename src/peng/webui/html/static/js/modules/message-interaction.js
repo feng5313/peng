@@ -51,6 +51,10 @@ function _prepareNestState(nestName) {
     state.remoteNest = null;
     state.remoteNestRoot = null;
   }
+  // 🔧 Task#1641：同步维护确定性平台状态（供 isCurrentNestWindows/toNativeDisplayPath 使用）
+  if (typeof _resolveNestPlatform === 'function') {
+    state.nestPlatform = _resolveNestPlatform(nestName);
+  }
 }
 
 // 从 nest 名称同步下拉框（选中消息/事务时调用）

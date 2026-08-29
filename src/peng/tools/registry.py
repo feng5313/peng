@@ -480,7 +480,7 @@ class ToolRegistry(metaclass=MetaSingleton):
 
         包括: read, write, edit, bash, glob, grep, websearch, webfetch,
               lsp, goto_definition, find_references,
-              message, task, skill, info, vision
+              message, task, skill, info
         """
         if self._tools:
             return
@@ -493,7 +493,6 @@ class ToolRegistry(metaclass=MetaSingleton):
         from peng.tools.nest import InputTool, NestTool, ShotTool, WindowTool
         from peng.tools.skill import SKILL_TOOL
         from peng.tools.task import ChecklistTool, InfoTool, ReportTool, TaskTool
-        from peng.tools.vision import VisionTool
         from peng.tools.web import WebFetchTool, WebSearchTool
 
         # 文件操作
@@ -521,8 +520,6 @@ class ToolRegistry(metaclass=MetaSingleton):
         self.register(ReportTool())
         # Skill 加载工具（Progressive Disclosure）
         self.register(SKILL_TOOL)
-        # 图片视觉识别工具
-        self.register(VisionTool())
         # 事务信息注入工具
         self.register(InfoTool())
         # 窗口查询和截屏工具

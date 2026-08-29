@@ -30,7 +30,7 @@ from peng.common import jsonp as json
 from peng.common.colors import ANSI_COLORS as _ANSI
 from peng.common.paths import get_temp_directory, chown_to_project_owner, ensure_dir_with_owner
 from peng.config import PathsConfig, get_agent_name, get_master_name, get_project_root
-from peng.tools.base import DualOutput, Tool, ToolError
+from peng.tools.base import REPORT_SUCCESS_SUMMARY, DualOutput, Tool, ToolError
 from peng.tools.file import replace_content, trim_diff, normalize_line_endings
 from peng.common.utils import generate_colored_diff
 
@@ -135,6 +135,35 @@ def _write_temp_file(content: str) -> str:
     return str(path)
 
 
+def _parse_progress(progress: Any) -> int | None:
+    """解析progress参数为0-100整数。
+
+    兼容容错：接受 str / int / None / float 等LLM可能传入的类型。
+    - None → 返回None（调用方决定：write报参数缺失；edit保留当前进度）
+    - "85" / 85 / 95.0 / "95%" → 返回对应整数
+    - 非法字符串（如 "abc"、"八成"）→ 返回None
+    """
+    if progress is None:
+        return None
+    # int/float直接转换（LLM可能传JSON数字而非字符串）
+    if isinstance(progress, bool):  # bool是int子类，需先排除
+        return None
+    if isinstance(progress, (int, float)):
+        value = int(progress)
+        return max(0, min(100, value))
+    # 字符串：去掉%后缀和首尾空白（兼容"95 %"中间空格），支持可选负号
+    text = str(progress).strip().replace("%", "").strip()
+    negative = text.startswith("-")
+    if negative:
+        text = text[1:]
+    if not text.isdigit():
+        return None
+    value = int(text)
+    if negative:
+        return 0  # 负值clamp为0
+    return max(0, min(100, value))
+
+
 class ChecklistTool(Tool):
     """
     事务检查清单工具（ChecklistTool）
@@ -160,13 +189,14 @@ class ChecklistTool(Tool):
 **事务启动时必须调用此工具检查checklist，并随工作进展更新checklist。**
 常用功能：
 1. 读取：action=read（获取当前事务的checklist内容）
-2. 重写：action=write checklist_content progress=<0-100>（重写checklist内容，同时更新事务总体进度，支持\\n换行符）
-3. 编辑：action=edit oldString newString [replaceAll] progress=<0-100>（编辑/替换checklist中部分内容，同时更新进度）
+2. 重写：action=write checklist_content progress=<0-100整数，必填>（重写checklist内容，同时更新事务总体进度，支持\\n换行符）
+3. 编辑：action=edit oldString newString [replaceAll] [progress=<0-100>，可选不填则保留当前进度]（编辑/替换checklist中部分内容）
 4. 查看其他事务：action=read id=<其他事务ID>（只读，不能修改其他事务的checklist）
-重要：write和edit操作时必须同时提供progress参数（0-100整数），表示事务总体完成进度。report工具要求progress=100时才允许汇报！
+重要：write操作时必须提供progress参数（0-100整数，必填）；edit操作时progress可选（不填保留当前进度）。report工具要求progress=100时才允许汇报！
 注意：
 checklist 在任务初期必须严格按照需求原样填写，禁止改变描述（因为此时你还没有全面了解情况，改变描述很可能歪曲需求！）
 checklist 应该随着任务进展更新补充为详细完整的任务功能列表、进展（⌛表示未完成， ✅表示已完成）、后继工作相关详细信息、相关代码位置和问题跟踪表，更新时禁止简化checklist避免丢失已有工作记录！
+checklist 和待办事项无关的已完成且提交git的事项必须从checklist删除，留着邀功只会干扰待办事项！
 """
 
     @property
@@ -185,7 +215,7 @@ checklist 应该随着任务进展更新补充为详细完整的任务功能列�
                 },
                 "progress": {
                     "type": "string",
-                    "description": "事务总体进度，0-100的整数（write/edit操作时可选，不提供则保留当前进度）。根据checklist完成情况估算：全部完成=100，完成一半=50，刚开始=10等。report工具要求progress=100才允许汇报！",
+                    "description": "事务总体进度，0-100的整数（也接受JSON数字）。write操作时必填；edit操作时可选（不提供或非法则保留当前进度）。report工具要求progress=100才允许汇报！",
                 },
                 "id": {
                     "type": "integer",
@@ -211,7 +241,7 @@ checklist 应该随着任务进展更新补充为详细完整的任务功能列�
         self,
         action: str,
         checklist_content: str | None = None,
-        progress: str | None = None,
+        progress: Any = None,
         id: int | None = None,
         oldString: str | None = None,
         newString: str | None = None,
@@ -283,16 +313,13 @@ checklist 应该随着任务进展更新补充为详细完整的任务功能列�
                         summary="❌ write操作需要提供checklist_content参数",
                         display="❌ write操作需要提供checklist_content参数",
                     )
-                progress = progress.replace("%", "")
-                if progress.isnumeric():
-                    progress = int(progress)
-                else:
+                parsed_progress = _parse_progress(progress)
+                if parsed_progress is None:
                     return DualOutput(
                         summary="❌ write操作需要提供progress参数（0-100整数，表示事务总体进度）",
                         display="❌ write操作需要提供progress参数（0-100整数，表示事务总体进度）",
                     )
-                # 校验progress范围
-                progress = max(0, min(100, int(progress)))
+                progress = parsed_progress
                 # 处理转义换行符
                 checklist_content = checklist_content.replace("\\n", "\n")
                 success = task_manager.db.update_task(
@@ -346,13 +373,13 @@ checklist 应该随着任务进展更新补充为详细完整的任务功能列�
                         summary=f"❌ 编辑checklist失败: {e}",
                         display=f"❌ 编辑checklist失败: {e}",
                     )
-                # 写回checklist
-                progress = progress.replace("%", "")
-                if progress.isnumeric():
-                    progress = int(progress)
-                else:
-                    progress = None
-                final_progress = progress if progress is not None else task.get("progress", 0)
+                # 写回checklist（progress可选：未提供或非法时保留当前进度）
+                parsed_progress = _parse_progress(progress)
+                final_progress = (
+                    parsed_progress
+                    if parsed_progress is not None
+                    else (task.get("progress", 0) or 0)
+                )
                 final_progress = max(0, min(100, int(final_progress)))
                 success = task_manager.db.update_task(
                     target_id, checklist=new_content, progress=final_progress
@@ -456,12 +483,9 @@ class ReportTool(Tool):
         try:
             action: str | None = kwargs.get("action")
             report_content: str = kwargs.get("summary", "")
-            progress: str = kwargs.get("progress") or "0"
-            progress = progress.replace("%", "")
-            if progress.isnumeric():
-                progress = int(progress)
-            else:
-                progress = 0
+            # 进度解析容错（兼容str/int/None；无效值按0处理以维持原有拒绝语义）
+            parsed_progress = _parse_progress(kwargs.get("progress"))
+            progress = parsed_progress if parsed_progress is not None else 0
             target_id_param: int | None = kwargs.get("id")
             my_task_id = self.get_context("task_id")
             task_manager = self.get_context("task_manager")
@@ -524,7 +548,7 @@ class ReportTool(Tool):
                 output = "❌  report工具调用失败：写入report字段失败"
                 return DualOutput(summary=output, display=output)
 
-            summary = "✅  report工具调用成功。"
+            summary = REPORT_SUCCESS_SUMMARY
             display = _format_markdown_for_display(
                 report_content, title=f"📝 事务#{target_id} 工作汇报已提交"
             )

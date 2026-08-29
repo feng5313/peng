@@ -684,9 +684,56 @@ def _h_with_links(text: str, nest: str = None) -> str:
     return _convert_paths_to_links(text, nest)
 
 
+def _content_to_text(content: Any) -> str:
+    """将消息 content 规范化为纯文本字符串
+
+    context 中消息 content 可能为 OpenAI 多模态格式（list）：
+    [{"type": "text", "text": "..."}, {"type": "image_url", "image_url": {...}}, ...]
+    （如 read 工具返回图片附件或多模态注入后的内容）。逐项提取可读文本：
+    - type=text → 取 text 字段
+    - type=image_url / image → "[图片]" 占位符
+    - 其他 dict 项 → JSON 序列化（截断防爆屏）
+    str 原样返回；None 返回空串；其他类型 str() 兜底。
+    """
+    import json
+
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                itype = item.get("type", "")
+                if itype == "text":
+                    parts.append(str(item.get("text", "")))
+                elif itype in ("image_url", "image", "input_image"):
+                    parts.append("[图片]")
+                elif "text" in item:
+                    parts.append(str(item.get("text", "")))
+                else:
+                    s = json.dumps(item, ensure_ascii=False, default=str)
+                    parts.append(s[:200] + ("…" if len(s) > 200 else ""))
+            elif isinstance(item, str):
+                parts.append(item)
+            else:
+                parts.append(str(item))
+        return "\n".join(p for p in parts if p)
+    if isinstance(content, dict):
+        if "text" in content:
+            return str(content.get("text", ""))
+        return json.dumps(content, ensure_ascii=False, default=str)[:200]
+    return str(content)
+
+
 def _md_to_html(md_text: str, nest: str = None) -> str:
     """简易 Markdown → HTML 转换（支持标题、加粗、代码、列表、表格、硬换行）"""
     import re as _re
+
+    # 防御：非字符串输入（如多模态 list）规范化为文本，保证渲染永不崩溃
+    if not isinstance(md_text, str):
+        md_text = _content_to_text(md_text)
 
     lines = md_text.split("\n")
     result = []
@@ -1218,7 +1265,7 @@ def _cmd_show_html(args):
     system_prompt_link = (
         '<div class="task-section" id="system-prompt-section-' + str(task["id"]) + '">'
         '<h3 class="system-prompt-toggle" onclick="toggleSystemPrompt(' + str(task["id"]) + ', this)" style="cursor:pointer;text-decoration:underline;color:#58a6ff;">'
-        '🤖 系统提示词 <span style="font-size:0.85em;color:#8b949e;">(点击展开)</span>'
+        '<span class="toggle-title">🤖 系统提示词</span> <span class="toggle-hint" style="font-size:0.85em;color:#8b949e;">(点击展开)</span>'
         '</h3>'
         '<div class="system-prompt-full" style="display:none">'
         '<style>'
@@ -1286,8 +1333,8 @@ def _cmd_show_html(args):
         }
         for i, msg in enumerate(messages):
             role = msg.get("role", "unknown")
-            content = msg.get("content", "") or ""
-            reasoning = msg.get("reasoning_content", "") or ""
+            content = _content_to_text(msg.get("content"))
+            reasoning = _content_to_text(msg.get("reasoning_content"))
             tool_calls = msg.get("tool_calls")
             icon = role_icons.get(role, "❓")
             color = role_colors.get(role, "#8b949e")
@@ -1336,7 +1383,7 @@ def _cmd_show_html(args):
         </div>'''
         parts.append(f'''<div class="task-section" id="context-section-{task['id']}">
             <h3 class="context-toggle" onclick="toggleContext({task['id']}, this)" style="cursor:pointer;text-decoration:underline;color:#58a6ff;">
-                📜 当前上下文 <span style="font-size:0.85em;color:#8b949e">({tokens // 1000}K tokens, {len(messages)} 条消息)</span> <span style="font-size:0.75em;color:#58a6ff;">(点击展开)</span>
+                <span class="toggle-title">📜 当前上下文</span> <span style="font-size:0.85em;color:#8b949e">({tokens // 1000}K tokens, {len(messages)} 条消息)</span> <span class="toggle-hint" style="font-size:0.75em;color:#58a6ff;">(点击展开)</span>
             </h3>
             <div class="context-full" style="display:none">{messages_html}{collapse_html}</div>
         </div>''')
@@ -1372,7 +1419,7 @@ def _cmd_show_html(args):
             # 注入信息标题为可点击超链接，点击后替换为全部 info 内容
             parts.append(f'''<div class="task-section" id="info-section-{task['id']}">
                 <h3 class="task-info-toggle" onclick="toggleTaskInfo({task['id']}, this)" style="cursor:pointer; text-decoration:underline;">
-                    💡 注入信息 <span style="font-size:0.85em; color:#8b949e">({read_count}已读/{unread_count}未读)</span><a href="javascript:void(0)" onclick="event.stopPropagation(); clearTaskInfo({task['id']})" style="margin-left:4ch; font-size:0.85em; color:#f85149; text-decoration:underline;">清除</a>
+                    <span class="toggle-title">💡 注入信息</span> <span style="font-size:0.85em; color:#8b949e">({read_count}已读/{unread_count}未读)</span><a href="javascript:void(0)" onclick="event.stopPropagation(); clearTaskInfo({task['id']})" style="margin-left:4ch; font-size:0.85em; color:#f85149; text-decoration:underline;">清除</a>
                 </h3>
                 <div class="task-info-default">{default_html}</div>
                 <div class="task-info-full" style="display:none">{all_info_html}</div>
