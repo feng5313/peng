@@ -937,7 +937,9 @@ function initOutput() {
       lineHeight: 1.0,
       letterSpacing: 0,
       rows: rows,
-      scrollback: state.webuiConfig.xterm.scrollback,  // 从配置读取缓冲区行数
+      // 🔧 Task#1725：scrollback 提升到页大小10倍 —— 翻页整页渲染后，长行/宽字符 wrap
+      // 可达3倍以上物理行占用，5000物理行保证整页内容完整保留在 buffer 内不丢失
+      scrollback: state.webuiConfig.xterm.scrollback * 10,
       allowTransparency: false,  // 禁用透明，让主题背景色生效
       allowProposedApi: true,  // 启用实验性 API，支持更准确的 unicode/emoji 宽度计算
       cursorBlink: true,
@@ -1120,6 +1122,15 @@ function initOutput() {
       const wasScrolledUp = state.userScrolledUp;
       // 🔧 Fix Task#1096：使用精确底部检测
       state.userScrolledUp = !isExactlyAtBottom();
+      // 🔧 Task#1725：翻页模式下用户手动滚回底部 → 自动退出翻页恢复实时。
+      // 此前 _browsingHistory 只有点"⏬回底"按钮才清除，用户滚轮上翻进入翻页模式后
+      // 再手动滚回底部会永远卡在翻页模式 → 实时输出不再写入 → "不显示新输出"。
+      if (state._browsingHistory && !state._loadingPage && isExactlyAtBottom()) {
+        state._browsingHistory = false;
+        state._pagingStartLine = -1;
+        state._pagingEndLine = -1;
+        scrollToNewest();
+      }
       // 🔧 Task#816：翻页浏览历史时不触发自动回到底部
       if (wasScrolledUp && !state.userScrolledUp && !state._browsingHistory) {
         const currentHistory = getOutputHistory(state.currentTaskId);
@@ -1179,30 +1190,25 @@ function initOutput() {
           return;
         }
         _wheelPagingLock = true;
+        // 🔧 Task#1725：缓存命中渲染<5ms，锁300ms足够防连击；
+        // 后端请求路径由 _loadingPage 防重入，不依赖本锁时长
         loadPrevPage().finally(function() {
-          setTimeout(function() { _wheelPagingLock = false; }, 800);
+          setTimeout(function() { _wheelPagingLock = false; }, 300);
         });
       } else if (scrollingDown && atBottom) {
         if (hasNewerOutput()) {
           // 还有更新的输出页 → 加载下一页
           _wheelPagingLock = true;
           loadNextPage().finally(function() {
-            setTimeout(function() { _wheelPagingLock = false; }, 800);
+            setTimeout(function() { _wheelPagingLock = false; }, 300);
           });
         } else {
-          // 已是最后一页 → 执行“回到底部”
+          // 已是最后一页 → 执行"回到底部"（scrollToNewest 内部统一处理状态重置）
           showSimpleToast('⏹️ 已回到底部', 'info');
-          state._browsingHistory = false;
-          state.userScrolledUp = false;
-          state._pagingStartLine = -1;
           state._userScrollIntentUntil = 0;  // 🔧 Fix #1428：清除滚动意图标记
-          state._pagingEndLine = -1;
-          state._pagingAnchorNewestTs = null;
-          state._pagingPageNewestTs = null;
-          state._pagingRecoveryUntil = Date.now() + 500;
           scrollToNewest();
           _wheelPagingLock = true;
-          setTimeout(function() { _wheelPagingLock = false; }, 600);
+          setTimeout(function() { _wheelPagingLock = false; }, 300);
         }
       }
     }, { capture: true, passive: true });

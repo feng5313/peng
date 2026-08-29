@@ -377,12 +377,17 @@ class ConnectionManager:
 
     async def disconnect(self, websocket: WebSocket) -> None:
         """断开连接"""
+        removed = False
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
-        # 清理连接锁
-        ws_id = id(websocket)
-        if ws_id in self._connection_locks:
-            del self._connection_locks[ws_id]
+            removed = True
+        # 🔧 Task#1725：只有当连接确实在活跃列表中时才清锁！
+        # 否则出现灾难竞态：reload时浏览器先accept新连接(创建锁)，
+        # 后处理旧连接关闭帧(pop锁)——若新旧对象id因地址复用相同，
+        # 旧disconnect会删掉新连接的锁 → 新连接所有send_to永久静默丢弃。
+        if removed:
+            ws_id = id(websocket)
+            self._connection_locks.pop(ws_id, None)
         logger.info(f"WebSocket 连接断开，当前连接数: {len(self.active_connections)}")
 
     async def send_to(self, websocket: WebSocket, message: str | dict[str, Any]) -> None:
@@ -395,13 +400,34 @@ class ConnectionManager:
         ws_id = id(websocket)
         lock = self._connection_locks.get(ws_id)
         if lock is None:
-            logger.debug("WebSocket连接锁不存在，可能已断开，跳过发送")
+            # 🔧 Task#1725：静默丢弃是诊断黑洞！锁丢失说明连接管理状态已损坏，
+            # 必须大声日志（曾导致页面收不到任何实时输出却无任何痕迹）
+            logger.warning(
+                f"⚠️ WebSocket连接锁不存在，发送被丢弃(连接状态损坏?): ws_id={ws_id}, "
+                f"type={message[:60] if isinstance(message, str) else 'dict'}"
+            )
             return
 
         # 使用锁保护发送操作，防止并发发送导致AssertionError
+        # 🔧 Task#1725：send必须带超时！半死连接（TCP半开/对端不读导致发送缓冲满）
+        # 会让send_text永久挂起——watch_loop顺序await每个客户端的回调，
+        # 一个僵尸连接就能卡死整个输出推送循环（所有客户端零增量、前端循环重订阅）。
         async with lock:
             try:
-                await websocket.send_text(message)
+                await asyncio.wait_for(websocket.send_text(message), timeout=5.0)
+            except asyncio.TimeoutError:
+                # 🔧 Task#1725：发送超时=死连接，立即清理，绝不让它拖垮watch_loop
+                logger.warning(
+                    f"WebSocket发送超时(5s)，判定为死连接并清理: ws_id={ws_id}"
+                )
+                # 仅当连接确实活跃时才清理（防误删地址复用的新连接的锁）
+                if websocket in self.active_connections:
+                    self.active_connections.remove(websocket)
+                    self._connection_locks.pop(ws_id, None)
+                try:
+                    await websocket.close()
+                except Exception:
+                    pass
             except RuntimeError as e:
                 # WebSocket已关闭或响应已完成，清理连接
                 err_msg = str(e)
@@ -414,7 +440,7 @@ class ConnectionManager:
                     logger.debug(f"WebSocket已关闭或响应完成，清理连接: {e}")
                     if websocket in self.active_connections:
                         self.active_connections.remove(websocket)
-                    self._connection_locks.pop(ws_id, None)
+                        self._connection_locks.pop(ws_id, None)
                 else:
                     raise
             except WebSocketDisconnect:
@@ -423,7 +449,7 @@ class ConnectionManager:
                 # 从活跃连接列表中移除已断开的连接并清理锁
                 if websocket in self.active_connections:
                     self.active_connections.remove(websocket)
-                self._connection_locks.pop(ws_id, None)
+                    self._connection_locks.pop(ws_id, None)
             except AssertionError as e:
                 # websockets 库内部状态异常（并发发送导致 waiter 状态不一致）
                 # 视为连接已断开，清理连接
@@ -434,7 +460,7 @@ class ConnectionManager:
                 # 从活跃连接列表中移除已断开的连接并清理锁
                 if websocket in self.active_connections:
                     self.active_connections.remove(websocket)
-                self._connection_locks.pop(ws_id, None)
+                    self._connection_locks.pop(ws_id, None)
                 # 主动关闭 WebSocket 连接
                 try:
                     await websocket.close()
@@ -762,6 +788,16 @@ async def _send_output_to_websocket(websocket: WebSocket, output_data: dict[str,
     如果发送失败，立即重新抛出异常，让read_history中断
     """
     try:
+        # 🔧 Task#1725：文件重写重置信号（行号格式迁移后通知前端重新拉取）
+        if output_data.get("type") == "reset":
+            await manager.send_to(
+                websocket,
+                {
+                    "type": "output_reset",
+                    "taskId": output_data.get("task_id"),
+                },
+            )
+            return
         await manager.send_to(
             websocket,
             {
@@ -783,6 +819,20 @@ async def _send_output_to_websocket(websocket: WebSocket, output_data: dict[str,
         raise
 
 
+def _detect_line_no_in_field(batch_lines: list[str], file_line_start: int) -> bool:
+    """检测批次行是否为新格式（第3字段=行号）。
+
+    🔧 Task#1725：新格式 {ts}\t{source}\t{lineNo}\t{content} 的行内行号 == 物理行号。
+    取批次首行验证：parts[2] == str(该行物理行号) → 新格式。
+    旧格式第3字段是固定task_id，不会恰好等于物理行号。
+    """
+    if not batch_lines or file_line_start <= 0:
+        return False
+    first = batch_lines[0].rstrip("\n")
+    parts = first.split("\t", 3)
+    return len(parts) >= 4 and parts[2] == str(file_line_start)
+
+
 async def _send_history_output_async(
     websocket: WebSocket,
     reader: Any,
@@ -792,55 +842,74 @@ async def _send_history_output_async(
     before_timestamp: str | None = None,
     since_time: str | None = None,
     subscription_epoch: int | None = None,
+    page_start: int | None = None,
+    page_end: int | None = None,
 ) -> None:
     """
     异步发送历史输出（后台任务）- 🚀 性能优化版
 
     核心优化：不再 readlines() 整个大文件！
-    - totalLines: 用分块二进制计数（C级速度）
+    - totalLines: 用行偏移索引 O(1) 获取（🔧 Task#1725）
+    - page_start/page_end: 行号范围 seek 直读，O(页大小)（🔧 Task#1725 翻页）
     - since_time: 用 find_timestamp_line_pos 定位后只读取增量
-    - before_timestamp: 扫描定位后只取窗口行
+    - before_timestamp: 扫描定位后只取窗口行（旧翻页协议，兼容保留）
     - 首次订阅: 从文件末尾读 scrollback 行
     - 所有文件IO在 asyncio.to_thread 中执行
     """
     try:
-        # 收集文件路径
-        file_paths = []
+        # 收集文件路径（带task_id，供行号索引使用）
+        file_entries: list[tuple[int, Path]] = []
         if task_ids:
             for tid in sorted(task_ids):
                 fp = reader.get_output_file_path(tid)
                 if fp.exists():
-                    file_paths.append(fp)
+                    file_entries.append((tid, fp))
         else:
             for fp in reader.output_dir.iterdir():
                 if fp.name.startswith("task-") and fp.name.endswith(".out"):
-                    file_paths.append(fp)
-            file_paths.sort(key=lambda x: x.name)
+                    try:
+                        file_entries.append((int(fp.name[5:-4]), fp))
+                    except ValueError:
+                        pass
+            file_entries.sort(key=lambda x: x[0])
 
-        if not file_paths:
+        if not file_entries:
             logger.info("[WebSocket后台任务] 没有输出文件")
             return
 
         # 🚀 所有文件IO在线程池中执行
         def _do_work():
+            # --- 模式0: page_start/page_end 行号翻页（🔧 Task#1725 O(1)）---
+            if page_start and page_end:
+                all_batch_lines = []
+                grand_total = 0
+                has_more = page_start > 1
+                file_line_start = page_start
+                count = 0
+                for tid, fp in file_entries:
+                    lines = reader.read_line_range_indexed(tid, fp, page_start, page_end)
+                    total = reader.get_total_lines(tid, fp)
+                    grand_total += total
+                    all_batch_lines.extend(lines)
+                    count += len(lines)
+                file_line_end = file_line_start + max(0, count - 1) if count else 0
+                # 行内行号检测：新格式第3字段=lineNo（==物理行号）
+                line_no_in_field = _detect_line_no_in_field(all_batch_lines, file_line_start)
+                logger.info(
+                    f"[WebSocket后台任务] 行号翻页完成: [{page_start},{page_end}] → {count}行, hasMore={has_more}, lineNoInField={line_no_in_field}"
+                )
+                return ("page_range", all_batch_lines, grand_total, has_more, file_line_start, file_line_end, line_no_in_field)
+
             # --- 模式1: since_time 增量获取 ---
             # 🚀 复用 update_subscription 已算好的订阅位置，不再重复扫描文件
             if since_time:
                 all_batch_lines = []
                 grand_total = 0
-                for fp in file_paths:
-                    task_id = None
-                    fname = fp.name
-                    if fname.startswith("task-") and fname.endswith(".out"):
-                        try:
-                            task_id = int(fname[5:-4])
-                        except ValueError:
-                            pass
+                for tid, fp in file_entries:
                     byte_pos = 0
-                    if task_id is not None:
-                        subs = reader._subscriptions.get(client_id, {})
-                        byte_pos = subs.get(task_id, 0)
-                    total = reader.count_total_lines(fp)
+                    subs = reader._subscriptions.get(client_id, {})
+                    byte_pos = subs.get(tid, 0)
+                    total = reader.get_total_lines(tid, fp)  # 🔧 Task#1725: O(1)
                     grand_total += total
                     if byte_pos > 0 and byte_pos < fp.stat().st_size:
                         lines, _, _ = reader.read_lines_from_byte_pos(fp, byte_pos)
@@ -848,30 +917,36 @@ async def _send_history_output_async(
                 logger.info(f"[WebSocket后台任务] 增量读取完成: {len(all_batch_lines)} 行, 总行数={grand_total}, since_time={since_time}")
                 return ("incremental", all_batch_lines, grand_total)
 
-            # --- 模式2: before_timestamp 翻页 ---
+            # --- 模式2: before_timestamp 翻页（旧协议，兼容保留）---
             # 🚀 用 read_lines_before_pos 反向读取，不逐行扫描整个文件
             if before_timestamp:
                 all_batch_lines = []
                 grand_total = 0
                 has_more = False
+                # 🔧 Task#1725 修复多文件行号覆盖bug：按文件分段正确累加行号
+                seg_line_start = 0
+                file_line_start = 0
                 file_line_end = 0
-                for fp in file_paths:
+                for tid, fp in file_entries:
                     cutoff_pos, cutoff_line, total = reader.find_timestamp_line_pos(fp, before_timestamp, mode="gte")
                     grand_total += total
                     if cutoff_line > 1:
                         has_more = True
                     if cutoff_pos > 0:
                         lines, _ = reader.read_lines_before_pos(fp, cutoff_pos, scrollback)
+                        if lines:
+                            seg_line_start = max(1, cutoff_line - len(lines) + 1)
+                            if not file_line_start:
+                                file_line_start = seg_line_start
+                            file_line_end = cutoff_line
                         all_batch_lines.extend(lines)
-                        file_line_end = cutoff_line
-                file_line_start = max(1, file_line_end - len(all_batch_lines) + 1)
                 logger.info(f"[WebSocket后台任务] 翻页读取完成: {len(all_batch_lines)} 行, hasMore={has_more}")
                 return ("older_history", all_batch_lines, grand_total, has_more, file_line_start, file_line_end)
 
             # --- 模式3: 首次订阅 ---
             all_batch_lines = []
             grand_total = 0
-            for fp in file_paths:
+            for tid, fp in file_entries:
                 lines, total, start_line_no = reader.read_last_n_lines(fp, scrollback)
                 grand_total += total
                 all_batch_lines.extend(lines)
@@ -891,17 +966,33 @@ async def _send_history_output_async(
 
         # --- 公共：更新订阅位置到文件末尾 ---
         async def _update_positions():
-            for fp in file_paths:
+            for tid, fp in file_entries:
                 if fp.exists():
                     file_size = fp.stat().st_size
-                    filename = fp.name
-                    parts = filename.split("-")
-                    if len(parts) >= 2:
-                        try:
-                            task_id = int(parts[1].split(".")[0])
-                            await reader.update_read_position(client_id, task_id, file_size)
-                        except (ValueError, IndexError):
-                            pass
+                    try:
+                        await reader.update_read_position(client_id, tid, file_size)
+                    except (ValueError, IndexError):
+                        pass
+
+        if mode == "page_range":
+            _, batch_lines, grand_total, has_more, fl_start, fl_end, line_no_in_field = result
+            await manager.send_to(websocket, {
+                "type": "output_batch",
+                "outputs": batch_lines,
+                "count": len(batch_lines),
+                "batchNum": 1,
+                "totalBatches": 1,
+                "hasMore": has_more,
+                "isPageRange": True,
+                "lineNoInField": line_no_in_field,
+                "isOlderHistory": False,
+                "isIncremental": False,
+                "totalLines": grand_total,
+                "fileLineStart": fl_start,
+                "fileLineEnd": fl_end,
+            })
+            logger.info(f"[WebSocket后台任务] 发送行号翻页批次：{len(batch_lines)} 行 [{fl_start}-{fl_end}]/{grand_total}")
+            return
 
         if mode == "incremental":
             _, batch_lines, grand_total = result
@@ -920,6 +1011,7 @@ async def _send_history_output_async(
                 "hasMore": False,
                 "isOlderHistory": False,
                 "isIncremental": True,
+                "lineNoInField": _detect_line_no_in_field(batch_lines, max(1, grand_total - count + 1)),
                 "totalLines": grand_total,
                 "fileLineStart": max(1, grand_total - count + 1),
                 "fileLineEnd": grand_total,
@@ -937,6 +1029,7 @@ async def _send_history_output_async(
                 "totalBatches": 1,
                 "hasMore": has_more,
                 "isOlderHistory": True,
+                "lineNoInField": _detect_line_no_in_field(batch_lines, fl_start),
                 "totalLines": grand_total,
                 "fileLineStart": fl_start,
                 "fileLineEnd": fl_end,
@@ -956,6 +1049,7 @@ async def _send_history_output_async(
                 "totalBatches": 1,
                 "hasMore": has_more,
                 "isOlderHistory": False,
+                "lineNoInField": _detect_line_no_in_field(batch_lines, start_line),
                 "totalLines": grand_total,
                 "fileLineStart": start_line,
                 "fileLineEnd": grand_total,
@@ -1020,8 +1114,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     skip_history = cmd.get("skipHistory", False)
                     before_timestamp = cmd.get("beforeTimestamp", None)  # 用于"上一页"加载更多老历史
                     since_time = cmd.get("sinceTime", None)  # 🔧 Task#219：增量获取切换期间的新输出
+                    # 🔧 Task#1725：O(1) 行号翻页 —— 按行号范围直接seek读取
+                    page_start = cmd.get("pageStart", None)
+                    page_end = cmd.get("pageEnd", None)
                     logger.info(
-                        f"处理订阅请求: messageId={message_id}, taskIds={task_ids}, skipHistory={skip_history}, beforeTimestamp={before_timestamp}, sinceTime={since_time}"
+                        f"处理订阅请求: messageId={message_id}, taskIds={task_ids}, skipHistory={skip_history}, beforeTimestamp={before_timestamp}, sinceTime={since_time}, pageStart={page_start}, pageEnd={page_end}"
                     )
 
                     if message_id:
@@ -1046,8 +1143,23 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         except Exception:
                             scrollback = DEFAULT_OUTPUT_HISTORY_LIMIT
 
+                        # 🔧 Task#1725：O(1) 行号翻页（优先级最高）—— 按行号范围seek直读
+                        if page_start and page_end:
+                            logger.info(f"[WebSocket] 行号翻页: [{page_start}, {page_end}]")
+                            asyncio.create_task(
+                                _send_history_output_async(
+                                    websocket,
+                                    reader,
+                                    client_id,
+                                    task_ids,
+                                    scrollback,
+                                    page_start=int(page_start),
+                                    page_end=int(page_end),
+                                    subscription_epoch=subscription_epoch,
+                                )
+                            )
                         # 🔧 如果提供了 beforeTimestamp，说明是"上一页"请求更多老历史
-                        if before_timestamp:
+                        elif before_timestamp:
                             logger.info(f"[WebSocket] 请求更老历史: beforeTimestamp={before_timestamp}")
                             # 发送头部消息
                             await manager.send_to(

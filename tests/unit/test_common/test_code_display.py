@@ -226,6 +226,36 @@ class TestFormatMarkdownDisplay:
                 assert ln == ""
 
 
+class TestToolResultDisplayPolicy:
+    """工具结果显示策略：line_edit 结果头部只显示 类型+路径（diff 在 display 中）"""
+
+    def test_line_edit_result_no_args(self):
+        from peng.llm.tool_engine import ToolExecutionEngine
+
+        engine = object.__new__(ToolExecutionEngine)
+        out = engine._format_tool_result_info(
+            "line_edit",
+            {
+                "filePath": "/tmp/demo.py",
+                "operation": "replace",
+                "startLine": 5,
+                "endLine": 7,
+                "content": "x = 1\n",
+            },
+        )
+        assert out == "✏️ 按行编辑 /tmp/demo.py"
+        assert "content" not in out and "operation" not in out  # 不含参数JSON
+
+    def test_other_tools_result_unaffected(self):
+        from peng.llm.tool_engine import ToolExecutionEngine
+
+        engine = object.__new__(ToolExecutionEngine)
+        out = engine._format_tool_result_info("read", {"filePath": "/x/a.py"})
+        assert "/x/a.py" not in out or "读取" in out  # read 保持原逻辑（带参数JSON）
+        out2 = engine._format_tool_result_info("bash", {"command": "ls"})
+        assert "ls" in out2
+
+
 class TestAnsiSelfContained:
     def test_every_line_independent(self):
         """每行内容拆出后独立可渲染：无跨行未闭合的颜色状态要求

@@ -56,9 +56,20 @@ class OutputReader:
         self._lock: asyncio.Lock | None = None
         self._lock_loop_id: int | None = None
 
+        # 🔧 Task#1725：O(1) 行偏移索引 —— task_id -> [每行起始字节偏移]
+        # 首次访问全扫建索引，之后文件追加只增量扫描新字节，翻页按行号seek直读
+        self._line_offsets: dict[int, list[int]] = {}
+        # 行首对齐扫描点（该位置必然是某行开头；文件尾非\n时停留在未完成行起始之前）
+        self._aligned_sizes: dict[int, int] = {}
+        # 索引行数上限（防止超大文件索引无限膨胀）
+        self.MAX_INDEX_LINES = 2_000_000
+
         # 监控事务
         self._watch_task: asyncio.Task | None = None
         self._running = False
+
+        # 🔧 Task#1725：watch循环的inode跟踪（检测输出文件被行号格式迁移重写）
+        self._watch_inos: dict[int, int] = {}
 
         # 客户端ID计数器
         self._next_client_id = 0
@@ -97,16 +108,22 @@ class OutputReader:
         """
         return self._output_dir / f"task-{task_id}.out"
 
-    def parse_output_line(self, line: str) -> dict[str, Any] | None:
+    def parse_output_line(self, line: str, fallback_line_no: int | None = None) -> dict[str, Any] | None:
         """
         解析输出行
 
-        格式：{timestamp}\t{source}\t{task_id}\t{content}
+        新格式（🔧 Task#1725）：{timestamp}\t{source}\t{lineNo}\t{content}（第3字段=行号）
+        旧格式：{timestamp}\t{source}\t{task_id}\t{content}（第3字段=事务ID）
+
+        区分：新格式行号从1连续递增且等于物理行位置；旧格式task_id为固定事务ID。
+        单行判断：第3字段为纯数字即兼容处理，行号优先用 fallback_line_no（物理行号，
+        两种格式下都与行内新格式行号一致）。
 
         source 可能是：thinking, answer, bash, tool_call, tool_result, system, task 等
 
         Args:
             line: 输出行
+            fallback_line_no: 物理行号（1-based），用作 fileLineNo
 
         Returns:
             解析后的字典，解析失败返回None
@@ -120,10 +137,16 @@ class OutputReader:
             return None
 
         try:
+            task_id = 0
+            try:
+                task_id = int(parts[2])
+            except ValueError:
+                pass
             return {
                 "timestamp": parts[0],
                 "source": parts[1],
-                "task_id": int(parts[2]),
+                "task_id": task_id,
+                "fileLineNo": fallback_line_no if fallback_line_no is not None else (task_id if task_id > 0 else None),
                 "content": parts[3],
             }
         except (ValueError, IndexError):
@@ -330,6 +353,142 @@ class OutputReader:
         except Exception as e:
             logger.warning(f"count_total_lines 失败: {file_path}, {e}")
             return 0
+
+    # ==================== 🔧 Task#1725：O(1) 行偏移索引 ====================
+
+    def _scan_line_offsets(self, file_path: Path, start_pos: int, end_pos: int, offsets: list[int], first_line_start: int | None = None) -> int | None:
+        """扫描 [start_pos, end_pos) 区间，把每个完整行的下一行起始偏移追加到 offsets。
+
+        start_pos 必须行首对齐（0 或某 \n 之后）。
+        只记录区间内以 \n 结尾的完整行；未完成行（无 \n）不记录。
+        first_line_start: 区间首行的起始偏移——当首行在区间内完成（遇\n）时补记录。
+
+        Returns: 区间内最后一个 \n 的下一位置（新对齐点）；区间无 \n 时返回 None。
+        """
+        last_nl_end: int | None = None
+        with open(file_path, "rb") as f:
+            pos = start_pos
+            while pos < end_pos:
+                f.seek(pos)
+                buf = f.read(min(1024 * 1024, end_pos - pos))
+                if not buf:
+                    break
+                idx = buf.find(b"\n")
+                if idx >= 0 and first_line_start is not None:
+                    offsets.append(first_line_start)
+                    first_line_start = None  # 只补记一次
+                while idx >= 0:
+                    if len(offsets) >= self.MAX_INDEX_LINES:
+                        return pos + idx + 1
+                    offsets.append(pos + idx + 1)
+                    last_nl_end = pos + idx + 1
+                    idx = buf.find(b"\n", idx + 1)
+                pos += len(buf)
+        return last_nl_end
+
+    def _ensure_line_index(self, task_id: int, file_path: Path) -> None:
+        """确保 task_id 的行偏移索引与文件同步（增量维护，追加O(新字节)）。
+
+        算法：_aligned_sizes[task_id] 记录"行首对齐扫描点"（该位置必然是某行开头）。
+        - 扫描 [aligned, size)，只 append 完整行（遇 \n）的下一行起始
+        - 文件末字节是 \n → aligned=size（全部对齐）；否则 aligned 不变（存在未完成行，
+          下次从原 aligned 重扫，未完成行完成后自然被正确记录）
+        - 截断/清空：offsets 清空 + aligned 归零重建
+        不变量：offsets 长度 == 文件中完整行数；offsets[i] == 第 i+1 行起始偏移。
+        """
+        try:
+            if not file_path.exists():
+                self._line_offsets.pop(task_id, None)
+                self._aligned_sizes.pop(task_id, None)
+                return
+            size = file_path.stat().st_size
+            offsets = self._line_offsets.get(task_id)
+            if offsets is None:
+                offsets = [0]  # 第1行起始偏移恒为0
+                self._line_offsets[task_id] = offsets
+                self._aligned_sizes[task_id] = 0
+            aligned = self._aligned_sizes.get(task_id, 0)
+            if size == 0:
+                offsets.clear()
+                self._aligned_sizes[task_id] = 0
+                return
+            if size < aligned:
+                # 文件被截断（清空输出/重启）→ 重建
+                offsets.clear()
+                offsets.append(0)
+                self._aligned_sizes[task_id] = 0
+                aligned = 0
+            if size == aligned:
+                return  # 无新增完整行
+            if not offsets:
+                offsets.append(0)  # 第1行起始
+            # 区间首行（起始于aligned）的起始偏移若尚未记录，交给scan在首行完成时补记
+            first_line_start = aligned if offsets[-1] < aligned else None
+            # 从对齐点增量扫描到当前文件尾
+            last_nl_end = self._scan_line_offsets(file_path, aligned, size, offsets, first_line_start)
+            self._cleanup_tail_sentinel(offsets, size)
+            # 对齐点推进到最后一个\n之后（该处可能是未完成行起始，下次从这重扫；
+            # 未完成行完成时由 first_line_start 机制补记其偏移）
+            if last_nl_end is not None:
+                self._aligned_sizes[task_id] = last_nl_end
+        except Exception as e:
+            logger.warning(f"_ensure_line_index 失败: task={task_id}, {file_path}, {e}")
+
+    @staticmethod
+    def _cleanup_tail_sentinel(offsets: list[int], size: int) -> None:
+        """清理扫描产生的尾部哨兵：文件以\\n结尾时，末个\\n会误增一个'下一行起始'偏移。
+
+        该偏移==文件大小，不代表真实行，必须移除（下次增量追加会重新扫描该区域）。
+        """
+        while offsets and offsets[-1] >= size:
+            offsets.pop()
+
+    def get_total_lines(self, task_id: int, file_path: Path) -> int:
+        """O(1) 获取文件总行数（基于增量维护的行偏移索引）。"""
+        try:
+            if not file_path.exists():
+                return 0
+            self._ensure_line_index(task_id, file_path)
+            return len(self._line_offsets.get(task_id, []))
+        except Exception as e:
+            logger.warning(f"get_total_lines 失败: task={task_id}, {e}")
+            return 0
+
+    def read_line_range_indexed(
+        self, task_id: int, file_path: Path, start_line: int, end_line: int, max_lines: int = 100_000
+    ) -> list[str]:
+        """按行号范围读取（seek直读，O(页大小)，行号1-based含两端）。
+
+        Returns: 行列表（每行带尾部\n，与文件原始行一致）
+        """
+        try:
+            if not file_path.exists():
+                return []
+            self._ensure_line_index(task_id, file_path)
+            offsets = self._line_offsets.get(task_id)
+            if not offsets:
+                return []
+            n = len(offsets)
+            s = max(1, start_line)
+            e = min(n, end_line, s + max_lines - 1)
+            if s > e:
+                return []
+            start_off = offsets[s - 1]
+            if e < n:
+                end_off = offsets[e]  # 第e+1行起始 = 第e行结束
+            else:
+                end_off = file_path.stat().st_size
+            with open(file_path, "rb") as f:
+                f.seek(start_off)
+                data = f.read(max(0, end_off - start_off))
+            text = data.decode("utf-8", errors="replace")
+            lines = text.split("\n")
+            if lines and lines[-1] == "":
+                lines.pop()
+            return [line + "\n" for line in lines]
+        except Exception as e:
+            logger.warning(f"read_line_range_indexed 失败: task={task_id}, {e}")
+            return []
 
     def read_lines_from_byte_pos(self, file_path: Path, byte_pos: int) -> tuple[list[str], int, int]:
         """从指定字节位置读取到文件末尾。
@@ -808,8 +967,17 @@ class OutputReader:
         """
         logger.info("🔍 输出文件监控循环已启动")
 
+        # 🔧 Task#1725：心跳可观测性——每120轮(60秒)打一条INFO，
+        # 便于诊断"watch_loop是否存活/卡死"类问题（此前卡死完全无痕迹）
+        _loop_round = 0
+
         while self._running:
             try:
+                _loop_round += 1
+                if _loop_round % 120 == 1:
+                    logger.info(
+                        f"💓 watch_loop心跳: 第{_loop_round}轮, 订阅客户端数={len(self._subscriptions)}"
+                    )
                 # 获取所有需要检查的文件及其订阅者
                 async with self._get_lock():
                     # 🔧 只有"非明确订阅模式"的客户端才自动发现新文件
@@ -853,8 +1021,38 @@ class OutputReader:
                         continue
 
                     try:
-                        file_size = file_path.stat().st_size
+                        st = file_path.stat()
+                        file_size = st.st_size
                     except OSError:
+                        continue
+
+                    # 🔧 Task#1725：检测文件被重写（行号格式迁移的os.replace会更换inode）
+                    # 字节位置订阅在重写后语义失效 → 通知客户端重置并重新拉取首批
+                    prev_ino = self._watch_inos.get(task_id)
+                    cur_ino = st.st_ino
+                    self._watch_inos[task_id] = cur_ino
+                    if prev_ino is not None and prev_ino != cur_ino:
+                        logger.info(
+                            f"[Task#1725] 检测到输出文件被重写(格式迁移): task-{task_id}, 通知 {len(client_positions)} 个客户端重置"
+                        )
+                        for client_id in client_positions:
+                            callback = callbacks.get(client_id)
+                            if callback:
+                                try:
+                                    # 🔧 Task#1725：同样带超时，防僵尸连接拖死watch_loop
+                                    await asyncio.wait_for(
+                                        callback({"type": "reset", "task_id": task_id, "timestamp": ""}),
+                                        timeout=5.0,
+                                    )
+                                except asyncio.TimeoutError:
+                                    logger.warning(f"发送output_reset超时: client={client_id}，跳过")
+                                except Exception as e:
+                                    logger.warning(f"发送output_reset失败: client={client_id}, {e}")
+                        # 订阅位置直接跳到新文件末尾（旧内容由前端重新订阅时拉取首批获得）
+                        async with self._get_lock():
+                            for client_id in client_positions:
+                                if client_id in self._subscriptions and task_id in self._subscriptions[client_id]:
+                                    self._subscriptions[client_id][task_id] = file_size
                         continue
 
                     # 找出最小位置（有新内容的最小起点）
@@ -896,9 +1094,15 @@ class OutputReader:
                                 line_pos = offset
                                 offset += len(raw_line.encode("utf-8")) + 1
                                 line_no += 1
-                                parsed = self.parse_output_line(raw_line + "\n")
+                                parsed = self.parse_output_line(raw_line + "\n", fallback_line_no=line_no)
                                 if parsed:
                                     parsed["fileLineNo"] = line_no
+                                    # 🔧 Task#1725 致命修复：新格式第3字段=行号，parse_output_line
+                                    # 会把它误解析为task_id → 前端appendOutput按行号建缓存
+                                    # → isCurrentTask=false → 实时输出永不显示（CLI watch正常，
+                                    #   webui不更新，就是它！）。watch循环天然知道权威task_id，
+                                    #   直接覆盖。
+                                    parsed["task_id"] = task_id
                                     lines.append((line_pos, parsed))
                             return lines, offset
 
@@ -912,7 +1116,15 @@ class OutputReader:
                                     callback = callbacks.get(client_id)
                                     if callback:
                                         try:
-                                            await callback(parsed)
+                                            # 🔧 Task#1725：回调必须带超时！
+                                            # 回调内部是 websocket.send_text，半死连接会让它
+                                            # 永久挂起 → 顺序await的watch_loop整个卡死 →
+                                            # 所有客户端零增量推送。超时跳过，绝不拖垮全局循环。
+                                            await asyncio.wait_for(callback(parsed), timeout=5.0)
+                                        except asyncio.TimeoutError:
+                                            logger.warning(
+                                                f"⚠️ 客户端 {client_id} 输出回调超时(5s)，跳过该行继续推送其他客户端"
+                                            )
                                         except Exception as e:
                                             logger.error(
                                                 f"回调新输出失败: {e}\n{traceback.format_exc()}"

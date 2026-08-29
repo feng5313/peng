@@ -176,5 +176,8 @@ const state = {
   _pagingPageNewestTs: null,
   _pagingStartIdx: -1,
   _pagingEndIdx: -1,
+  // 🔧 Task#1725：O(1) 行号翻页状态
+  _loadingPage: null,          // 行号翻页请求进行中 {start, end}；null=空闲
+  _xtermNewestLineNo: 0,       // xterm 中实际已写入的最大行号（内容落后判定）
 };
 

@@ -4,7 +4,10 @@
 let _lastOutputReceivedAt = Date.now();
 let _outputHealthCheckTimer = null;
 const OUTPUT_HEALTH_CHECK_INTERVAL = 3000;  // 3秒检测一次
-const OUTPUT_STALL_THRESHOLD = 5000;       // 5秒没收到输出视为停滞
+const OUTPUT_STALL_THRESHOLD = 12000;       // 🔧 Task#1725：12秒没收到输出才视为停滞
+//                                            （LLM思考间隔普遍5~15秒，旧值5秒对断续输出事务是误报机器）
+let _stallRetryCount = 0;                   // 🔧 Task#1725：连续停滞重订阅计数（退避防风暴）
+let _nextStallRetryAt = 0;                  // 下次允许停滞重订阅的时间戳
 
 function _startOutputHealthCheck() {
   if (_outputHealthCheckTimer) return;
@@ -19,7 +22,13 @@ function _startOutputHealthCheck() {
 
     const elapsed = Date.now() - _lastOutputReceivedAt;
     if (elapsed > OUTPUT_STALL_THRESHOLD) {
-      console.warn(`[Task#281] 输出停滞检测：${Math.round(elapsed/1000)}秒未收到输出，重新订阅 task=${state.currentTaskId}`);
+      // 🔧 Task#1725：退避重订阅——连续停滞时逐次拉长间隔(12s→24s→48s→96s封顶)，
+      // 防止"断续输出事务+重订阅风暴"打爆前后端（曾致服务端每5秒被重订阅刷屏）
+      if (Date.now() < _nextStallRetryAt) return;
+      _stallRetryCount++;
+      const backoff = Math.min(12000 * Math.pow(2, _stallRetryCount - 1), 96000);
+      _nextStallRetryAt = Date.now() + backoff;
+      console.warn(`[Task#281] 输出停滞检测：${Math.round(elapsed/1000)}秒未收到输出，重新订阅 task=${state.currentTaskId} (第${_stallRetryCount}次, 退避${Math.round(backoff/1000)}s)`);
       _lastOutputReceivedAt = Date.now();  // 重置防止连续触发
       // 用 sinceTime 增量获取：从最后已知时间戳之后的新输出，不重复历史
       const sinceTime = state.currentNewestTimestamp || null;
@@ -70,9 +79,66 @@ function initWebSocket() {
       }
       // 🔧 Task #182：WebSocket连接后切换为慢速兜底轮询（30秒），避免不断无意义刷新
       startTasksRefresh();
-      // 🔧 Task#281：启动输出健康检测
+      // 🔧 Task#1725：启动输出健康检测
       _startOutputHealthCheck();
+      // 🔧 Task#1725：连接成功即清除connecting标记
+      state._wsConnectingSince = null;
     };
+
+    // 🔧 Task#1725：WS自愈守护——根治"断线后页面永远没数据"
+    // 此前重连仅靠 onclose→setTimeout(3s)→initWebSocket 单链，任何一环断裂
+    // （后台标签页setTimeout被浏览器节流至1次/分钟、initWebSocket偶发异常、
+    //  onclose未触发）页面就永久断供：xterm不动、事务树不刷，用户只见死页面。
+    // 守护三保险：
+    //   1) 页面切回前台立即检查重连（后台节流的setTimeout在切回瞬间补偿）
+    //   2) 每10秒健康巡检（前台不节流）：非OPEN且无在途重连 → 立即重连
+    //   3) CONNECTING卡死>15秒（握手挂起）→ 强制重建
+    let _wsReconnectScheduled = false;
+    function _wsSelfHealCheck(reason) {
+      try {
+        const rs = state.ws ? state.ws.readyState : WebSocket.CLOSED;
+        if (rs === WebSocket.OPEN) {
+          state._wsConnectingSince = null;
+          _wsReconnectScheduled = false;
+          return;  // 健康
+        }
+        if (rs === WebSocket.CONNECTING) {
+          if (state._wsConnectingSince && Date.now() - state._wsConnectingSince > 15000) {
+            console.warn(`[Task#1725] WS握手卡死>15s(${reason})，强制重建连接`);
+            try { state.ws.onclose = null; state.ws.close(); } catch (e) {}
+            state.ws = null;
+          } else {
+            return;  // 正常握手中
+          }
+        }
+        // CLOSED/CLOSING/被强杀：调度重连（防重复调度）
+        if (!_wsReconnectScheduled) {
+          _wsReconnectScheduled = true;
+          console.warn(`[Task#1725] WS自愈守护触发重连(${reason}, readyState=${rs})`);
+          setTimeout(() => {
+            _wsReconnectScheduled = false;
+            initWebSocket();
+          }, 500);
+        }
+      } catch (e) {
+        console.error('[Task#1725] WS自愈巡检异常:', e);
+      }
+    }
+    let _wsSelfHealTimer = null;
+    function _startWsSelfHealWatchdog() {
+      if (_wsSelfHealTimer) return;
+      _wsSelfHealTimer = setInterval(() => {
+        // 浏览器对后台标签会把interval节流到1次/分钟——切回前台由visibilitychange立即补偿
+        _wsSelfHealCheck('interval');
+      }, 10000);
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+          _wsSelfHealCheck('visibility');
+        }
+      });
+      window.addEventListener('online', () => _wsSelfHealCheck('online'));
+    }
+    _startWsSelfHealWatchdog();
 
     state.ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
@@ -87,6 +153,8 @@ function initWebSocket() {
       startTasksRefresh();
 
       // 尝试重连
+      // 🔧 Task#1725：重连期间标记 connecting 时间戳，供 _wsSelfHealWatchdog 判断
+      state._wsConnectingSince = Date.now();
       setTimeout(() => {
         initWebSocket();
       }, 3000);
@@ -127,27 +195,56 @@ function handleWebSocketMessage(data) {
       // - 首次订阅：batch 1 是最新 scrollback 行，hasMore 表示是否还有更老历史
       // - "上一页"请求：isOlderHistory=true，返回比 beforeTimestamp 更老的 scrollback 行
       // - 🔧 Task#219 增量获取：isIncremental=true，返回 sinceTime 之后的新输出
+      // - 🔧 Task#1725 行号翻页：isPageRange=true，返回 [pageStart, pageEnd] 行号范围的行（O(1)）
       // 每批内部顺序：[旧→新]（文件本身就是按时间写入的）
       // 缓存需要：[老→新]
       const isFirstBatch = data.batchNum === 1;
       const isOlderHistory = data.isOlderHistory === true;
       const isIncremental = data.isIncremental === true;
+      const isPageRange = data.isPageRange === true;
       const hasMore = data.hasMore === true;
       // 🔧 Fix Task#840：后端提供的确定性行号信息
       const totalLines = data.totalLines || 0;
       const fileLineStart = data.fileLineStart || 0;
       const fileLineEnd = data.fileLineEnd || 0;
 
+      // 🔧 Task#1725：行号翻页响应 —— 解析行内行号（新格式）、分组缓存、原子渲染目标页
+      if (isPageRange) {
+        handlePageRangeBatch(data, totalLines, fileLineStart, fileLineEnd, hasMore);
+        break;
+      }
+
       if (data.outputs && Array.isArray(data.outputs) && data.outputs.length > 0) {
-        // 解析每行并分配全局行号（fileLineNo = 文件中的实际行号）
+        // 🔧 Task#1725：统一行解析 —— 支持新格式（第3字段=行号）与旧格式（第3字段=taskId）
+        // 新格式下行内没有 taskId，全部归属当前订阅事务；行号优先用行内值（权威）
+        const lineNoInField = data.lineNoInField === true;
         const parsedOutputs = data.outputs.map((line, i) => {
           const cleanLine = line.replace(/\n$/, '').replace(/\r$/, '');
           const parts = cleanLine.split('\t');
-          const item = parts.length >= 4
-            ? { timestamp: parts[0], source: parts[1], taskId: parseInt(parts[2]) || 0, content: parts.slice(3).join('\t') }
-            : { timestamp: '', source: '', taskId: 0, content: cleanLine };
-          // 🔧 Fix Task#840：fileLineNo = 文件实际行号（后端提供）
-          item.fileLineNo = fileLineStart + i;
+          let item;
+          if (lineNoInField && parts.length >= 4) {
+            // 新格式: {ts}\t{source}\t{lineNo}\t{content}
+            const inlineLineNo = parseInt(parts[2]);
+            item = {
+              timestamp: parts[0],
+              source: parts[1],
+              taskId: state.currentTaskId || 0,
+              content: parts.slice(3).join('\t'),
+            };
+            item.fileLineNo = (inlineLineNo > 0 ? inlineLineNo : fileLineStart + i);
+          } else if (parts.length >= 4) {
+            // 旧格式: {ts}\t{source}\t{taskId}\t{content}
+            item = {
+              timestamp: parts[0],
+              source: parts[1],
+              taskId: parseInt(parts[2]) || 0,
+              content: parts.slice(3).join('\t'),
+            };
+            item.fileLineNo = fileLineStart + i;
+          } else {
+            item = { timestamp: '', source: '', taskId: state.currentTaskId || 0, content: cleanLine };
+            item.fileLineNo = fileLineStart + i;
+          }
           return item;
         });
 
@@ -187,6 +284,7 @@ function handleWebSocketMessage(data) {
               // 只有当前事务的增量数据才写入 xterm 和更新全局状态
               if (!isStaleBatch) {
               _lastOutputReceivedAt = Date.now();
+              _stallRetryCount = 0;  // 🔧 Task#1725：收到增量数据，重置停滞退避
 
               // 🔧 Fix Task#1108: 安全检查 —— 打破 userScrolledUp 死锁（同 appendOutput）
               if (state.userScrolledUp && !state._browsingHistory && state.output && isExactlyAtBottom()) {
@@ -292,12 +390,9 @@ function handleWebSocketMessage(data) {
           state.hasMoreHistory.set(taskId, hasMore);
           updatePaginationButtons();
         }
-        // 🔧 Task#1102：如果正在显示"加载中"，恢复之前的页面内容
-        if (state._loadingPrevPage) {
-          state._loadingPrevPage = false;
-          restoreCurrentPage();
-          showSimpleToast('⏹️ 没有更旧的输出了', 'info');
-        }
+        // 🔧 Task#1725：恢复当前页（不清屏式加载，屏幕内容一直保持完整）
+        restoreCurrentPage();
+        showSimpleToast('⏹️ 没有更旧的输出了', 'info');
       } else if (!isOlderHistory && data.outputs !== undefined) {
         // 首次订阅但无输出：更新 hasMoreHistory 状态
         const taskId = state.currentTaskId;
@@ -311,7 +406,13 @@ function handleWebSocketMessage(data) {
     case 'output':
       // 存储并显示进程输出
       _lastOutputReceivedAt = Date.now();  // 🔧 Task#281：更新最后收到输出时间
+      _stallRetryCount = 0;  // 🔧 Task#1725：收到实时输出，重置停滞退避
       appendOutput(data.content, data.source, data.taskId, data.messageId, data.timestamp, data.fileLineNo);
+      break;
+
+    case 'output_reset':
+      // 🔧 Task#1725：输出文件被重写（行号格式迁移）→ 清缓存重新拉取
+      handleOutputReset(data.taskId);
       break;
 
     case 'status':
@@ -357,5 +458,130 @@ function handleWebSocketMessage(data) {
     default:
       break;
   }
+}
+
+/**
+ * 🔧 Task#1725：行号翻页响应处理（isPageRange=true 的 output_batch）
+ *
+ * - 解析行内行号（新格式 {ts}\t{source}\t{lineNo}\t{content}，lineNoInField=true）
+ *   或使用物理行号 fallback（旧格式，兼容未迁移文件）
+ * - 按行 taskId 分组 unshift 到各自缓存（比旧行为"整批塞进第一行taskId缓存"正确）
+ * - 仅当响应匹配当前翻页请求（_loadingPage 存在且批次覆盖请求范围）时才渲染目标页，
+ *   过期/超时后的迟到响应只缓存不渲染（防止页面突跳）
+ * - 全程不清屏（黑屏根治）：加载中提示为非破坏性 toast
+ */
+function handlePageRangeBatch(data, totalLines, fileLineStart, fileLineEnd, hasMore) {
+  const outputs = data.outputs;
+  const lineNoInField = data.lineNoInField === true;
+  const curTaskId = state.currentTaskId;
+
+  // 请求匹配信息（请求发起时记录的目标页范围）
+  const pending = state._loadingPage;
+  state._totalLines = Math.max(state._totalLines, totalLines);
+
+  if (!outputs || !Array.isArray(outputs) || outputs.length === 0) {
+    // 空响应：请求范围超出文件（通常是请求了不存在的历史）→ 修正 totalLines 上界
+    if (pending) {
+      state._totalLines = Math.min(state._totalLines, Math.max(0, pending.start - 1));
+      state._loadingPage = null;
+    }
+    showSimpleToast('⏹️ 没有更旧的输出了', 'info');
+    updatePaginationButtons();
+    return;
+  }
+
+  // 解析行并按 taskId 分组
+  const byTask = new Map();
+  for (let i = 0; i < outputs.length; i++) {
+    const cleanLine = outputs[i].replace(/\n$/, '').replace(/\r$/, '');
+    const parts = cleanLine.split('\t');
+    let item;
+    if (lineNoInField && parts.length >= 4) {
+      // 🔧 新格式: {ts}\t{source}\t{lineNo}\t{content} —— 第3字段是行号，taskId归属订阅事务
+      const fileLineNo = parseInt(parts[2]);
+      item = {
+        timestamp: parts[0],
+        source: parts[1],
+        taskId: curTaskId || 0,
+        fileLineNo: (fileLineNo > 0 ? fileLineNo : fileLineStart + i),
+        content: parts.slice(3).join('\t'),
+      };
+    } else if (parts.length >= 4) {
+      // 旧格式: {ts}\t{source}\t{taskId}\t{content} —— 行号用后端物理行号
+      item = {
+        timestamp: parts[0],
+        source: parts[1],
+        taskId: parseInt(parts[2]) || 0,
+        fileLineNo: fileLineStart + i,
+        content: parts.slice(3).join('\t'),
+      };
+    } else {
+      item = { timestamp: '', source: '', taskId: curTaskId || 0, fileLineNo: fileLineStart + i, content: cleanLine };
+    }
+    if (!byTask.has(item.taskId)) byTask.set(item.taskId, []);
+    byTask.get(item.taskId).push(item);
+  }
+
+  // 分组缓存：批次按行号升序，unshift 到各缓存头部（翻页向更旧行进行，缓存现有行都更新）
+  // 🔧 Task#1725：按行号去重 —— 同一范围被重复请求（翻页往返/多次跳页）时不产生重复行
+  for (const [tid, items] of byTask) {
+    if (items.length > 0) {
+      const history = getOutputHistory(tid);
+      const existing = new Set();
+      for (const h of history) {
+        if (h.fileLineNo != null) existing.add(h.fileLineNo);
+      }
+      const fresh = items.filter(it => it.fileLineNo == null || !existing.has(it.fileLineNo));
+      if (fresh.length > 0) {
+        history.unshift(...fresh);
+      }
+    }
+  }
+
+  // 🔧 Task#1725 消费式渲染：page_range 防重入保证同一时刻只有一个在途请求，
+  // 响应到达即视为该请求的结果，直接渲染响应的实际范围。
+  // （旧判定 batchCoversRequest 过严：请求范围被文件头夹紧时 fileLineEnd < pending.end
+  //   会永不渲染，_loadingPage 挂到超时 → "经常加载超时"）
+  if (pending) {
+    state._loadingPage = null;
+    const renderStart = Math.min(pending.start, fileLineStart || pending.start);
+    const renderEnd = Math.max(pending.end, fileLineEnd || pending.end);
+    renderPageRange(renderStart, renderEnd);
+    var pi = getPageInfo(renderStart);
+    if (pi) showSimpleToast('📄 第' + pi.page + '/' + pi.totalPages + '页', 'info');
+  }
+  updatePaginationButtons();
+}
+
+/**
+ * 🔧 Task#1725：输出文件重写重置处理（行号格式迁移后触发）
+ * 清空该任务缓存与显示状态，重新订阅拉取首批（新格式）输出
+ */
+function handleOutputReset(taskId) {
+  if (taskId == null) return;
+  // 非当前事务：只清缓存（切换回该事务时会重新拉取）
+  if (taskId !== state.currentTaskId) {
+    state.outputHistory.delete(taskId);
+    state.hasMoreHistory.delete(taskId);
+    return;
+  }
+  // 当前事务：清缓存 + 清屏 + 重新订阅
+  state.outputHistory.delete(taskId);
+  state.hasMoreHistory.delete(taskId);
+  state.currentOldestTimestamp = null;
+  state.currentNewestTimestamp = null;
+  state._totalLines = 0;
+  state._pagingStartLine = -1;
+  state._pagingEndLine = -1;
+  state._loadingPage = null;
+  state._browsingHistory = false;
+  state.userScrolledUp = false;
+  state._xtermNewestLineNo = 0;
+  if (state.output) {
+    state.output.clear();
+    state.currentColor = '';
+  }
+  showSimpleToast('🔄 输出格式迁移完成，重新加载...', 'info');
+  subscribeOutput(0, false);
 }
 

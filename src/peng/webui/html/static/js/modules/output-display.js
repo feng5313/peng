@@ -68,28 +68,122 @@ function getNewestTimestamp() {
 }
 
 function hasNewerOutput() {
-  if (state._pagingEndLine < 0) return false;
-  if (state._pagingEndLine < state._totalLines) return true;
-  // 🔧 Fix #1064: 缓存兜底检查 —— _totalLines 可能尚未同步，检查缓存中是否有更新的行
+  const limit = state.webuiConfig.xterm.scrollback || 500;
+  if (state._pagingStartLine < 0) return false;  // 实时模式已是最新
+  // 🔧 Fix #1064 缓存兜底：_totalLines 可能尚未同步，用缓存最大行号兜底
   const currentHistory = getOutputHistory(state.currentTaskId);
-  if (currentHistory.length > 0) {
-    const maxLineNo = currentHistory[currentHistory.length - 1].fileLineNo || 0;
-    return maxLineNo > state._pagingEndLine;
-  }
-  return false;
+  const maxLineNo = currentHistory.length > 0
+    ? (currentHistory[currentHistory.length - 1].fileLineNo || 0) : 0;
+  const total = Math.max(state._totalLines, maxLineNo);
+  return state._pagingEndLine < total;
 }
 
 function hasOlderOutput() {
   const limit = state.webuiConfig.xterm.scrollback || 500;
   if (state._pagingStartLine < 0) {
-    // 实时模式：缓存数据量 > 一页行数，或服务端还有历史
-    const currentHistory = getOutputHistory(state.currentTaskId);
-    const cacheLen = currentHistory ? currentHistory.length : 0;
-    return cacheLen > limit
-      || state._totalLines > limit
+    // 实时模式：总行数超过一页 或 服务端还有更早历史
+    return state._totalLines > limit
       || state.hasMoreHistory.get(state.currentTaskId) === true;
   }
   return state._pagingStartLine > 1;
+}
+
+// ==================== 🔧 Task#1725：O(1) 行号翻页核心 ====================
+
+/**
+ * 缓存是否完整覆盖行号范围 [startLine, endLine]（含两端）
+ */
+function cacheHasFullRange(startLine, endLine) {
+  const history = getOutputHistory(state.currentTaskId);
+  const need = endLine - startLine + 1;
+  let found = 0;
+  for (const item of history) {
+    const ln = item.fileLineNo;
+    if (ln >= startLine && ln <= endLine) {
+      found++;
+      if (found >= need) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 原子渲染行号范围 [startLine, endLine]（唯一写屏入口）
+ *
+ * - clear+write 一体完成，消除"清屏后等待"黑屏窗口
+ * - 行数据从缓存按 fileLineNo 精确匹配；passFilters 渲染期过滤
+ * - 更新 _pagingStartLine/_pagingEndLine/_xtermNewestLineNo
+ */
+function renderPageRange(startLine, endLine) {
+  if (!state.output) return;
+  const history = getOutputHistory(state.currentTaskId);
+  const byLine = new Map();
+  for (const item of history) {
+    const ln = item.fileLineNo;
+    if (ln >= startLine && ln <= endLine) byLine.set(ln, item);
+  }
+
+  // 抑制渲染期间的 onScroll 误判（原子窗口）
+  state._pagingRecoveryUntil = Date.now() + 800;
+  state.output.clear();
+  state.currentColor = '';
+
+  const chunks = [];
+  for (let ln = startLine; ln <= endLine; ln++) {
+    const item = byLine.get(ln);
+    if (item && passFilters(item.source)) {
+      chunks.push(formatLineNoPrefix(item.fileLineNo) + convertFilePathsToLinks(item.content) + '\r\n');
+    }
+  }
+  if (chunks.length > 0) {
+    writeAndScroll(chunks.join(''), () => {
+      if (state.output) state.output.scrollToBottom();
+    });
+  } else {
+    setTimeout(() => { if (state.output) state.output.scrollToBottom(); }, 0);
+  }
+
+  // 状态推进
+  state._pagingStartLine = startLine;
+  state._pagingEndLine = endLine;
+  state._xtermNewestLineNo = Math.max(state._xtermNewestLineNo || 0, endLine);
+  // 时间戳指针同步到页面最新行（保证 appendOutput 的去重判断正确）
+  let newestItem = null;
+  for (let ln = endLine; ln >= startLine; ln--) {
+    const it = byLine.get(ln);
+    if (it) { newestItem = it; break; }
+  }
+  if (newestItem && newestItem.timestamp) {
+    state.currentNewestTimestamp = newestItem.timestamp;
+  }
+  let oldestItem = null;
+  for (let ln = startLine; ln <= endLine; ln++) {
+    const it = byLine.get(ln);
+    if (it) { oldestItem = it; break; }
+  }
+  if (oldestItem && oldestItem.timestamp) {
+    state.currentOldestTimestamp = oldestItem.timestamp;
+  }
+  updatePaginationButtons();
+}
+
+/**
+ * 向后端请求行号范围页（O(1) seek直读）—— 非破坏性：不清屏，仅 toast 提示
+ * 响应由 websocket.js 的 handlePageRangeBatch 缓存并触发 renderPageRange
+ */
+function fetchPage(startLine, endLine) {
+  if (state._loadingPage) return;  // 已有翻页请求进行中
+  state._loadingPage = { start: startLine, end: endLine };
+  // 🔧 Task#1725：按风主要求去除"加载第x-y行"toast（渲染本身就是反馈，toast纯属打扰）
+  subscribeOutput(0, false, null, null, startLine, endLine);
+  // 🔧 超时兜底：后端无响应时解锁（屏幕保持当前页，绝不黑屏）
+  const token = state._loadingPage;
+  setTimeout(() => {
+    if (state._loadingPage === token) {
+      state._loadingPage = null;
+      showSimpleToast('❌ 加载超时，请重试', 'error');
+    }
+  }, 5000);
 }
 
 // ==================== 输出头部功能链接 ====================
@@ -214,296 +308,101 @@ function getPageInfo(startLine) {
   return { page: Math.max(1, page), totalPages };
 }
 /**
- * 🔧 Task#1102：在 xterm 中显示"加载中"占位
- * 清空当前内容，在终端居中位置显示加载提示
- */
-function showLoadingInXterm() {
-  if (!state.output) return;
-  state._pagingRecoveryUntil = Date.now() + 10000;  // 抑制 onScroll，防止误触发
-  state.output.clear();
-  state.currentColor = '';
-  const rows = state.output.rows || 24;
-  const padTop = Math.max(0, Math.floor((rows - 1) / 2));
-  state.output.write('\r\n'.repeat(padTop) + '\x1b[33m  ⏳ 加载中...\x1b[0m\r\n');
-}
-
-/**
- * 🔧 Task#1102：恢复之前显示的页面内容（后端返回空数据时调用）
- * 根据当前 paging 状态从缓存重新渲染
- */
-function restoreCurrentPage() {
-  if (!state.output) return;
-  const currentHistory = getOutputHistory(state.currentTaskId);
-  if (currentHistory.length === 0) return;
-
-  if (state._pagingStartLine > 0 && state._pagingEndLine > 0) {
-    // 翻页模式：重新渲染当前页
-    const outputsToShow = currentHistory.filter(item =>
-      item.fileLineNo >= state._pagingStartLine && item.fileLineNo <= state._pagingEndLine
-    );
-    if (outputsToShow.length === 0) {
-      // 缓存无数据，回到底部
-      scrollToNewest();
-      return;
-    }
-    state._pagingRecoveryUntil = Date.now() + 500;
-    state.output.clear();
-    state.currentColor = '';
-    const chunks = [];
-    for (const item of outputsToShow) {
-      if (passFilters(item.source)) {
-        chunks.push(formatLineNoPrefix(item.fileLineNo) + convertFilePathsToLinks(item.content) + '\r\n');
-      }
-    }
-    // 🔧 Fix Task#1111: 使用 writeAndScroll 替代坏掉的 write callback
-    if (chunks.length > 0) {
-      writeAndScroll(chunks.join(''), () => {
-        if (state.output) state.output.scrollToBottom();
-      });
-    } else {
-      setTimeout(() => { if (state.output) state.output.scrollToBottom(); }, 0);
-    }
-  } else {
-    // 实时模式：回到底部
-    scrollToNewest();
-  }
-}
-
-/**
- * 加载上一页（更旧的输出）- 先操作缓存，缓存耗尽时向后端请求
+ * 🔧 Task#1725：加载上一页（更旧的输出）
+ *
+ * 行号语义：当前页 [s,e] → 上一页 = [max(1, s-limit), s-1]；实时模式先取窗口 [total-limit+1, total]。
+ * 缓存完整命中 → renderPageRange 直接渲染（0ms）；否则 fetchPage 走后端 O(1) seek。
+ * 全程不清屏（消灭黑屏），加载中为非破坏性 toast。
  */
 async function loadPrevPage() {
+  if (!state.output || state._loadingPage) return;
   const currentHistory = getOutputHistory(state.currentTaskId);
-  if (!state.output || currentHistory.length === 0) return;
+  if (currentHistory.length === 0 && state._totalLines <= 0) return;
+
+  const limit = state.webuiConfig.xterm.scrollback || 500;
+  let startLine, endLine;
+
+  if (state._pagingStartLine < 0) {
+    // 实时模式 → 首次翻页：上一页是 [total-2*limit+1, total-limit]
+    const maxLineNo = currentHistory.length > 0
+      ? (currentHistory[currentHistory.length - 1].fileLineNo || 0) : 0;
+    const total = Math.max(state._totalLines, maxLineNo);
+    if (total <= limit) {
+      showSimpleToast('⏹️ 没有更旧的输出了', 'info');
+      return;
+    }
+    endLine = total - limit;
+    startLine = Math.max(1, endLine - limit + 1);
+  } else {
+    if (state._pagingStartLine <= 1) {
+      showSimpleToast('⏹️ 没有更旧的输出了', 'info');
+      return;
+    }
+    endLine = state._pagingStartLine - 1;
+    startLine = Math.max(1, endLine - limit + 1);
+  }
 
   state._browsingHistory = true;
-  const limit = state.webuiConfig.xterm.scrollback || 500;
+  state.userScrolledUp = true;
 
-  // 🔧 Fix Task#840：基于全局行号定位
-  let curStartLine = state._pagingStartLine;
-  if (curStartLine < 0) {
-    // 首次翻页：用 _totalLines，fallback 到缓存最大 fileLineNo
-    const total = state._totalLines || 0;
-    if (total > 0) {
-      curStartLine = Math.max(1, total - limit + 1);
-    } else {
-      // _totalLines 未设置（增量切换），用缓存实际数据
-      const maxLn = currentHistory.reduce(function(m, i){ return Math.max(m, i.fileLineNo || 0); }, 0);
-      curStartLine = Math.max(1, maxLn - limit + 1);
-    }
-  }
-
-  if (curStartLine <= 1) {
-    showSimpleToast('⏹️ 没有更旧的输出了', 'info');
-    state._browsingHistory = false;
-    return;
-  }
-
-  // 在缓存中查找行号 < curStartLine 的项
-  const olderItems = currentHistory.filter(item => item.fileLineNo && item.fileLineNo < curStartLine);
-
-  if (olderItems.length > 0) {
-    // 取最近的 limit 条
-    const startIdx = Math.max(0, olderItems.length - limit);
-    const outputsToShow = olderItems.slice(startIdx);
-    const newStartLine = outputsToShow[0].fileLineNo;
-    const newEndLine = outputsToShow[outputsToShow.length - 1].fileLineNo;
-
-    // 🔧 Fix Task#840：检查行号连续性
-    // 期望行数 = newEndLine - newStartLine + 1，如果实际行数远小于期望值说明有空洞
-    const expectedCount = newEndLine - newStartLine + 1;
-    if (outputsToShow.length < expectedCount * 0.5) {
-      // 行号严重不连续，从后端请求补全
-      const beforeTimestamp = outputsToShow[0].timestamp;
-      if (beforeTimestamp) {
-        // 🔧 Task#1102：显示加载中占位，收到后端数据后由 renderOlderHistory 替换
-        showLoadingInXterm();
-        state._loadingPrevPage = true;
-        await subscribeOutput(0, false, beforeTimestamp);
-        return;
-      }
-    }
-
-    // 🔧 Fix #1064: 在 clear+write 前设置 _pagingRecoveryUntil，防止 onScroll 误设 userScrolledUp
-    state._pagingRecoveryUntil = Date.now() + 500;
-    state.output.clear(); state.currentColor = '';
-
-    // 只有到达最早输出（newStartLine===1）时才填充空行
-    const padCount = (newStartLine === 1) ? Math.max(0, limit - outputsToShow.length) : 0;
-    const chunks = [];
-    if (padCount > 0) chunks.push('\r\n'.repeat(padCount));
-    for (const item of outputsToShow) {
-      if (passFilters(item.source)) {
-        chunks.push(formatLineNoPrefix(item.fileLineNo) + convertFilePathsToLinks(item.content) + '\r\n');
-      }
-    }
-    // 🔧 Fix Task#1111: 使用 writeAndScroll 替代坏掉的 write callback
-    if (chunks.length > 0) {
-      writeAndScroll(chunks.join(''), () => {
-        if (state.output) state.output.scrollToBottom();
-      });
-    } else {
-      // 无内容可写时直接滚动
-      setTimeout(() => { if (state.output) state.output.scrollToBottom(); }, 0);
-    }
-
-    state._pagingStartLine = newStartLine;
-    state._pagingEndLine = newEndLine;
-    state.currentOldestTimestamp = outputsToShow[0].timestamp;
-    state._pagingPageNewestTs = outputsToShow[outputsToShow.length - 1].timestamp;
-
-    var pi = getPageInfo(newStartLine);
+  if (cacheHasFullRange(startLine, endLine)) {
+    // 缓存完整命中 → 直接渲染（无网络请求，无闪烁）
+    renderPageRange(startLine, endLine);
+    var pi = getPageInfo(startLine);
     showSimpleToast(pi ? ('↑️ 第' + pi.page + '/' + pi.totalPages + '页') : '↑️ 上一页', 'info');
-
-    updatePaginationButtons();
-    return;
+  } else {
+    // 缓存不足 → 后端 O(1) 行号翻页（响应后自动渲染）
+    fetchPage(startLine, endLine);
   }
-
-  // 缓存中没有更老的行，向后端请求
-  if (curStartLine <= 1) {
-    showSimpleToast('⏹️ 没有更旧的输出了', 'info');
-    state._browsingHistory = false;
-    return;
-  }
-
-  const beforeTimestamp = currentHistory.length > 0
-    ? currentHistory[0].timestamp
-    : state.currentOldestTimestamp;
-
-  if (!beforeTimestamp) {
-    showSimpleToast('⏹️ 没有更旧的输出了', 'info');
-    state._browsingHistory = false;
-    return;
-  }
-
-  // 🔧 Task#1102：缓存无更老数据，显示加载中占位，收到后端数据后由 renderOlderHistory 替换
-  showLoadingInXterm();
-  state._loadingPrevPage = true;
-  await subscribeOutput(0, false, beforeTimestamp);
 }
 
 
 /**
- * 加载下一页（更新的输出）
+ * 🔧 Task#1725：加载下一页（更新的输出）
+ *
+ * 行号语义：当前页 [s,e] → 下一页 = [e+1, min(total, e+limit)]。
+ * 已在最后一页 → 回到实时模式。缓存命中直渲，否则后端 O(1)。
  */
 async function loadNextPage() {
+  if (!state.output || state._loadingPage) return;
   const currentHistory = getOutputHistory(state.currentTaskId);
-  if (!state.output || currentHistory.length === 0) {
-    state._browsingHistory = false;
-    state.userScrolledUp = false;
-    return;
-  }
 
-  // 🔧 Fix Task#840：未翻页模式直接回到实时（不翻页）
-  if (state._pagingEndLine < 0) {
+  // 未翻页模式 → 直接回实时
+  if (state._pagingStartLine < 0) {
     state._browsingHistory = false;
     state.userScrolledUp = false;
-    state._pagingRecoveryUntil = Date.now() + 500;
     scrollToNewest();
     return;
   }
 
-  // 如果不在底部，先滚到底部
-  if (!isAtBottom()) {
-    setTimeout(() => {
-      if (state.output) state.output.scrollToBottom();
-    }, 50);
-    return;
-  }
-
-  state._browsingHistory = true;
   const limit = state.webuiConfig.xterm.scrollback || 500;
+  const maxLineNo = currentHistory.length > 0
+    ? (currentHistory[currentHistory.length - 1].fileLineNo || 0) : 0;
+  const total = Math.max(state._totalLines, maxLineNo);
+  const startLine = state._pagingEndLine + 1;
 
-  const newItems = currentHistory.filter(item => item.fileLineNo > state._pagingEndLine);
-
-  if (newItems.length === 0) {
-    // 缓存中没有更新的，回到实时模式
-    state._browsingHistory = false;
-    state.userScrolledUp = false;
-    state._pagingRecoveryUntil = Date.now() + 500;
+  if (startLine > total) {
+    // 已是最后一页 → 回实时模式
     scrollToNewest();
     return;
   }
 
-  const outputsToShow = newItems.slice(0, limit);
-  const newStartLine = outputsToShow[0].fileLineNo;
-  const newEndLine = outputsToShow[outputsToShow.length - 1].fileLineNo;
-  // 🔧 Fix #1064: 用 _totalLines 判断最后一页，并用缓存兜底
-  // _totalLines 可能因 appendOutput 未及时同步而偏小，需检查缓存中是否还有更新的行
-  const total = state._totalLines || 0;
-  const hasEvenNewer = newItems.length > limit;  // newItems 中还有未展示的
-  const isLastPage = newEndLine >= total && !hasEvenNewer;
+  const endLine = Math.min(total, startLine + limit - 1);
+  state._browsingHistory = true;
+  state.userScrolledUp = true;
 
-  // 被全部过滤，跳过
-  const hasVisible = outputsToShow.some(item => passFilters(item.source));
-  if (!hasVisible) {
-    state._pagingStartLine = newStartLine;
-    state._pagingEndLine = newEndLine;
-    state.currentOldestTimestamp = outputsToShow[0].timestamp;
-    state._pagingPageNewestTs = outputsToShow[outputsToShow.length - 1].timestamp;
-    if (isLastPage) {
-      state._browsingHistory = false;
-      state.userScrolledUp = false;
-      state._pagingRecoveryUntil = Date.now() + 500;
-      scrollToNewest();
-    }
-    updatePaginationButtons();
-    return;
-  }
-
-  // 🔧 Fix #1064: 在 clear+write 前设置 _pagingRecoveryUntil，防止 onScroll 误设 userScrolledUp
-  state._pagingRecoveryUntil = Date.now() + 500;
-  state.output.clear(); state.currentColor = '';
-
-  const chunks = [];
-  for (const item of outputsToShow) {
-    if (passFilters(item.source)) {
-      chunks.push(formatLineNoPrefix(item.fileLineNo) + convertFilePathsToLinks(item.content) + '\r\n');
-    }
-  }
-  // 🔧 Fix Task#1111: 使用 writeAndScroll 替代坏掉的 write callback
-  if (chunks.length > 0) {
-    writeAndScroll(chunks.join(''), () => {
-      if (state.output) state.output.scrollToTop();
-    });
+  if (cacheHasFullRange(startLine, endLine)) {
+    renderPageRange(startLine, endLine);
+    var pi = getPageInfo(startLine);
+    showSimpleToast(pi ? ('↓️ 第' + pi.page + '/' + pi.totalPages + '页') : '↓️ 下一页', 'info');
   } else {
-    setTimeout(() => { if (state.output) state.output.scrollToTop(); }, 0);
+    fetchPage(startLine, endLine);
   }
-
-  state._pagingStartLine = newStartLine;
-  state._pagingEndLine = newEndLine;
-  state.currentOldestTimestamp = outputsToShow[0].timestamp;
-  state._pagingPageNewestTs = outputsToShow[outputsToShow.length - 1].timestamp;
-
-  var pi = getPageInfo(newStartLine);
-  if (isLastPage) {
-    // 到最后一页 → 回到实时模式，确保 append_output 正常显示
-    // 🔧 Fix #1064: 必须重置 _browsingHistory，否则 appendOutput 的 shouldSkipWrite
-    // 永远为 true（_browsingHistory || userScrolledUp），导致翻到最后一页后
-    // 不再显示任何新输出，用户被困在浏览模式中无法回到实时模式
-    state._browsingHistory = false;
-    state.userScrolledUp = false;
-    showSimpleToast('⏹️ 已回到底部', 'info');
-    state._pagingRecoveryUntil = Date.now() + 500;
-    scrollToNewest();
-    return;
-  }
-  showSimpleToast(pi ? ('↓️ 第' + pi.page + '/' + pi.totalPages + '页') : '↓️ 下一页', 'info');
-
-  state._pagingRecoveryUntil = Date.now() + 500;
-  updatePaginationButtons();
 }
 
 /**
  * 🔧 Fix Task#1433：从缓存全量渲染到 xterm（切换事务时立即调用）
- *
- * 根因修复：selectTask 清空 xterm 后延迟调用 scrollToNewest()，但在延迟窗口内
- * _watch_loop 的实时输出通过 appendOutput 写入了几行并设置了 currentNewestTimestamp，
- * 导致 scrollToNewest 误认为"已在最新位置"跳过缓存渲染，只显示那几行实时输出。
- *
- * 本函数在清空 xterm 后立即同步执行缓存渲染，不依赖延迟回调，彻底消除竞态窗口。
- *
- * @param {number} taskId - 要渲染的事务ID
+ * 🔧 Task#1725：内部统一走 renderPageRange（渲染最后一页）
  */
 function renderFromCache(taskId) {
   if (!state.output) return;
@@ -512,221 +411,131 @@ function renderFromCache(taskId) {
 
   const limit = state.webuiConfig.xterm.scrollback || 500;
 
-  // 取最新的 limit 条
-  const startIdx = Math.max(0, currentHistory.length - limit);
-  const outputsToShow = currentHistory.slice(startIdx);
-
-  // 抑制 onScroll，防止 clear+write 过程中 userScrolledUp 被误设为 true
-  state._pagingRecoveryUntil = Date.now() + 500;
-  state.output.clear(); state.currentColor = '';
-
-  // 批量合并为单个字符串再 write，减少渲染帧数
-  const chunks = [];
-  for (const item of outputsToShow) {
-    if (passFilters(item.source)) {
-      chunks.push(formatLineNoPrefix(item.fileLineNo) + convertFilePathsToLinks(item.content) + '\r\n');
-    }
-  }
-  if (chunks.length > 0) {
-    writeAndScroll(chunks.join(''), () => {
-      if (state.output) state.output.scrollToBottom();
-    });
-  } else {
-    setTimeout(() => { if (state.output) state.output.scrollToBottom(); }, 0);
-  }
-
-  // 设置时间戳指针（关键：防止后续 scrollToNewest 误判"已在最新位置"）
-  state.currentOldestTimestamp = outputsToShow[0].timestamp;
-  state.currentNewestTimestamp = outputsToShow[outputsToShow.length - 1].timestamp;
-
-  // 🔧 Fix Task#1433：从缓存恢复 _totalLines（取缓存中最大的 fileLineNo）
-  // 否则 _totalLines 为 0 导致翻页功能异常（getPageInfo 计算 0 页，hasOlderOutput/hasNewerOutput 判断错误）
+  // 取最新的 limit 条的行号范围
   const maxLineNo = currentHistory.reduce(function(m, i) { return Math.max(m, i.fileLineNo || 0); }, 0);
+  const endLine = Math.max(maxLineNo, currentHistory.length);
+  const startLine = Math.max(1, endLine - limit + 1);
+
+  renderPageRange(startLine, endLine);
+
+  // 🔧 首屏渲染后恢复实时模式（renderPageRange 会设置页范围，实时语义必须为 -1）
+  state._pagingStartLine = -1;
+  state._pagingEndLine = -1;
+  state._browsingHistory = false;
+  state.userScrolledUp = false;
+
+  // 从缓存恢复 _totalLines
   if (maxLineNo > state._totalLines) {
     state._totalLines = maxLineNo;
   }
-
-  // 重置翻页和滚动状态
-  state._pagingStartLine = -1;
-  state._pagingEndLine = -1;
-  state._pagingAnchorNewestTs = null;
-  state._pagingPageNewestTs = null;
-  state.userScrolledUp = false;
-  state._browsingHistory = false;
-  state._userScrollIntentUntil = 0;
 }
 
 /**
- * 回到底部 - 加载缓存中最新的内容
+ * 🔧 Task#1725：回到底部 —— 恢复实时模式
+ *
+ * 快速路径：未翻页且 xterm 已含最新行 → 仅 scrollToBottom（无闪屏，高频实时输出安全）
+ * 否则：全量渲染最后一页（缓存命中直渲 / 后端 O(1) 请求），彻底消灭"时间戳指针脱节导致的内容缺失"
  */
 function scrollToNewest() {
-  // 🔧 Task#1102：清除加载标志（回到实时模式无需加载占位）
-  state._loadingPrevPage = false;
-  const currentHistory = getOutputHistory(state.currentTaskId);
-  if (!state.output || currentHistory.length === 0) return;
+  // 清除翻页加载占位与浏览状态
+  state._loadingPage = null;
+  state._browsingHistory = false;
+  state.userScrolledUp = false;
 
-  // 🔧 清除输出搜索状态（回到底部时搜索不再有效）
+  // 清除输出搜索状态（回到底部时搜索不再有效）
   if (typeof _clearSearch === 'function') _clearSearch();
 
-  // 🔧 Task#816修复：scrollToNewest 是用户/系统主动"回到底部"的操作，
-  // 不应被 _browsingHistory 阻止。_browsingHistory 只用于阻止 appendOutput 的自动滚动。
-  // 如果需要保护，由调用方在调用前重置 _browsingHistory。
-  // 🔧 Fix #1064: 安全退出浏览模式，防止遗漏导致 appendOutput 永久跳过写入
-  state._browsingHistory = false;
+  if (!state.output) return;
+  const currentHistory = getOutputHistory(state.currentTaskId);
+  const limit = state.webuiConfig.xterm.scrollback || 500;
+  const maxLineNo = currentHistory.length > 0
+    ? (currentHistory[currentHistory.length - 1].fileLineNo || 0) : 0;
+  const total = Math.max(state._totalLines, maxLineNo);
 
-  // 🔧 检查是否已经在显示最新内容
-  const latestTimestamp = currentHistory[currentHistory.length - 1].timestamp;
-  if (state.currentNewestTimestamp !== latestTimestamp) {
-    // 🔧 Fix Task#1404：实时模式下增量追加缺失输出，避免 clear()+write() 导致 viewport 弹到顶部
-    // 原方案：clear() + write(全部历史) → clear() 将 ydisp 重置为 0（顶部），用户看到弹到顶部
-    // 新方案：找到 currentNewestTimestamp 之后的增量输出，直接追加到 xterm buffer 末尾，
-    //         viewport 保持稳定，scrollToBottom() 后直接显示最新内容
-    const isRealtimeMode = state._pagingStartLine < 0;
-
-    // 找到 currentNewestTimestamp 在缓存中的位置
-    let newestIdx = -1;
-    if (state.currentNewestTimestamp !== null) {
-      for (let i = currentHistory.length - 1; i >= 0; i--) {
-        if (currentHistory[i].timestamp === state.currentNewestTimestamp) {
-          newestIdx = i;
-          break;
-        }
-        // timestamp 单调递增，找到第一个 <= currentNewestTimestamp 的即可
-        if (currentHistory[i].timestamp < state.currentNewestTimestamp) {
-          newestIdx = i;  // 取前一条（可能 timestamp 不完全匹配但内容已在 xterm 中）
-          break;
-        }
-      }
-    }
-
-    if (isRealtimeMode && newestIdx >= 0) {
-      // 实时模式 + 已有显示基准：增量追加缺失输出
-      const newOutputs = currentHistory.slice(newestIdx + 1);
-      if (newOutputs.length > 0) {
-        const chunks = [];
-        for (const item of newOutputs) {
-          if (passFilters(item.source)) {
-            chunks.push(formatLineNoPrefix(item.fileLineNo) + convertFilePathsToLinks(item.content) + '\r\n');
-          }
-        }
-        if (chunks.length > 0 && state.output) {
-          writeAndScroll(chunks.join(''), () => {
-            if (state.output) state.output.scrollToBottom();
-          });
-        } else if (state.output) {
-          setTimeout(() => { state.output.scrollToBottom(); }, 0);
-        }
-      } else if (state.output) {
-        // 没有增量输出，只需滚动到底部
-        setTimeout(() => { state.output.scrollToBottom(); }, 0);
-      }
-      // 更新时间戳指针
-      state.currentNewestTimestamp = latestTimestamp;
-      if (state.currentOldestTimestamp === null) {
-        state.currentOldestTimestamp = currentHistory[0].timestamp;
-      }
-    } else {
-      // 翻页模式或无基准：全量 clear+write（原有逻辑）
-      const limit = state.webuiConfig.xterm.scrollback || 500;
-
-      // 取最新的 limit 条
-      const startIdx = Math.max(0, currentHistory.length - limit);
-      const outputsToShow = currentHistory.slice(startIdx);
-
-      // 🔧 Fix #1064: 抑制 onScroll，防止 clear+write 过程中 userScrolledUp 被误设为 true
-      state._pagingRecoveryUntil = Date.now() + 500;
-      state.output.clear(); state.currentColor = '';
-
-      // 🔧 优化(task#113)：批量合并为单个字符串再 write，减少渲染帧数
-      const chunks = [];
-      for (const item of outputsToShow) {
-        if (passFilters(item.source)) {
-          chunks.push(formatLineNoPrefix(item.fileLineNo) + convertFilePathsToLinks(item.content) + '\r\n');
-        }
-      }
-      // 🔧 Fix Task#1111: 使用 writeAndScroll 替代坏掉的 write callback
-      if (chunks.length > 0) {
-        writeAndScroll(chunks.join(''), () => {
-          if (state.output) state.output.scrollToBottom();
-        });
-      } else {
-        setTimeout(() => { if (state.output) state.output.scrollToBottom(); }, 0);
-      }
-
-      // 记录时间戳指针
-      state.currentOldestTimestamp = outputsToShow[0].timestamp;
-      state.currentNewestTimestamp = outputsToShow[outputsToShow.length - 1].timestamp;
-    }
-  } else {
-    // 已在最新位置，只需滚动到底部
+  // 快速路径：实时模式且 xterm 已含全部最新行 → 只滚动到底部
+  if (state._pagingStartLine < 0 && (state._xtermNewestLineNo || 0) >= maxLineNo) {
     setTimeout(() => { if (state.output) state.output.scrollToBottom(); }, 0);
+    state._pagingStartLine = -1;
+    state._pagingEndLine = -1;
+    updatePaginationButtons();
+    return;
   }
-  // 🔧 Task #92：重置用户滚动状态（已显示最新内容）
-  state.userScrolledUp = false;
-  // 🔧 Fix Task#840：清除翻页状态，恢复正常实时模式
-  state._pagingStartLine = -1;
-  state._pagingEndLine = -1;
-  state._pagingAnchorNewestTs = null;
-  state._pagingPageNewestTs = null;
-  updatePaginationButtons();
 
+  // 全量渲染最后一页
+  if (total <= 0) {
+    state._pagingStartLine = -1;
+    state._pagingEndLine = -1;
+    return;
+  }
+  const endLine = total;
+  const startLine = Math.max(1, endLine - limit + 1);
+  if (cacheHasFullRange(startLine, endLine)) {
+    renderPageRange(startLine, endLine);
+    // 渲染后恢复实时模式
+    state._pagingStartLine = -1;
+    state._pagingEndLine = -1;
+    state._browsingHistory = false;
+    state.userScrolledUp = false;
+    updatePaginationButtons();
+  } else {
+    // 后端请求（响应后 handlePageRangeBatch 渲染），渲染完成后恢复实时
+    state._browsingHistory = true;  // 请求期间保持浏览态，防止渲染前被实时输出干扰
+    fetchPage(startLine, endLine);
+    // 渲染后恢复实时：由 renderPageRange 完成后的统一出口处理
+    const watch = setInterval(() => {
+      if (!state._loadingPage && state._pagingEndLine >= endLine) {
+        clearInterval(watch);
+        state._pagingStartLine = -1;
+        state._pagingEndLine = -1;
+        state._browsingHistory = false;
+        state.userScrolledUp = false;
+        updatePaginationButtons();
+      } else if (!state._loadingPage) {
+        clearInterval(watch);  // 超时/空响应
+      }
+    }, 100);
+    setTimeout(() => clearInterval(watch), 8000);
+  }
 }
 
 /**
- * 渲染"上一页"加载的更老历史
- * 当后端返回老历史数据后，重新渲染 xterm 显示完整页面
+ * 渲染"上一页"加载的更老历史（旧 beforeTimestamp 协议兼容入口）
+ * 🔧 Task#1725：内部统一走 renderPageRange（按行号渲染，不再手工拼 chunks）
  */
 function renderOlderHistory(taskId, newOutputs) {
-  // 🔧 Task#1102：清除加载标志（后端数据已到达）
-  state._loadingPrevPage = false;
+  if (!state.output) return;
+  if (!newOutputs || newOutputs.length === 0) {
+    restoreCurrentPage();
+    return;
+  }
   const currentHistory = getOutputHistory(taskId);
-  if (!state.output || currentHistory.length === 0) return;
+  if (currentHistory.length === 0) return;
 
   const limit = state.webuiConfig.xterm.scrollback || 500;
 
-  // 🔧 Fix Task#840：老历史已带 fileLineNo，直接定位显示范围
-  // 取 newOutputs 的第一个 fileLineNo 作为显示页的起始
-  const newStartLine = newOutputs[0]?.fileLineNo;
-  if (!newStartLine) return;
+  // 取 newOutputs 的行号范围
+  const lineNos = newOutputs.map(o => o.fileLineNo || 0).filter(ln => ln > 0);
+  if (lineNos.length === 0) return;
+  const newStartLine = Math.min(...lineNos);
+  const newEndLine = Math.max(...lineNos);
 
-  // 从缓存中取行号 >= newStartLine 且 < newStartLine + limit 的项
-  const outputsToShow = currentHistory.filter(item =>
-    item.fileLineNo >= newStartLine && item.fileLineNo < newStartLine + limit
-  );
+  renderPageRange(newStartLine, newEndLine);
 
-  if (outputsToShow.length === 0) return;
-
-  // 🔧 Fix #1064: 在 clear+write 前设置 _pagingRecoveryUntil，防止 onScroll 误设 userScrolledUp
-  state._pagingRecoveryUntil = Date.now() + 500;
-  state.output.clear(); state.currentColor = '';
-
-  // 到达最早输出时填充空行
-  const padCount = (newStartLine === 1) ? Math.max(0, limit - outputsToShow.length) : 0;
-  const chunks = [];
-  if (padCount > 0) chunks.push('\r\n'.repeat(padCount));
-  for (const item of outputsToShow) {
-    if (passFilters(item.source)) {
-      chunks.push(formatLineNoPrefix(item.fileLineNo) + convertFilePathsToLinks(item.content) + '\r\n');
-    }
-  }
-  // 🔧 Fix Task#1111: 使用 writeAndScroll 替代坏掉的 write callback
-  if (chunks.length > 0) {
-    writeAndScroll(chunks.join(''), () => {
-      if (state.output) state.output.scrollToBottom();
-    });
-  } else {
-    setTimeout(() => { if (state.output) state.output.scrollToBottom(); }, 0);
-  }
-
-  state._pagingStartLine = outputsToShow[0].fileLineNo;
-  state._pagingEndLine = outputsToShow[outputsToShow.length - 1].fileLineNo;
-  state.currentOldestTimestamp = outputsToShow[0].timestamp;
-  state._pagingPageNewestTs = outputsToShow[outputsToShow.length - 1].timestamp;
-
-  var pi = getPageInfo(state._pagingStartLine);
+  var pi = getPageInfo(newStartLine);
   showSimpleToast(pi ? ('↑️ 第' + pi.page + '/' + pi.totalPages + '页') : '↑️ 上一页', 'info');
-
   updatePaginationButtons();
+}
+
+/**
+ * 🔧 Task#1725：恢复当前页（后端返回空数据/失败时调用）
+ */
+function restoreCurrentPage() {
+  if (!state.output) return;
+  if (state._pagingStartLine > 0 && state._pagingEndLine > 0) {
+    renderPageRange(state._pagingStartLine, state._pagingEndLine);
+  } else {
+    scrollToNewest();
+  }
 }
 
 /**
@@ -787,6 +596,8 @@ async function clearOutput(task_id = 0, deleteFile = false, extraTaskIds = null)
     state._pagingStartLine = -1;
     state._pagingEndLine = -1;
     state._totalLines = 0;
+    state._loadingPage = null;  // 🔧 Task#1725：取消进行中的行号翻页请求
+    state._xtermNewestLineNo = 0;  // 🔧 Task#1725：重置 xterm 内容行号
 
     // 清空额外事务的缓存（子事务等）
     if (extraTaskIds && Array.isArray(extraTaskIds)) {

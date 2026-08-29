@@ -1973,6 +1973,11 @@ class ToolExecutionEngine:
 
             my_task_id = self._task_id
 
+            # 事务总管(#2)不参与冲突检测：总管只监控调度、不修改文件，
+            # 与其他事务共享 nest+workdir 是正常设计，冲突警告对其纯属噪音
+            if my_task_id == 2:
+                return
+
             # 获取所有运行中事务
             running_tasks = self.task_manager.db.get_running_tasks()
 
@@ -1983,6 +1988,9 @@ class ToolExecutionEngine:
                     continue
                 # 排除子事务：子事务的文件操作受父事务调度，不单独参与冲突检测
                 if t.get("parent_task_id"):
+                    continue
+                # 排除事务总管#2：总管只监控调度、不修改文件，永不构成实际冲突
+                if t.get("id") == 2:
                     continue
                 t_nest = (t.get("nest") or "").strip()
                 t_workdir = (t.get("workdir") or "").strip()
@@ -4469,12 +4477,13 @@ class ToolExecutionEngine:
     }
 
     # 这些工具的参数太冗长，工具调用结果记录时只显示工具类型+文件路径
+    # （line_edit 的结果 display 已含文件路径+diff，头部不再重复参数）
     _TOOL_RESULT_NO_ARGS: frozenset[str] = frozenset(
-        {"write", "edit", "checklist", "report", "message"}
+        {"write", "edit", "line_edit", "checklist", "report", "message"}
     )
 
     # 上述工具中包含文件路径参数的工具
-    _TOOL_RESULT_HAS_PATH: frozenset[str] = frozenset({"write", "edit"})
+    _TOOL_RESULT_HAS_PATH: frozenset[str] = frozenset({"write", "edit", "line_edit"})
 
     def _format_tool_call_info(self, tool_name: str, arguments: dict) -> str:
         """格式化工具调用信息（始终显示完整参数）

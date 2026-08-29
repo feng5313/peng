@@ -72,8 +72,11 @@ function appendOutput(content, source = 'output', taskId = null, messageId = nul
   }
 
   // 🔧 修复Task#219：重构 shouldAppend 判断逻辑
-  // 用明确的用户意图（翻页/滚动）来判断是否跳过写入
-  const shouldSkipWrite = state._browsingHistory || state.userScrolledUp;
+  // 🔧 Task#1725：在底部时永远写入（消灭"底部不更新"）——
+  // userScrolledUp 只应在用户真正上移视口时阻止写入；isExactlyAtBottom 说明视口就在底部，
+  // 即使存在残留的 userScrolledUp（时间窗口竞态），也必须写入，否则底部卡死不更新。
+  const atExactBottom = state.output && isExactlyAtBottom();
+  const shouldSkipWrite = state._browsingHistory || (state.userScrolledUp && !atExactBottom);
 
   // 更新时间戳指针：只在非翻页模式下更新（currentNewestTimestamp 表示"当前显示的最新"）
   if (!state._browsingHistory && !state.userScrolledUp) {
@@ -101,6 +104,10 @@ function appendOutput(content, source = 'output', taskId = null, messageId = nul
     // write() 使 buffer 增长 → onScroll 检测到 buffer.length 变化 → 跳过（不误设 userScrolledUp）
     // 用户滚动 → onScroll 检测到 buffer.length 未变 → 正常设置 userScrolledUp
     state.output.write(formatLineNoPrefix(fileLineNo) + convertFilePathsToLinks(content) + '\r\n');
+    // 🔧 Task#1725：更新 xterm 实际内容最新行号（回底时判定内容是否落后）
+    if (fileLineNo && fileLineNo > (state._xtermNewestLineNo || 0)) {
+      state._xtermNewestLineNo = fileLineNo;
+    }
     // 🔧 修复：写入后确保滚动到底部，防止buffer增长后viewport位置滞后导致isAtBottom误判
     // userScrolledUp已在上面检查为false，此处安全滚动
     // 🔧 Fix #1428: rAF 回调可能在用户滚轮事件之后才执行，

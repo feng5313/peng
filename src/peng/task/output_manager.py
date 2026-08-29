@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
 import traceback
@@ -39,8 +40,9 @@ class OutputManager:
     - 行缓冲：缓存输出直到遇到换行符
     - 线程安全：使用锁保护文件写入
     - 自动flush：确保文件内容最新
-    - 文件格式：{timestamp}\t{source}\t{task_id}\t{content}
+    - 文件格式：{timestamp}\t{source}\t{lineNo}\t{content}（🔧 Task#1725：第3字段为行号）
     - 文件命名：task-{task_id}.out
+    - 旧格式（第3字段为task_id）在再次写入时自动迁移为行号格式
     """
 
     _instance = None
@@ -71,6 +73,13 @@ class OutputManager:
 
         # 跟踪每个 task_id 已连续写入的空行数，用于限制连续空行不超过1个
         self._consecutive_empty: dict[int, int] = {}
+
+        # 🔧 Task#1725：行号计数器（行号=物理行位置，O(1)分配）
+        self._next_line_no: dict[int, int] = {}
+        # 行号计数器初始化时/最近的文件大小（检测外部清空 → 计数器重置）
+        self._line_no_file_size: dict[int, int] = {}
+        # 已确认是行号格式的文件（避免重复检测）
+        self._line_no_format_ok: set[int] = set()
 
         # 加载配置
         try:
@@ -199,6 +208,116 @@ class OutputManager:
                 self._write_lines(task_id, source, [remaining])
                 self._buffers[buffer_key] = ""
 
+    # ==================== 🔧 Task#1725：行号格式 ====================
+
+    def _detect_line_no_format(self, file_path: Path) -> bool:
+        """检测文件是否已是行号格式（第3字段为行号）。
+
+        判定：前2行的第3字段分别为 '1'、'2'（行号从1连续）。
+        旧格式第3字段是task_id（恒定值，不可能连续为1、2），至少需要2行才能可靠区分。
+        空文件/不足2行时：单行看第3字段是否=='1'；全空视为新格式（无需迁移）。
+        """
+        try:
+            if not file_path.exists() or file_path.stat().st_size == 0:
+                return True
+            with open(file_path, encoding="utf-8", errors="replace") as f:
+                first = f.readline()
+                if not first:
+                    return True
+                parts = first.rstrip("\n").split("\t")
+                if len(parts) < 4 or parts[2] != "1":
+                    return False
+                second = f.readline()
+                if not second:
+                    return True  # 仅1行且第3字段==1 → 新格式
+                parts = second.rstrip("\n").split("\t")
+                return len(parts) >= 4 and parts[2] == "2"
+        except Exception as e:
+            logger.warning(f"行号格式检测失败: {file_path}, {e}")
+            return False
+
+    def _migrate_to_line_no_format(self, task_id: int, file_path: Path) -> int:
+        """旧格式（第3字段task_id）原地迁移为行号格式（第3字段=物理行号）。
+
+        Returns: 迁移后的总行数（作为行号计数器初始值）
+        写端独占写时才调用（此时本进程是该文件唯一写者），rename 原子替换。
+        """
+        total = 0
+        tmp_path = file_path.with_suffix(".out.migrating")
+        try:
+            with open(file_path, encoding="utf-8", errors="replace") as fin, \
+                 open(tmp_path, "w", encoding="utf-8") as fout:
+                for line in fin:
+                    total += 1
+                    raw = line.rstrip("\n")
+                    parts = raw.split("\t")
+                    if len(parts) >= 4:
+                        new_raw = parts[0] + "\t" + parts[1] + "\t" + str(total) + "\t" + "\t".join(parts[3:])
+                    else:
+                        new_raw = raw  # 异常行原样保留
+                    fout.write(new_raw + "\n")
+            os.replace(tmp_path, file_path)
+            logger.info(f"[Task#1725] 输出文件已迁移为行号格式: task={task_id}, {total}行")
+            return total
+        except Exception as e:
+            logger.error(f"行号格式迁移失败: {file_path}, {e}\n{traceback.format_exc()}")
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+            return 0
+
+    def _ensure_line_no_ready(self, task_id: int, file_path: Path) -> None:
+        """确保行号计数器就绪（在 _write_lock 保护下调用）。
+
+        - 首次写该文件：检测格式；旧格式先迁移；计数器=总行数+1
+        - 后续：检测文件被外部清空（size<记录值）→ 计数器重置
+        """
+        # 已初始化：检查外部清空
+        if task_id in self._next_line_no:
+            try:
+                size = file_path.stat().st_size if file_path.exists() else 0
+                if size < self._line_no_file_size.get(task_id, 0):
+                    # 文件被清空/截断 → 重置计数器从1开始
+                    self._next_line_no[task_id] = 1
+                    self._line_no_file_size[task_id] = 0
+                    self._line_no_format_ok.discard(task_id)
+            except OSError:
+                pass
+            return
+
+        # 首次：格式检测 + 迁移 + 计数器初始化
+        total = 0
+        if file_path.exists() and file_path.stat().st_size > 0:
+            if not self._detect_line_no_format(file_path):
+                total = self._migrate_to_line_no_format(task_id, file_path)
+                if total == 0:
+                    # 迁移失败 → 按当前实际行数初始化，避免行号错乱
+                    total = self._count_lines_fallback(file_path)
+            else:
+                total = self._count_lines_fallback(file_path)
+            self._line_no_format_ok.add(task_id)
+        self._next_line_no[task_id] = total + 1
+        try:
+            self._line_no_file_size[task_id] = file_path.stat().st_size if file_path.exists() else 0
+        except OSError:
+            self._line_no_file_size[task_id] = 0
+
+    def _count_lines_fallback(self, file_path: Path) -> int:
+        """行数统计兜底（分块计数）。"""
+        count = 0
+        try:
+            with open(file_path, "rb") as f:
+                while True:
+                    buf = f.read(1024 * 1024)
+                    if not buf:
+                        break
+                    count += buf.count(b"\n")
+        except Exception as e:
+            logger.warning(f"行数统计失败: {file_path}, {e}")
+        return count
+
     def _write_lines(
         self,
         task_id: int,
@@ -235,6 +354,9 @@ class OutputManager:
         file_path = self.get_output_file_path(task_id)
 
         try:
+            # 🔧 Task#1725：确保行号计数器就绪（含旧格式自动迁移）
+            self._ensure_line_no_ready(int(task_id), file_path)
+
             # 追加模式打开文件
             need_chown = not file_path.exists()
             with open(file_path, "a", encoding="utf-8") as f:
@@ -242,7 +364,8 @@ class OutputManager:
                     # 不跳过空行，而是将空行写入为空格占位符
                     if not line.strip():
                         line = " "  # 保留空格占位符
-                    # 格式：{timestamp}\t{source}\t{task_id}\t{content}
+                    # 格式：{timestamp}\t{source}\t{lineNo}\t{content}
+                    # 🔧 Task#1725：第3字段为行号（=物理行位置，O(1)分配）
                     timestamp = datetime.now().isoformat()
                     if source in ["thinking", "answer"]:
                         color = (
@@ -251,13 +374,21 @@ class OutputManager:
                             else _COLORS.models("big_model")
                         )
                         line = colorize(line, color)
-                    formatted_line = f"{timestamp}\t{source}\t{task_id}\t{line}\n"
+                    line_no = self._next_line_no[int(task_id)]
+                    self._next_line_no[int(task_id)] = line_no + 1
+                    formatted_line = f"{timestamp}\t{source}\t{line_no}\t{line}\n"
 
                     # 中文标点保持原样输出，不再转换为英文标点
                     f.write(formatted_line)
 
                 # 立即flush确保文件内容最新
                 f.flush()
+
+            # 🔧 Task#1725：记录写入后大小（外部清空检测基准）
+            try:
+                self._line_no_file_size[int(task_id)] = file_path.stat().st_size
+            except OSError:
+                pass
 
             # 新建的文件需要设置 owner（root 运行时文件会归 root 所有）
             if need_chown:

@@ -871,7 +871,7 @@ const SUBSCRIBE_RETRY_DELAY = 500;  // 500ms
 
 // 🔧 优化：增加WebSocket连接等待重试机制
 // beforeTimestamp: 用于"上一页"加载更多老历史，指定获取此时间戳之前的数据
-async function subscribeOutput(retryCount = 0, skipHistory = false, beforeTimestamp = null, sinceTime = null) {
+async function subscribeOutput(retryCount = 0, skipHistory = false, beforeTimestamp = null, sinceTime = null, pageStart = null, pageEnd = null) {
   const maxRetries = 200;  // 200次 * 100ms = 20秒
   const retryDelay = 100;
   const messageId = state.currentMessageId;
@@ -886,11 +886,11 @@ async function subscribeOutput(retryCount = 0, skipHistory = false, beforeTimest
     if (retryCount >= maxRetries) {
       console.error('❌ WebSocket 连接超时，订阅失败，0.5秒后自动重试');
       // 🔥 启动后台重试事务
-      setTimeout(() => subscribeOutput(0, skipHistory, beforeTimestamp, sinceTime), 500);
+      setTimeout(() => subscribeOutput(0, skipHistory, beforeTimestamp, sinceTime, pageStart, pageEnd), 500);
       return;
     }
     await new Promise(resolve => setTimeout(resolve, retryDelay));
-    return subscribeOutput(retryCount + 1, skipHistory, beforeTimestamp, sinceTime);
+    return subscribeOutput(retryCount + 1, skipHistory, beforeTimestamp, sinceTime, pageStart, pageEnd);
   }
   // 发送订阅消息
   try {
@@ -907,10 +907,15 @@ async function subscribeOutput(retryCount = 0, skipHistory = false, beforeTimest
     if (sinceTime) {
       msg.sinceTime = sinceTime;
     }
+    // 🔧 Task#1725：O(1) 行号翻页请求
+    if (pageStart && pageEnd) {
+      msg.pageStart = pageStart;
+      msg.pageEnd = pageEnd;
+    }
     state.ws.send(JSON.stringify(msg));
   } catch (error) {
     console.error('订阅失败，0.5秒后重试:', error);
-    setTimeout(() => subscribeOutput(0, skipHistory, beforeTimestamp, sinceTime), 500);
+    setTimeout(() => subscribeOutput(0, skipHistory, beforeTimestamp, sinceTime, pageStart, pageEnd), 500);
   }
 }
 
@@ -1498,6 +1503,8 @@ async function selectTask(taskId, messageId = null) {
   state._pagingStartLine = -1;  // 🔧 Fix Task#840：清除翻页行号
   state._pagingEndLine = -1;
   state._totalLines = 0;  // 🔧 Fix Task#840：切换事务重置总行数
+  state._loadingPage = null;  // 🔧 Task#1725：取消进行中的行号翻页请求
+  state._xtermNewestLineNo = 0;  // 🔧 Task#1725：重置 xterm 内容行号
   state._pagingAnchorNewestTs = null;
   state._pagingPageNewestTs = null;
   state.currentOldestTimestamp = null;
