@@ -360,16 +360,20 @@ function initEventListeners() {
         }
         return;
       }
-      // 上箭头: 在历史列表中向上选择（高亮上移，输入框内容不变）
-      if (e.key === 'ArrowUp' && !e.altKey && !e.shiftKey) {
+      // 🔧 事务#1732修复：上/下箭头按输入框行数分流
+      // - 多行输入（≥2行）：上下键用于光标在行间移动（换行编辑），不拦截（让浏览器默认行为生效），
+      //   同时关闭历史列表（用户在编辑文本，而非查找历史）。此前无条件拦截导致多行文本无法换行移动光标。
+      // - 单行输入：维持终端式历史导航（列表可见时高亮移动；列表隐藏时 navigate 的 render 会弹出列表）
+      // 行数计算与 input 事件防抖逻辑保持一致（innerText.trim() 统计换行符）
+      const isPlainArrowKey = (e.key === 'ArrowUp' || e.key === 'ArrowDown') && !e.altKey && !e.shiftKey && !e.ctrlKey;
+      if (isPlainArrowKey) {
+        const inputLineCount = (input.innerText.trim().match(/\n/g) || []).length + 1;
+        if (inputLineCount >= 2) {
+          hideInputHistoryList();
+          return;  // 不 preventDefault，浏览器默认移动光标到上一行/下一行
+        }
         e.preventDefault();
-        navigateFilteredHistory(-1);  // -1 表示往上（更老的方向）
-        return;
-      }
-      // 下箭头: 在历史列表中向下选择（高亮下移，输入框内容不变）
-      if (e.key === 'ArrowDown' && !e.altKey && !e.shiftKey) {
-        e.preventDefault();
-        navigateFilteredHistory(1);  // 1 表示往下（更新的方向）
+        navigateFilteredHistory(e.key === 'ArrowUp' ? -1 : 1);  // -1 往上（更老），1 往下（更新）
         return;
       }
       // Ctrl+C: 如果没有选中文字，暂停当前选中的事务分支

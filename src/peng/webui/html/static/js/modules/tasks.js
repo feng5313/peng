@@ -18,7 +18,7 @@ async function loadWebUIConfig() {
   // 加载 xterm 配置
   if (config.xterm) {
     state.webuiConfig.xterm.scrollback = config.xterm.scrollback;
-    state.webuiConfig.xterm.show_line_numbers = config.xterm.show_line_numbers !== false;
+    state.webuiConfig.xterm.show_line_numbers = config.xterm.show_line_numbers === true;
   }
 
   // 加载内容截断配置
@@ -986,6 +986,16 @@ function updateTaskElement(headEl, task) {
       } else if (task.status !== 'running') {
         statusEl.style.animationDuration = '';
       }
+
+      // 🔧 事务#1864：同步prefill徽章（状态变化时更新，如running→completed移除；
+      // 百分比文本由 updatePrefillBadges 在每次广播时轻量刷新）
+      const existingBadge = meta.querySelector('.task-prefill-badge');
+      const badgeHtml = renderPrefillBadge(task);
+      if (badgeHtml && !existingBadge) {
+        statusEl.insertAdjacentHTML('afterend', badgeHtml);
+      } else if (!badgeHtml && existingBadge) {
+        existingBadge.remove();
+      }
     }
 
     // 更新操作按钮
@@ -1190,6 +1200,7 @@ function renderTaskItem(task, level = 0, hoveredId = null, highlightTerms = []) 
                              ${task.parent_task_id ? `<span class="task-chain-sender"><span class="caller-id parent-task-id" data-task-id="${task.parent_task_id}" onclick="event.stopPropagation(); showTaskDetails(${task.parent_task_id})">${taskIcon}${task.parent_task_id}</span></span>` : ''}
                              ${!task.parent_task_id && task.message_id ? `<span class="task-chain-sender"><span class="caller-id" onclick="event.stopPropagation(); showMessageDetails(${task.message_id})">${messageIcon}${task.message_id}</span></span>` : ''}
                              ${statusIcon ? `<span class="task-chain-status ${statusClass}" title="${getStatusTitle(task.status)}"${randomAnimationDelay ? ` style="${randomAnimationDelay}"` : ''}>${statusIcon}</span>` : ''}
+                             ${renderPrefillBadge(task)}
                              ${level === 0 ? (task.id === 1 ? '<span class="action-btn top-btn topped" title="系统事务，永远顶置">★</span>' : `<span class="action-btn top-btn${state.toppedTaskIds.has(task.id) ? ' topped' : ''}" onclick="event.stopPropagation(); toggleTaskTop(${task.id})" title="${state.toppedTaskIds.has(task.id) ? '已顶置，点击取消' : '顶置'}">${state.toppedTaskIds.has(task.id) ? '★' : '☆'}</span>`) : ''}
                              <span class="task-chain-actions">
                                  ${renderTaskActions(task)}
@@ -1621,11 +1632,78 @@ function handleThroughputUpdate(data) {
   // 🔧 更新 nest 流量数据
   state.nestTraffic = data.nest_traffic || [];
 
+  // 🔧 事务#1864：更新prefill阶段状态（本地大模型长上下文prefill进度）
+  state.prefillStatus = data.prefill_status || {};
+
   // 动态更新所有 running 状态图标的动画速度
   updateRunningAnimationSpeed();
 
+  // 🔧 事务#1864：轻量刷新prefill进度徽章（不重建DOM）
+  updatePrefillBadges();
+
   // 更新底部状态栏的吞吐率显示
   renderThroughputStatusBar();
+}
+
+/**
+ * 🔧 事务#1864：渲染prefill进度徽章HTML
+ *
+ * running事务处于prefill阶段（LLM请求已发出但首个chunk未返回）时显示。
+ * 本地大模型（如s-qwen3.8）长上下文prefill耗时较长，徽章让用户知道
+ * 系统正在正常工作而非卡死。
+ *
+ * @param {Object} task - 事务对象（需含id和status）
+ * @returns {string} 徽章HTML字符串（非prefill阶段返回空串）
+ */
+function renderPrefillBadge(task) {
+  const ps = state.prefillStatus || {};
+  const info = ps[task.id];
+  if (task.status === 'running' && info) {
+    const pct = Math.max(0, Math.min(99, info.percent || 0));
+    const secs = Math.round(info.elapsed || 0);
+    return `<span class="task-prefill-badge" data-task-id="${task.id}" title="LLM prefill（长上下文填充）进行中：约${pct}%，已等待${secs}秒（输入约${info.est_tokens || 0} tokens），首个输出即将开始">⏳prefill ${pct}%</span>`;
+  }
+  return '';
+}
+
+/**
+ * 🔧 事务#1864：prefill状态更新时轻量刷新所有badge（不重建DOM）
+ *
+ * 1. 已有badge的事务：更新文本和title
+ * 2. prefill已结束的事务（状态文件已删除）：移除badge
+ * 3. 新进入prefill的事务（badge不存在）：在状态图标后插入badge
+ */
+function updatePrefillBadges() {
+  const ps = state.prefillStatus || {};
+
+  // 更新/移除已有badge
+  document.querySelectorAll('.task-prefill-badge').forEach(el => {
+    const taskId = parseInt(el.dataset.taskId, 10);
+    const info = ps[taskId];
+    if (!info) {
+      // prefill已结束（首个chunk到达，状态文件已删除），移除徽章
+      el.remove();
+      return;
+    }
+    const pct = Math.max(0, Math.min(99, info.percent || 0));
+    const secs = Math.round(info.elapsed || 0);
+    el.textContent = `⏳prefill ${pct}%`;
+    el.title = `LLM prefill（长上下文填充）进行中：约${pct}%，已等待${secs}秒（输入约${info.est_tokens || 0} tokens），首个输出即将开始`;
+  });
+
+  // 为新进入prefill的事务插入badge（在状态图标后；折叠的子事务DOM不存在则跳过，
+  // 展开时全量渲染的renderPrefillBadge会带上）
+  for (const [taskIdStr, info] of Object.entries(ps)) {
+    const taskId = parseInt(taskIdStr, 10);
+    if (document.querySelector(`.task-prefill-badge[data-task-id="${taskId}"]`)) continue;
+    const statusEl = document.querySelector(`.task-chain-head[data-id="${taskId}"] .task-chain-status`);
+    if (statusEl) {
+      const pct = Math.max(0, Math.min(99, info.percent || 0));
+      const secs = Math.round(info.elapsed || 0);
+      statusEl.insertAdjacentHTML('afterend',
+        `<span class="task-prefill-badge" data-task-id="${taskId}" title="LLM prefill（长上下文填充）进行中：约${pct}%，已等待${secs}秒（输入约${info.est_tokens || 0} tokens），首个输出即将开始">⏳prefill ${pct}%</span>`);
+    }
+  }
 }
 
 /**
@@ -1705,16 +1783,29 @@ function renderThroughputStatusBar() {
     }
   }
 
-  // 🔧 渲染 Provider 吞吐率到 status-throughputs 区域
+  // 🔧 渲染 Provider 吞吐率 + prefill进度 到 status-throughputs 区域
   if (throughputEl) {
     const throughputs = state.providerThroughputs;
-    if (!throughputs || Object.keys(throughputs).length === 0) {
+    // 🔧 事务#1864：prefill状态（prefill期间无chunk无吞吐率，
+    // 进度信息是用户唯一可见的活动迹象，必须渲染）
+    const prefill = state.prefillStatus || {};
+    const prefillCount = Object.keys(prefill).length;
+
+    if ((!throughputs || Object.keys(throughputs).length === 0) && prefillCount === 0) {
       throughputEl.textContent = '';
       return;
     }
 
     let parts = [];
-    for (const [provider, tps] of Object.entries(throughputs)) {
+    // 🔧 事务#1864：prefill进度显示在最前，格式：⏳🐥#1864 prefill 42%
+    if (prefillCount > 0) {
+      for (const [taskId, info] of Object.entries(prefill)) {
+        const icon = getProviderIcon(info.provider) || '🤖';
+        const pct = Math.max(0, Math.min(99, info.percent || 0));
+        parts.push(`⏳${icon} #${taskId} prefill ${pct}%`);
+      }
+    }
+    for (const [provider, tps] of Object.entries(throughputs || {})) {
       const icon = getProviderIcon(provider) || '🤖';
       let tpsStr;
       if (tps < 10) {

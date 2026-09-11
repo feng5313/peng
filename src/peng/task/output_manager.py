@@ -23,6 +23,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+try:
+    import fcntl  # Unix 跨进程文件锁
+except ImportError:  # Windows 无 fcntl
+    fcntl = None
+
 from peng.common.colors import colorize, get_colors
 from peng.common.paths import chown_to_project_owner, ensure_dir_with_owner
 from peng.config import get_agent_name, get_master_name
@@ -269,40 +274,41 @@ class OutputManager:
             return 0
 
     def _ensure_line_no_ready(self, task_id: int, file_path: Path) -> None:
-        """确保行号计数器就绪（在 _write_lock 保护下调用）。
+        """确保行号计数器与文件状态同步（在 _write_lock + flock 保护下调用）。
 
-        - 首次写该文件：检测格式；旧格式先迁移；计数器=总行数+1
-        - 后续：检测文件被外部清空（size<记录值）→ 计数器重置
+        🔧 Fix #1751：写前对齐 —— 多进程并发写同一输出文件时
+        （webui服务与fly service/CLI各自持有独立OutputManager单例），
+        各进程内存计数器会漂移，导致行内行号跳变错位（实测task-2.out
+        物理行137451行号却是95387），进而导致前端行号格式判定失败、
+        切换事务输出不渲染、翻页黑屏。现改为：
+        - 文件大小与上次记录一致 → 计数器有效（快速路径，O(1)）
+        - 首次初始化 / 外部进程追加（size>记录值）→ 对齐物理行数+1。
+          用物理行数（数\n，绝对权威）而非尾部行内行号——错位进程写的
+          行号本身是错的，跟随它对齐会自我强化错误
+          （触发频率=外部进程写入次数，低频，26ms/20MB可接受）
+        - 文件被清空/截断（size<记录值）→ 计数器重置为1
         """
-        # 已初始化：检查外部清空
-        if task_id in self._next_line_no:
-            try:
-                size = file_path.stat().st_size if file_path.exists() else 0
-                if size < self._line_no_file_size.get(task_id, 0):
-                    # 文件被清空/截断 → 重置计数器从1开始
-                    self._next_line_no[task_id] = 1
-                    self._line_no_file_size[task_id] = 0
-                    self._line_no_format_ok.discard(task_id)
-            except OSError:
-                pass
+        try:
+            size = file_path.stat().st_size if file_path.exists() else 0
+        except OSError:
+            size = 0
+        recorded = self._line_no_file_size.get(task_id, 0)
+        if task_id in self._next_line_no and size == recorded:
+            return  # 文件无变化，计数器有效
+
+        if size == 0 or size < recorded:
+            # 空文件或被外部清空/截断 → 从1开始
+            self._next_line_no[task_id] = 1
+            self._line_no_file_size[task_id] = size
+            self._line_no_format_ok.discard(task_id)
             return
 
-        # 首次：格式检测 + 迁移 + 计数器初始化
-        total = 0
-        if file_path.exists() and file_path.stat().st_size > 0:
-            if not self._detect_line_no_format(file_path):
-                total = self._migrate_to_line_no_format(task_id, file_path)
-                if total == 0:
-                    # 迁移失败 → 按当前实际行数初始化，避免行号错乱
-                    total = self._count_lines_fallback(file_path)
-            else:
-                total = self._count_lines_fallback(file_path)
-            self._line_no_format_ok.add(task_id)
+        # 首次初始化 或 外部进程追加了新行 → 对齐物理行数+1（渐进迁移，
+        # 不再全文件重写迁移——多进程并发下os.replace会导致另一进程写丢）
+        total = self._count_lines_fallback(file_path)
         self._next_line_no[task_id] = total + 1
-        try:
-            self._line_no_file_size[task_id] = file_path.stat().st_size if file_path.exists() else 0
-        except OSError:
-            self._line_no_file_size[task_id] = 0
+        self._line_no_file_size[task_id] = size
+        self._line_no_format_ok.add(task_id)
 
     def _count_lines_fallback(self, file_path: Path) -> int:
         """行数统计兜底（分块计数）。"""
@@ -354,35 +360,42 @@ class OutputManager:
         file_path = self.get_output_file_path(task_id)
 
         try:
-            # 🔧 Task#1725：确保行号计数器就绪（含旧格式自动迁移）
-            self._ensure_line_no_ready(int(task_id), file_path)
-
             # 追加模式打开文件
             need_chown = not file_path.exists()
             with open(file_path, "a", encoding="utf-8") as f:
-                for line in filtered_lines:
-                    # 不跳过空行，而是将空行写入为空格占位符
-                    if not line.strip():
-                        line = " "  # 保留空格占位符
-                    # 格式：{timestamp}\t{source}\t{lineNo}\t{content}
-                    # 🔧 Task#1725：第3字段为行号（=物理行位置，O(1)分配）
-                    timestamp = datetime.now().isoformat()
-                    if source in ["thinking", "answer"]:
-                        color = (
-                            _COLORS.agent("thinking")
-                            if source == "thinking"
-                            else _COLORS.models("big_model")
-                        )
-                        line = colorize(line, color)
-                    line_no = self._next_line_no[int(task_id)]
-                    self._next_line_no[int(task_id)] = line_no + 1
-                    formatted_line = f"{timestamp}\t{source}\t{line_no}\t{line}\n"
+                # 🔧 Fix #1751：跨进程排他锁（Unix）—— webui服务/fly service/CLI
+                # 多进程并发追加同一输出文件时串行化，配合锁内写前对齐保证行号一致
+                if fcntl is not None:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    # 🔧 Fix #1751：写前对齐（锁内检测外部进程追加/清空，见 _ensure_line_no_ready）
+                    self._ensure_line_no_ready(int(task_id), file_path)
+                    for line in filtered_lines:
+                        # 不跳过空行，而是将空行写入为空格占位符
+                        if not line.strip():
+                            line = " "  # 保留空格占位符
+                        # 格式：{timestamp}\t{source}\t{lineNo}\t{content}
+                        # 🔧 Task#1725：第3字段为行号（=物理行位置，O(1)分配）
+                        timestamp = datetime.now().isoformat()
+                        if source in ["thinking", "answer"]:
+                            color = (
+                                _COLORS.agent("thinking")
+                                if source == "thinking"
+                                else _COLORS.models("big_model")
+                            )
+                            line = colorize(line, color)
+                        line_no = self._next_line_no[int(task_id)]
+                        self._next_line_no[int(task_id)] = line_no + 1
+                        formatted_line = f"{timestamp}\t{source}\t{line_no}\t{line}\n"
 
-                    # 中文标点保持原样输出，不再转换为英文标点
-                    f.write(formatted_line)
+                        # 中文标点保持原样输出，不再转换为英文标点
+                        f.write(formatted_line)
 
-                # 立即flush确保文件内容最新
-                f.flush()
+                    # 立即flush确保文件内容最新
+                    f.flush()
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
             # 🔧 Task#1725：记录写入后大小（外部清空检测基准）
             try:

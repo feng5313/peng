@@ -866,6 +866,45 @@ def _resolve_to_absolute(project_root: Path, path_str: str) -> Path:
     return path
 
 
+# ==================== 运行期 vision 能力禁用（事务#1819） ====================
+# 背景：provider 配置声明 vision=true 但后端实际不支持多模态（如 vLLM/sglang
+# 部署未启用视觉，返回"messages.content.type 参数非法，取值范围 ['text']"），
+# 事务#1818中 s-qwen3.8 因此每次收到附件都 400 并被误冷却。运行期禁用标记
+# 使 provider 选择与请求构建把该 provider 视为非 vision，实现自适应纠偏，
+# 无需人工改配置文件。
+# 进程内存标记（不持久化）：重启/配置热重载后自动复位，TTL 到期自动恢复探测。
+_RUNTIME_VISION_DISABLED: dict[str, float] = {}  # provider名 → 禁用到期时间戳
+
+
+def disable_provider_vision(provider_name: str, ttl_seconds: float = 600) -> None:
+    """运行期禁用指定 provider 的 vision 能力（TTL 到期自动恢复）
+
+    Args:
+        provider_name: provider 名称（空名忽略）
+        ttl_seconds: 禁用时长（秒），默认10分钟
+    """
+    if not provider_name:
+        return
+    _RUNTIME_VISION_DISABLED[provider_name] = time.time() + ttl_seconds
+    logger.warning(
+        f"[LLMConfig] 运行期禁用 {provider_name} 的vision能力({ttl_seconds:.0f}秒)："
+        f"后端不支持多模态content"
+    )
+
+
+def is_provider_vision_runtime_disabled(provider_name: str) -> bool:
+    """检查 provider 的 vision 能力是否被运行期禁用（TTL 过期自动清除标记）"""
+    expiry = _RUNTIME_VISION_DISABLED.get(provider_name)
+    if expiry is None:
+        return False
+    if time.time() >= expiry:
+        # 禁用到期：清除标记，恢复探测（后端可能已修复）
+        _RUNTIME_VISION_DISABLED.pop(provider_name, None)
+        logger.info(f"[LLMConfig] {provider_name} vision运行期禁用到期，恢复探测")
+        return False
+    return True
+
+
 class ProviderConfig(BaseModel):
     """单个 Provider 的配置
 
@@ -907,8 +946,12 @@ class ProviderConfig(BaseModel):
     # 模型不支持禁用思考（如 GLM-5.3 仅支持 enabled+reasoning_effort）：
     # thinking_mode=disabled 时降级为 enabled + 此档位推理强度（通常配 "low"）
     # None/空=支持真正的禁用（发送 thinking.type=disabled）
-    reasoning_disabled_fallback: str | None = None  # 禁思考降级档位（low/medium/high/xhigh/max），None=真禁用
-    thinking_persistence: bool = True  # 是否支持思考内容持久化（GLM等不复用history中的reasoning_content，需写入文件）
+    reasoning_disabled_fallback: str | None = (
+        None  # 禁思考降级档位（low/medium/high/xhigh/max），None=真禁用
+    )
+    thinking_persistence: bool = (
+        True  # 是否支持思考内容持久化（GLM等不复用history中的reasoning_content，需写入文件）
+    )
     compact_threshold: int | None = None  # 上下文压缩阈值，None时使用全局compact_threshold
     # 费用配置（元/百万tokens），None时使用全局默认值(0)
     price_input_hit: float | None = None  # 命中缓存的输入价格
@@ -1081,7 +1124,9 @@ class LLMConfig(BaseModel):
     shifts: list[str] = Field(default_factory=list)
 
     # 通用配置（所有 provider 共享）
-    thinking_mode: str = "auto"  # 全局思考模式（auto/enabled/disabled/low/high/max），覆盖 provider 级别配置
+    thinking_mode: str = (
+        "auto"  # 全局思考模式（auto/enabled/disabled/low/high/max），覆盖 provider 级别配置
+    )
     thinking_dead_loop_threshold: int = 10  # 全局思考死循环检测阈值
     content_dead_loop_threshold: int = 8  # 全局内容死循环检测阈值（content流中重复行检测）
     temperature: float = 0.5
@@ -1207,7 +1252,10 @@ class LLMConfig(BaseModel):
         return [p for p, _ in enabled_providers]
 
     def _get_best_available_provider(
-        self, forbidden: list[str] | None = None, prefer_vision: bool = False
+        self,
+        forbidden: list[str] | None = None,
+        prefer_vision: bool = False,
+        min_context_tokens: int | None = None,
     ) -> str | None:
         """
         获取当前最佳可用 provider（优先级最高且不在冷却中的）
@@ -1222,6 +1270,8 @@ class LLMConfig(BaseModel):
                 先在支持vision的provider中按priority选最优；无可用vision
                 provider时回退普通选择（多模态内容会被降级为纯文本）。
                 vision-only 的provider不参与（它们不支持普通LLM任务）。
+            min_context_tokens: 估算的请求输入token数（事务#1807）。
+                上下文能力装不下当前请求的provider被跳过，防止切换后必然400。
 
         Returns:
             最佳可用 provider 名称，如果没有可用 provider 则返回 None
@@ -1231,19 +1281,32 @@ class LLMConfig(BaseModel):
             return None
 
         # 多模态优先：在支持vision的provider中按priority选最优（不含vision-only）
+        # 🔧 事务#1819：运行期vision禁用的provider不参与vision筛选
         if prefer_vision:
             vision_shifts = [
-                p for p in shifts if self.providers[p].is_vision_enabled() and not self.providers[p].is_vision_only()
+                p
+                for p in shifts
+                if self.providers[p].is_vision_enabled()
+                and not self.providers[p].is_vision_only()
+                and not is_provider_vision_runtime_disabled(p)
             ]
             if vision_shifts:
                 candidates = vision_shifts
             else:
-                logger.warning(
-                    "[LLMConfig] 无可用vision provider，多模态内容将降级为纯文本"
-                )
+                logger.warning("[LLMConfig] 无可用vision provider，多模态内容将降级为纯文本")
                 candidates = shifts
         else:
             candidates = shifts
+
+        # 上下文能力过滤（事务#1807）：装不下当前请求的provider不参与选择
+        if min_context_tokens is not None:
+            candidates = [p for p in candidates if self._context_capacity_ok(p, min_context_tokens)]
+            if not candidates:
+                logger.warning(
+                    f"[LLMConfig] 所有provider上下文能力均不足"
+                    f"(请求输入~{min_context_tokens}tokens)，无能力匹配的provider（事务#1807）"
+                )
+                return None
 
         # 将 forbidden 转换为集合以加速查找
         forbidden_set = set(forbidden) if forbidden else set()
@@ -1307,6 +1370,42 @@ class LLMConfig(BaseModel):
         if min_remaining < 0:
             return 0.0
         return min_remaining
+
+    def _effective_compact_threshold(self, provider: str) -> int:
+        """获取provider的有效上下文压缩阈值（provider级优先，None时用全局值）
+
+        兼作该provider上下文处理能力的判据：上下文超过此值的provider不应被切换选中
+        （切换过去请求会超限400，且立即触发上下文压缩告警，如事务#1805）。
+        """
+        prov_config = self.providers.get(provider)
+        if prov_config and prov_config.compact_threshold is not None:
+            return prov_config.compact_threshold
+        return self.compact_threshold
+
+    def _context_capacity_ok(self, provider: str, min_context_tokens: int | None) -> bool:
+        """校验provider的上下文能力是否装得下当前请求（事务#1807）
+
+        准据与系统自身阈值语义一致（check_progress_and_compact同款）：
+        估算输入token（含安全余量）≤ 有效compact_threshold 即能力足够。
+        不额外计入max_tokens输出预留——compact_threshold是用户按模型真实
+        上限配置的软阈值，若加输出预留会把正在正常服务、上下文接近阈值的
+        provider也误判为不足，反而制造无谓切换（破坏前缀缓存/优先级意图）。
+        #1805实况验证：输入243K*1.05=255K > s-qwen3.8的220K即正确跳过。
+
+        Args:
+            provider: provider名称
+            min_context_tokens: 估算的请求输入token数（None=不校验，保持旧行为）
+        """
+        if min_context_tokens is None:
+            return True
+        capacity = self._effective_compact_threshold(provider)
+        if min_context_tokens > capacity:
+            logger.info(
+                f"[LLMConfig] {provider}上下文能力不足: 请求输入~{min_context_tokens}tokens"
+                f" > compact_threshold {capacity}，跳过该provider（事务#1807）"
+            )
+            return False
+        return True
 
     def _get_failure_info(self, provider: str) -> FailureInfo | None:
         """获取 provider 的失败信息（自动转换为 FailureInfo）"""
@@ -1445,8 +1544,12 @@ class LLMConfig(BaseModel):
 
         Returns:
             (providers列表, locked标志, forbidden_providers列表) 或 None
+            providers列表有序：带!锁定标记的provider排在最前（get_provider
+            锁定时取favorites[0]，保证锁定语义指向用户带!指定的目标），
+            其余按content中出现顺序排列
         """
-        providers = set([])
+        locked_list: list[str] = []  # 带!锁定标记的provider（按出现顺序）
+        normal_list: list[str] = []  # 普通标记的provider（按出现顺序）
         locked = False
         forbidden = set([])
         if content:
@@ -1462,13 +1565,17 @@ class LLMConfig(BaseModel):
             for r in results:
                 c = r
                 # 检测锁定标记（兼容半角!和全角！）
-                if c.endswith("!") or c.endswith("\uff01"):
+                is_locked = c.endswith("!") or c.endswith("\uff01")
+                if is_locked:
                     locked = True
                     c = c.rstrip("!\uff01")
-                # locked时搜索全部provider（含未启用），否则只搜已启用
-                p = self.match_provider(c, include_disabled=locked)
+                # 带!锁定标记时搜索全部provider（含未启用），否则只搜已启用
+                p = self.match_provider(c, include_disabled=is_locked)
                 if p:
-                    providers.add(p)
+                    if is_locked and p not in locked_list:
+                        locked_list.append(p)
+                    elif not is_locked and p not in normal_list and p not in locked_list:
+                        normal_list.append(p)
             # 检测禁止语法：@<provider>X 或 @<provider> X（只匹配大写X，小写x无效）
             # 同时支持 @<emoji>X 的禁止语法
             forbidden_results = re.findall(
@@ -1479,9 +1586,8 @@ class LLMConfig(BaseModel):
                 p = self.match_provider(c, include_disabled=True)
                 if p:
                     forbidden.add(p)
-        return (
-            (list(providers), locked, list(forbidden)) if providers or locked or forbidden else None
-        )
+        providers = locked_list + normal_list
+        return (providers, locked, list(forbidden)) if providers or locked or forbidden else None
 
     def get_provider(
         self,
@@ -1492,6 +1598,7 @@ class LLMConfig(BaseModel):
         locked: bool = False,
         forbidden: list[str] | None = None,
         prefer_vision: bool = False,
+        min_context_tokens: int | None = None,
     ) -> dict[str, any] | None:
         """
         获取 provider 配置（统一入口）
@@ -1501,24 +1608,32 @@ class LLMConfig(BaseModel):
             locked: 锁定provider（来自 @<provider>! 语法），即使失败也不切换
             forbidden: 禁止使用的provider列表（来自 @<provider>X 语法），此事务中不使用这些provider
             prefer_vision: 优先使用支持多模态的provider（事务包含@file=/webui附件时True）
+            min_context_tokens: 估算的请求输入token数（事务#1807）。传入时上下文
+                能力装不下当前请求（输入token > 有效compact_threshold）的provider
+                不会被切换选中，防止切换后必然400超限；全部不足时兜底返回能力
+                最大的provider走既有400→冷却→上下文紧张→压缩/重启自愈链路。
+                锁定(@provider!)与enable_fallback=False场景尊重用户显式意图，仅告警。
         """
         import time
 
         # provider锁定：即使失败也不切换，直接返回锁定的provider配置
         if locked:
-            # 确定锁定的provider名称：优先current，其次从favorites匹配（排除被禁止的）
+            # 确定锁定的provider名称：优先favorites（用户在事务content中显式@指定的
+            # provider，带!锁定标记的排在favorites最前），其次current（client实例
+            # 上一轮使用的provider，可能是首轮预热按priority自动选择的记录，
+            # 非用户显式意图），最后已保存的current_provider（排除被禁止的）
             forbidden_set = set(forbidden) if forbidden else set()
             locked_provider = None
-            if current and current in self.providers:
-                if current not in forbidden_set:
-                    locked_provider = current
-            if not locked_provider and favorites:
+            if favorites:
                 for fav in favorites:
                     if fav not in forbidden_set:
                         matched = self.match_provider(fav, include_disabled=True)
-                        if matched:
+                        if matched and matched not in forbidden_set:
                             locked_provider = matched
                             break
+            if not locked_provider and current and current in self.providers:
+                if current not in forbidden_set:
+                    locked_provider = current
             # 还没有，尝试使用已保存的 current_provider（排除被禁止的）
             if (
                 not locked_provider
@@ -1540,13 +1655,23 @@ class LLMConfig(BaseModel):
                     logger.info(
                         f"[LLMConfig] provider已锁定: {locked_provider} (enable={prov_config.enable})"
                     )
+                    # 上下文能力校验（事务#1807）：锁定是用户显式意图不强切，仅告警
+                    if not self._context_capacity_ok(locked_provider, min_context_tokens):
+                        logger.warning(
+                            f"[LLMConfig] 锁定provider {locked_provider} 上下文能力不足"
+                            f"(请求输入~{min_context_tokens}tokens)，仍按锁定使用，"
+                            f"请求可能上下文超限400（事务#1807）"
+                        )
                     return {
                         "provider": locked_provider,
                         "api_key": prov_config.api_key,
                         "base_url": prov_config.base_url,
                         "model": prov_config.model,
                         "small_model": prov_config.small_model,
-                        "vision": prov_config.vision,
+                        # 🔧 事务#1819：运行期vision禁用时返回disabled（附件将降级发送）
+                        "vision": prov_config.vision
+                        if not is_provider_vision_runtime_disabled(locked_provider)
+                        else "disabled",
                         "thinking_mode": prov_config.thinking_mode
                         if prov_config.thinking_mode != "auto"
                         else self.thinking_mode,
@@ -1614,13 +1739,24 @@ class LLMConfig(BaseModel):
             else:
                 # 返回完整的 provider 字典
                 prov_config = self.providers[self.current_provider]
+                # 上下文能力校验（事务#1807）：enable_fallback=False为用户显式
+                # 单provider模式不强切，仅告警
+                if not self._context_capacity_ok(self.current_provider, min_context_tokens):
+                    logger.warning(
+                        f"[LLMConfig] enable_fallback=False，provider {self.current_provider} "
+                        f"上下文能力不足(请求输入~{min_context_tokens}tokens)，"
+                        f"仍按配置使用，请求可能上下文超限400（事务#1807）"
+                    )
                 return {
                     "provider": self.current_provider,
                     "api_key": prov_config.api_key,
                     "base_url": prov_config.base_url,
                     "model": prov_config.model,
                     "small_model": prov_config.small_model,
-                    "vision": prov_config.vision,
+                    # 🔧 事务#1819：运行期vision禁用时返回disabled（附件将降级发送）
+                    "vision": prov_config.vision
+                    if not is_provider_vision_runtime_disabled(self.current_provider)
+                    else "disabled",
                     "thinking_mode": prov_config.thinking_mode
                     if prov_config.thinking_mode != "auto"
                     else self.thinking_mode,
@@ -1696,20 +1832,45 @@ class LLMConfig(BaseModel):
         # 2. current 为空（首次连接）
         # 3. current 不可用（未启用、在冷却中、或被禁止）
         # 4. prefer_vision=True 且 current 不支持多模态（切换到vision provider）
+        # 5. favorites（事务content显式@指定的provider）存在且 current 不在其中
         forbidden_set = set(forbidden) if forbidden else set()
+        favorites_set = set(favorites) if favorites else set()
         if not failed and current and current in self.providers and current not in forbidden_set:
             prov_config = self.providers[current]
+            # 用户在事务content中显式@指定的provider（favorites）优先级最高：
+            # current不在favorites中时不直接复用current（current可能只是首轮
+            # 预热按priority自动选择的记录，非用户显式意图），落入下方切换逻辑
+            if favorites_set and current not in favorites_set:
+                logger.info(
+                    f"[LLMConfig] 事务显式指定provider {sorted(favorites_set)}，"
+                    f"不复用current {current}，切换到指定provider"
+                )
             # 多模态优先：current不支持vision时切换到vision provider
             # （显式favorites/@provider指定的优先级高于prefer_vision，不覆盖）
-            if prefer_vision and not favorites and (
-                not prov_config.is_vision_enabled() or prov_config.is_vision_only()
+            # 🔧 事务#1819：运行期vision禁用的provider同样视为不支持多模态
+            elif (
+                prefer_vision
+                and not favorites
+                and (
+                    not prov_config.is_vision_enabled()
+                    or prov_config.is_vision_only()
+                    or is_provider_vision_runtime_disabled(current)
+                )
             ):
                 logger.info(
                     f"[LLMConfig] {current}不支持多模态，切换到vision provider处理多模态内容"
                 )
             else:
+                # 上下文能力校验（事务#1807）：current装不下当前请求时不复用
+                # （config热改compact_threshold/上下文跨阈值增长等场景），落入切换逻辑
+                if not self._context_capacity_ok(current, min_context_tokens):
+                    logger.warning(
+                        f"[LLMConfig] {current}上下文能力不足"
+                        f"(请求输入~{min_context_tokens}tokens)，不复用current，"
+                        f"切换到能力足够的provider（事务#1807）"
+                    )
                 # 检查 current provider 是否仍然可用（启用且非vision-only）
-                if prov_config.enable and not prov_config.is_vision_only():
+                elif prov_config.enable and not prov_config.is_vision_only():
                     failure_info = self._get_failure_info(current)
                     if not failure_info or (
                         time.time() - failure_info.last_failure_time > failure_info.cooldown
@@ -1722,7 +1883,10 @@ class LLMConfig(BaseModel):
                             "base_url": prov_config.base_url,
                             "model": prov_config.model,
                             "small_model": prov_config.small_model,
-                            "vision": prov_config.vision,
+                            # 🔧 事务#1819：运行期vision禁用时返回disabled（附件将降级发送）
+                            "vision": prov_config.vision
+                            if not is_provider_vision_runtime_disabled(current)
+                            else "disabled",
                             "thinking_mode": prov_config.thinking_mode
                             if prov_config.thinking_mode != "auto"
                             else self.thinking_mode,
@@ -1792,8 +1956,11 @@ class LLMConfig(BaseModel):
         if not favorites:
             # 优先使用 shifts 中第一个不在冷却中的 provider（即 priority 最高的可用 provider）
             # prefer_vision=True 时在vision provider中选最优
+            # min_context_tokens过滤掉上下文能力不足的provider（事务#1807）
             target_provider = self._get_best_available_provider(
-                forbidden=forbidden, prefer_vision=prefer_vision
+                forbidden=forbidden,
+                prefer_vision=prefer_vision,
+                min_context_tokens=min_context_tokens,
             )
             auto_selected = True
         else:
@@ -1805,7 +1972,9 @@ class LLMConfig(BaseModel):
                 target_provider = self.match_provider(valid_favorites[r])
             else:
                 # 所有favorites都被禁止，使用自动选择
-                target_provider = self._get_best_available_provider(forbidden=forbidden)
+                target_provider = self._get_best_available_provider(
+                    forbidden=forbidden, min_context_tokens=min_context_tokens
+                )
                 auto_selected = True
 
         # 如果未找到匹配的 provider，尝试使用第一个可用的provider
@@ -1852,7 +2021,9 @@ class LLMConfig(BaseModel):
                 current_time = time.time()
                 if current_time - failure_info.last_failure_time <= failure_info.cooldown:
                     # 还在冷却中，强制切换到下一个 provider（全部失败也要换一个返回！）
-                    fallback = self._get_best_available_provider(forbidden=forbidden)
+                    fallback = self._get_best_available_provider(
+                        forbidden=forbidden, min_context_tokens=min_context_tokens
+                    )
                     if fallback and fallback in self.providers:
                         logger.warning(f"[LLMConfig] {target_provider}在冷却中，切换到: {fallback}")
                         target_provider = fallback
@@ -1884,6 +2055,29 @@ class LLMConfig(BaseModel):
                         except Exception as e:
                             logger.debug(f"[LLMConfig] 心跳更新失败: {e}")
 
+        # 上下文能力最终guard（事务#1807）：favorites匹配/target无效时的兜底列表
+        # 等路径可能选中能力不足的provider（_get_best_available_provider全被过滤
+        # 返回None时，target来自未过滤的_get_enabled_providers_sorted）。
+        # 此时改选enabled非vision-only非forbidden中有效compact_threshold最大者；
+        # 全部不足时也返回能力最大者——由上层走既有400→冷却→上下文紧张告警→
+        # 压缩/重启自愈链路，绝不因能力校验而sys.exit或死等。
+        if not self._context_capacity_ok(target_provider, min_context_tokens):
+            enabled_providers = self._get_enabled_providers_sorted()
+            if forbidden:
+                enabled_providers = [p for p in enabled_providers if p not in set(forbidden)]
+            if enabled_providers:
+                best_capacity = max(
+                    enabled_providers, key=lambda p: self._effective_compact_threshold(p)
+                )
+                logger.warning(
+                    f"[LLMConfig] {target_provider}上下文能力不足"
+                    f"(请求输入~{min_context_tokens}tokens)，无能力足够的可用provider，"
+                    f"兜底使用能力最大的provider: {best_capacity} "
+                    f"(compact_threshold={self._effective_compact_threshold(best_capacity)})，"
+                    f"可能仍上下文超限，将走压缩/重启自愈链路（事务#1807）"
+                )
+                target_provider = best_capacity
+
         # 同步更新 current_provider（跟踪当前实际使用的 provider）
         self.current_provider = target_provider
 
@@ -1897,7 +2091,10 @@ class LLMConfig(BaseModel):
             "base_url": prov_config.base_url,
             "model": prov_config.model,
             "small_model": prov_config.small_model,
-            "vision": prov_config.vision,
+            # 🔧 事务#1819：运行期vision禁用时返回disabled（附件将降级发送）
+            "vision": prov_config.vision
+            if not is_provider_vision_runtime_disabled(target_provider)
+            else "disabled",
             "thinking_mode": prov_config.thinking_mode
             if prov_config.thinking_mode != "auto"
             else self.thinking_mode,
@@ -2113,8 +2310,8 @@ def is_auto_mode_prompt(prompt: str) -> bool:
 class MonitorConfig(BaseModel):
     """监控配置"""
 
-    inbox_monitor_interval: int = 1
-    heartbeat_monitor_interval: int = 1
+    inbox_monitor_interval: float = 1.0  # 支持亚秒级轮询（如0.5秒）
+    heartbeat_monitor_interval: float = 1.0
     archive_after_days: int = 3
     auto_start_pending_tasks: bool = False
     default_heartbeat_timeout: int = 600  # 事务默认心跳超时时间（秒）
@@ -2912,6 +3109,8 @@ class PengConfig(BaseModel):
 
         return cls(
             paths=PathsConfig(**data.get("paths", {})),
+            monitor=MonitorConfig(**data.get("monitor", {})),
+            process=ProcessConfig(**data.get("process", {})),
             llm=LLMConfig(**PengConfig._parse_llm_config(data.get("llm", {}))),
             display=DisplayConfig(**data.get("display", {})),
             parallel=ParallelConfig(**data.get("parallel", {})),
@@ -3076,12 +3275,9 @@ def load_config(config_path: Path | None = None) -> PengConfig:
     if config_path in _config_cache:
         cached_config, cached_main_mtime, cached_related_mtimes = _config_cache[config_path]
         if main_mtime == cached_main_mtime:
-            # 检查相关文件的 mtime
-            related_unchanged = True
-            for file_path, mtime in current_related_mtimes.items():
-                if cached_related_mtimes.get(file_path) != mtime:
-                    related_unchanged = False
-                    break
+            # 检查相关文件的 mtime（双向对比：既检测修改/新增，也检测删除——
+            # 如 data/peng.json 覆盖层被删除后必须失效缓存，否则继续用旧配置）
+            related_unchanged = current_related_mtimes == cached_related_mtimes
 
             if related_unchanged:
                 # 所有文件均未变化，返回缓存
@@ -3332,9 +3528,7 @@ def get_master_name() -> str:
     except Exception as e:
         import traceback
 
-        logger.error(
-            f"❌ get_master_name() - loader.py:1739: 异常 - {e}\n{traceback.format_exc()}"
-        )
+        logger.error(f"❌ get_master_name() - loader.py:1739: 异常 - {e}\n{traceback.format_exc()}")
         # 配置加载失败时返回默认值
         return "master"
 
@@ -3350,4 +3544,4 @@ def get_default_heartbeat_timeout() -> int:
         config = load_config()
         return config.monitor.default_heartbeat_timeout
     except Exception:
-        return 180
+        return 320

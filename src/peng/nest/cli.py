@@ -1967,6 +1967,50 @@ def _setup_nest_logging(name: str | None = None) -> None:
     logger.info(f"nest 日志系统已初始化: {log_file}")
 
 
+def _cleanup_stale_nest_locks(lock_file) -> None:
+    """清理持有进程已死亡的单实例锁文件（事务#1737）
+
+    OS 级文件锁会随进程死亡自动释放，但锁文件本身会残留。
+    残留锁文件记录的持有 PID 已死亡时，该文件是纯垃圾——
+    删除以免干扰启动诊断（epyc 事故中残留锁导致新实例无法启动）。
+
+    安全性: 仅当锁文件内记录的 PID 已确认死亡时才删除；
+    PID 存活（含复用场景）或无法判定时保留，绝不影响活实例的互斥。
+    """
+    try:
+        pid_txt = lock_file.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return
+    if not pid_txt.isdigit():
+        return  # 空/异常内容无法判定持有者，保守保留
+    pid = int(pid_txt)
+    alive = False
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if handle:
+                alive = True
+                ctypes.windll.kernel32.CloseHandle(handle)
+        else:
+            os.kill(pid, 0)
+            alive = True
+    except (OSError, ValueError, AttributeError):
+        alive = False
+    if not alive:
+        try:
+            lock_file.unlink(missing_ok=True)
+            _safe_print(
+                f"[Nest] 已清理陈旧锁文件: {lock_file.name} (持有PID {pid} 已死亡)"
+            )
+        except OSError:
+            pass
+
+
 def _ensure_single_instance(name: str, host: str, port: int) -> bool:
     """确保只有一个同参数的 nest 实例在运行（不同参数允许共存）
 
@@ -2003,6 +2047,11 @@ def _ensure_single_instance(name: str, host: str, port: int) -> bool:
 
     from peng.common.paths import ensure_dir_with_owner
     ensure_dir_with_owner(lock_file.parent)
+
+    # 🔧 事务#1737: 清理陈旧锁文件——进程被强杀/崩溃后 OS 锁自动释放，
+    # 但残留的锁文件会干扰启动诊断（本次 epyc 事故中残留锁导致新实例
+    # 无法启动、restart 三次失败）。持有 PID 已死亡的锁文件直接清理。
+    _cleanup_stale_nest_locks(lock_file)
 
     # 尝试获取排他锁（非阻塞）
     try:

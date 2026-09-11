@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -261,11 +262,20 @@ async def _try_connect_and_execute(command: str, args: list[str], host: str, por
     
     try:
         # 发送 CLI 命令请求
+        # 附带 PENG_CLI_* 前缀的客户端标记环境变量（如无参数模式的 PENG_CLI_NOARGS），
+        # 远端 bridge 会合并到子进程环境，确保远端执行行为与客户端本地一致
+        cli_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k.startswith("PENG_CLI_")
+        }
         request = {
             "type": "cli_command",
             "command": command,
             "args": args,
         }
+        if cli_env:
+            request["env"] = cli_env
         await ws.send(json.dumps(request, ensure_ascii=True))
         
         # 流式接收响应：stream 消息实时打印，result/error 消息为最终结果

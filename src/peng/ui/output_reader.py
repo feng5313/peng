@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import traceback
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -63,6 +64,16 @@ class OutputReader:
         self._aligned_sizes: dict[int, int] = {}
         # 索引行数上限（防止超大文件索引无限膨胀）
         self.MAX_INDEX_LINES = 2_000_000
+        # 🔧 Task#1858：行索引并发保护锁 —— 根因修复！
+        # 翻页请求经 asyncio.to_thread 在线程池并发执行 _ensure_line_index，
+        # 多线程同时增量扫描同一 task 区间并交错 append → 索引重复/非单调
+        # （实测 task-1855 索引 19493 条 > 实际 17414 行，7114 处非单调），
+        # 后续 seek 直读取到乱序偏移读出 0 字节 → 前端误报"没有更旧的输出了" → 上翻卡死。
+        # 用 RLock（可重入）：read_line_range_indexed → _ensure_line_index 嵌套调用不死锁。
+        self._index_lock = threading.RLock()
+        # 已通过完整性校验的 task 集合（每个 task 终身只做一次 O(n) 校验，零持续开销；
+        # 任何重建/截断时移除，下次访问重新校验）
+        self._index_verified: set[int] = set()
 
         # 监控事务
         self._watch_task: asyncio.Task | None = None
@@ -354,6 +365,37 @@ class OutputReader:
             logger.warning(f"count_total_lines 失败: {file_path}, {e}")
             return 0
 
+    @staticmethod
+    def _task_id_from_path(file_path: Path) -> int | None:
+        """从输出文件名解析 task_id（task-{id}.out → id），失败返回 None。"""
+        name = file_path.name
+        if name.startswith("task-") and name.endswith(".out"):
+            try:
+                return int(name[5:-4])
+            except ValueError:
+                return None
+        return None
+
+    def line_no_at_byte(self, task_id: int, file_path: Path, byte_pos: int) -> int:
+        """返回 byte_pos 所在行的行号（1-based）。🔧 Fix #1751：O(log n) 索引二分。
+
+        替代 watch_loop 中"从文件头分块扫描计数换行符"的 O(file_size) 逻辑
+        （20MB文件每轮询26ms×每文件，长时间运行后输出文件增大导致增量推送
+        越来越慢）。行偏移索引由 _ensure_line_index 增量维护，此处只做二分。
+        """
+        try:
+            with self._index_lock:  # 🔧 Task#1858：与翻页扫描互斥，防止读到交错中的索引
+                self._ensure_line_index(task_id, file_path)
+                offsets = self._line_offsets.get(task_id)
+                if not offsets:
+                    return 0
+                # offsets[i] = 第 i+1 行起始偏移；bisect_right 得到 byte_pos 所在行号
+                import bisect
+                return bisect.bisect_right(offsets, byte_pos)
+        except Exception as e:
+            logger.warning(f"line_no_at_byte 失败: task={task_id}, pos={byte_pos}, {e}")
+            return 0
+
     # ==================== 🔧 Task#1725：O(1) 行偏移索引 ====================
 
     def _scan_line_offsets(self, file_path: Path, start_pos: int, end_pos: int, offsets: list[int], first_line_start: int | None = None) -> int | None:
@@ -386,6 +428,20 @@ class OutputReader:
                 pos += len(buf)
         return last_nl_end
 
+    def _reset_line_index(self, task_id: int) -> None:
+        """清空 task_id 行索引（下次访问时全扫重建）。
+
+        🔧 Task#1858 抽取公共重建逻辑。调用方须已持有 _index_lock。
+        """
+        offsets = self._line_offsets.get(task_id)
+        if offsets is None:
+            self._line_offsets[task_id] = [0]
+        else:
+            offsets.clear()
+            offsets.append(0)
+        self._aligned_sizes[task_id] = 0
+        self._index_verified.discard(task_id)
+
     def _ensure_line_index(self, task_id: int, file_path: Path) -> None:
         """确保 task_id 的行偏移索引与文件同步（增量维护，追加O(新字节)）。
 
@@ -395,44 +451,69 @@ class OutputReader:
           下次从原 aligned 重扫，未完成行完成后自然被正确记录）
         - 截断/清空：offsets 清空 + aligned 归零重建
         不变量：offsets 长度 == 文件中完整行数；offsets[i] == 第 i+1 行起始偏移。
+
+        🔧 Task#1858 并发安全（根因修复）：全程持 _index_lock（RLock，可重入）。
+        翻页/实时推送/订阅等路径经 asyncio.to_thread 在线程池并发进入，此前无任何
+        保护 → 多线程同时增量扫描同一 task 区间并交错 append → 索引重复/非单调
+        （实测 task-1855：索引 19493 条 > 实际 17414 行，7114 处非单调）→
+        read_line_range_indexed 取到乱序偏移读出 0 字节 → 前端误报
+        "没有更旧的输出了" → xterm 上翻卡死。
+        并加一次性完整性校验（单调性），发现历史/未知来源损坏立即重建自愈。
         """
-        try:
-            if not file_path.exists():
-                self._line_offsets.pop(task_id, None)
-                self._aligned_sizes.pop(task_id, None)
-                return
-            size = file_path.stat().st_size
-            offsets = self._line_offsets.get(task_id)
-            if offsets is None:
-                offsets = [0]  # 第1行起始偏移恒为0
-                self._line_offsets[task_id] = offsets
-                self._aligned_sizes[task_id] = 0
-            aligned = self._aligned_sizes.get(task_id, 0)
-            if size == 0:
-                offsets.clear()
-                self._aligned_sizes[task_id] = 0
-                return
-            if size < aligned:
-                # 文件被截断（清空输出/重启）→ 重建
-                offsets.clear()
-                offsets.append(0)
-                self._aligned_sizes[task_id] = 0
-                aligned = 0
-            if size == aligned:
-                return  # 无新增完整行
-            if not offsets:
-                offsets.append(0)  # 第1行起始
-            # 区间首行（起始于aligned）的起始偏移若尚未记录，交给scan在首行完成时补记
-            first_line_start = aligned if offsets[-1] < aligned else None
-            # 从对齐点增量扫描到当前文件尾
-            last_nl_end = self._scan_line_offsets(file_path, aligned, size, offsets, first_line_start)
-            self._cleanup_tail_sentinel(offsets, size)
-            # 对齐点推进到最后一个\n之后（该处可能是未完成行起始，下次从这重扫；
-            # 未完成行完成时由 first_line_start 机制补记其偏移）
-            if last_nl_end is not None:
-                self._aligned_sizes[task_id] = last_nl_end
-        except Exception as e:
-            logger.warning(f"_ensure_line_index 失败: task={task_id}, {file_path}, {e}")
+        with self._index_lock:
+            try:
+                if not file_path.exists():
+                    self._line_offsets.pop(task_id, None)
+                    self._aligned_sizes.pop(task_id, None)
+                    self._index_verified.discard(task_id)
+                    return
+                size = file_path.stat().st_size
+                offsets = self._line_offsets.get(task_id)
+                if offsets is None:
+                    offsets = [0]  # 第1行起始偏移恒为0
+                    self._line_offsets[task_id] = offsets
+                    self._aligned_sizes[task_id] = 0
+                aligned = self._aligned_sizes.get(task_id, 0)
+                if size == 0:
+                    offsets.clear()
+                    self._aligned_sizes[task_id] = 0
+                    self._index_verified.discard(task_id)
+                    return
+                if size < aligned:
+                    # 文件被截断（清空输出/重启）→ 重建
+                    logger.info(f"[Task#1858] 行索引截断重建: task={task_id}, aligned={aligned} > size={size}")
+                    self._reset_line_index(task_id)
+                    aligned = 0
+                    offsets = self._line_offsets[task_id]
+                # 🔧 Task#1858：一次性完整性校验 —— 非单调/首偏移非0 即为损坏
+                # （历史并发损坏或其他未知写入路径），立即重建自愈；
+                # 通过后标记 verified，同 task 终身不再重复 O(n) 校验（零持续开销）
+                if task_id not in self._index_verified:
+                    if (not offsets or offsets[0] != 0
+                            or any(offsets[i] >= offsets[i + 1] for i in range(len(offsets) - 1))):
+                        logger.warning(
+                            f"[Task#1858] 行索引损坏自愈: task={task_id}, len={len(offsets)} != 实际行数，"
+                            f"检测到非单调偏移，重建索引"
+                        )
+                        self._reset_line_index(task_id)
+                        aligned = 0
+                        offsets = self._line_offsets[task_id]
+                    self._index_verified.add(task_id)
+                if size == aligned:
+                    return  # 无新增完整行
+                if not offsets:
+                    offsets.append(0)  # 第1行起始
+                # 区间首行（起始于aligned）的起始偏移若尚未记录，交给scan在首行完成时补记
+                first_line_start = aligned if offsets[-1] < aligned else None
+                # 从对齐点增量扫描到当前文件尾
+                last_nl_end = self._scan_line_offsets(file_path, aligned, size, offsets, first_line_start)
+                self._cleanup_tail_sentinel(offsets, size)
+                # 对齐点推进到最后一个\n之后（该处可能是未完成行起始，下次从这重扫；
+                # 未完成行完成时由 first_line_start 机制补记其偏移）
+                if last_nl_end is not None:
+                    self._aligned_sizes[task_id] = last_nl_end
+            except Exception as e:
+                logger.warning(f"_ensure_line_index 失败: task={task_id}, {file_path}, {e}")
 
     @staticmethod
     def _cleanup_tail_sentinel(offsets: list[int], size: int) -> None:
@@ -444,12 +525,16 @@ class OutputReader:
             offsets.pop()
 
     def get_total_lines(self, task_id: int, file_path: Path) -> int:
-        """O(1) 获取文件总行数（基于增量维护的行偏移索引）。"""
+        """O(1) 获取文件总行数（基于增量维护的行偏移索引）。
+
+        🔧 Task#1858：全程持 _index_lock（RLock），确保 ensure+读取 的原子性。
+        """
         try:
-            if not file_path.exists():
-                return 0
-            self._ensure_line_index(task_id, file_path)
-            return len(self._line_offsets.get(task_id, []))
+            with self._index_lock:
+                if not file_path.exists():
+                    return 0
+                self._ensure_line_index(task_id, file_path)
+                return len(self._line_offsets.get(task_id, []))
         except Exception as e:
             logger.warning(f"get_total_lines 失败: task={task_id}, {e}")
             return 0
@@ -459,33 +544,47 @@ class OutputReader:
     ) -> list[str]:
         """按行号范围读取（seek直读，O(页大小)，行号1-based含两端）。
 
+        🔧 Task#1858 并发安全：偏移快照在 _index_lock 内获取，文件IO在锁外执行
+        （快照值不依赖索引生命周期）；应读到数据却返回空时视为索引损坏，
+        强制重建后重试一次（最后防线，正常情况下加锁后不会触发）。
+
         Returns: 行列表（每行带尾部\n，与文件原始行一致）
         """
         try:
             if not file_path.exists():
                 return []
-            self._ensure_line_index(task_id, file_path)
-            offsets = self._line_offsets.get(task_id)
-            if not offsets:
-                return []
-            n = len(offsets)
-            s = max(1, start_line)
-            e = min(n, end_line, s + max_lines - 1)
-            if s > e:
-                return []
-            start_off = offsets[s - 1]
-            if e < n:
-                end_off = offsets[e]  # 第e+1行起始 = 第e行结束
-            else:
-                end_off = file_path.stat().st_size
-            with open(file_path, "rb") as f:
-                f.seek(start_off)
-                data = f.read(max(0, end_off - start_off))
-            text = data.decode("utf-8", errors="replace")
-            lines = text.split("\n")
-            if lines and lines[-1] == "":
-                lines.pop()
-            return [line + "\n" for line in lines]
+            for attempt in (1, 2):  # 第2次 = 索引重建后的自愈重试
+                with self._index_lock:
+                    self._ensure_line_index(task_id, file_path)
+                    offsets = self._line_offsets.get(task_id)
+                    if not offsets:
+                        return []
+                    n = len(offsets)
+                    s = max(1, start_line)
+                    e = min(n, end_line, s + max_lines - 1)
+                    if s > e:
+                        return []  # 请求范围超出文件行数，合法空
+                    start_off = offsets[s - 1]
+                    end_off = offsets[e] if e < n else file_path.stat().st_size
+                # 文件读在锁外（start_off/end_off 是不可变快照）
+                with open(file_path, "rb") as f:
+                    f.seek(start_off)
+                    data = f.read(max(0, end_off - start_off))
+                text = data.decode("utf-8", errors="replace")
+                lines = text.split("\n")
+                if lines and lines[-1] == "":
+                    lines.pop()
+                result = [line + "\n" for line in lines]
+                # 应读到数据（s<=n）却为空 → 偏移乱序（索引损坏，如 end_off<=start_off）
+                if result or s > n:
+                    return result
+                logger.warning(
+                    f"[Task#1858] 行范围[{s},{e}]应读到数据却为空(off {start_off}->{end_off})，"
+                    f"重建索引重试(attempt={attempt}): task={task_id}"
+                )
+                with self._index_lock:
+                    self._reset_line_index(task_id)
+            return []
         except Exception as e:
             logger.warning(f"read_line_range_indexed 失败: task={task_id}, {e}")
             return []
@@ -568,7 +667,10 @@ class OutputReader:
                         hi = mid
                     else:
                         lo = line_start + 1
-            total_lines = self.count_total_lines(file_path)
+            # 🔧 Fix #1751：O(1) 索引取总行数（原 count_total_lines 全文件扫描）
+            tid = self._task_id_from_path(file_path)
+            total_lines = self.get_total_lines(tid, file_path) if tid is not None \
+                else self.count_total_lines(file_path)
             if match_pos is not None:
                 match_line_no = self._count_newlines_before(file_path, match_pos) + 1
                 return match_pos, match_line_no, total_lines
@@ -626,11 +728,26 @@ class OutputReader:
     def read_last_n_lines(self, file_path: Path, n: int) -> tuple[list[str], int, int]:
         """从文件末尾读取最后N行。
 
+        🔧 Fix #1751：O(1) 索引化 —— 原实现 count_total_lines 全扫 + deque 从头
+        迭代整个文件（20万行/31MB 实测 148ms，每次切换事务的首批订阅都执行），
+        是"长时间运行后切换事务输出加载延迟大"的直接来源之一。
+        现用行偏移索引（_ensure_line_index 增量维护）定位末 N 行 seek 直读。
+
         Returns: (lines, total_lines, start_line_no)
         """
         if not file_path.exists():
             return [], 0, 0
         try:
+            task_id = self._task_id_from_path(file_path)
+            if task_id is not None:
+                # 索引路径：O(1) 总行数 + O(页大小) seek 直读尾部
+                total = self.get_total_lines(task_id, file_path)
+                if total > 0:
+                    start = max(1, total - n + 1)
+                    tail = self.read_line_range_indexed(task_id, file_path, start, total)
+                    return tail, total, start
+                return [], 0, 0
+            # 兜底：非 task-{id}.out 命名 → 原逻辑
             total_lines = self.count_total_lines(file_path)
             if total_lines == 0:
                 return [], 0, 0
@@ -1067,18 +1184,12 @@ class OutputReader:
                     try:
                         def _read_new_lines(fp: Path, seek_pos: int) -> tuple[list[tuple[int, dict[str, Any]]], int]:
                             lines = []
+                            # 🔧 Fix #1751：行号改用行偏移索引二分 O(log n)。
+                            # 原逻辑从文件头分块扫描计数换行符 O(file_size)
+                            # （20MB文件26ms×每轮询×每文件，长时间运行后输出
+                            # 文件持续增大导致增量推送越来越慢）
+                            prev_line_count = self.line_no_at_byte(task_id, fp, seek_pos) - 1
                             with open(fp, "rb") as f:
-                                # 🚀 性能优化：分块二进制计数 seek_pos 之前的行数（C级速度）
-                                f.seek(0)
-                                prev_line_count = 0
-                                remaining = seek_pos
-                                while remaining > 0:
-                                    chunk_size = min(1024 * 1024, remaining)
-                                    chunk = f.read(chunk_size)
-                                    if not chunk:
-                                        break
-                                    prev_line_count += chunk.count(b"\n")
-                                    remaining -= len(chunk)
                                 # 定位到 seek_pos，读取后续新内容
                                 f.seek(seek_pos)
                                 remaining_bytes = f.read()

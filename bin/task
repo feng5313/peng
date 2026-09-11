@@ -20,9 +20,10 @@
     task up <ID>                提高优先级（递归提高子事务）
     task down <ID>              降低优先级（递归降低子事务）
     task delete <ID>            递归删除事务及其所有子事务
-    task kill <ID>              杀死指定事务的所有后台进程
-    task killall                杀死pid.json中记录的所有后台进程
-    task daemon                 显示所有已注册的后台进程
+    task kill <ID>              杀死指定事务的所有后台daemon进程
+    task kill -d <daemon_id>    杀死指定daemon id的后台进程（可多个-d）
+    task killall                杀死daemon.json中记录的所有后台daemon进程
+    task daemon                 显示所有已注册的后台daemon
     task retry <ID>             重试事务
     task recover                恢复中断的事务
     task start <ID>             启动待定事务

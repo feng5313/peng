@@ -924,6 +924,13 @@ async def _handle_cli_command(websocket, cli_msg):
         "CLICOLOR_FORCE": "1",
         "PYTHONUNBUFFERED": "1",
     })
+    # 合并客户端 CLI 标记环境变量（PENG_CLI_* 前缀，如无参数模式的 PENG_CLI_NOARGS），
+    # 使远端执行的 CLI 与客户端本地的行为一致
+    _cli_env = cli_msg.get("env")
+    if isinstance(_cli_env, dict):
+        for _k, _v in _cli_env.items():
+            if isinstance(_k, str) and _k.startswith("PENG_CLI_") and isinstance(_v, str):
+                _color_env[_k] = _v
     
     try:
         proc = await asyncio.create_subprocess_exec(

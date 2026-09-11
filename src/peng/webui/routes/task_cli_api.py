@@ -23,7 +23,12 @@ from pydantic import BaseModel
 
 from peng.task.manager import TaskManager
 from peng.task.info import parse_info_to_list_with_status, serialize_info_list
-from peng.common.pid_registry import kill_task_pids, cleanup_dead_pids, get_all_tasks
+from peng.common.daemon_registry import (
+    cleanup_dead_daemons,
+    kill_all_daemons_sync,
+    kill_task_daemons_sync,
+    list_daemons,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -552,11 +557,13 @@ async def delete_task(task_id: int, force: bool = False) -> dict[str, Any]:
 
 @router.post("/{task_id}/kill")
 async def kill_task(task_id: int) -> dict[str, Any]:
-    """杀死指定事务的所有后台进程"""
+    """杀死指定事务的所有后台daemon进程"""
     _get_task_or_404(task_id)
 
-    cleaned = cleanup_dead_pids(task_id)
-    result = kill_task_pids(task_id)
+    import asyncio
+
+    cleaned = await asyncio.to_thread(cleanup_dead_daemons)
+    result = await asyncio.to_thread(kill_task_daemons_sync, task_id)
 
     return {
         "cleaned": cleaned,
@@ -569,39 +576,31 @@ async def kill_task(task_id: int) -> dict[str, Any]:
 
 @router.post("/killall")
 async def kill_all_tasks() -> dict[str, Any]:
-    """杀死所有后台进程"""
-    cleaned = cleanup_dead_pids(None)
-    all_data = get_all_tasks()
+    """杀死所有后台daemon进程"""
+    import asyncio
 
-    total_killed = []
-    total_already_dead = []
-    total_errors = []
-
-    for task_id_str, pids in all_data.items():
-        tid = int(task_id_str)
-        result = kill_task_pids(tid)
-        total_killed.extend(result["killed"])
-        total_already_dead.extend(result["already_dead"])
-        total_errors.extend(result["errors"])
+    cleaned = await asyncio.to_thread(cleanup_dead_daemons)
+    result = await asyncio.to_thread(kill_all_daemons_sync)
 
     return {
         "cleaned": cleaned,
-        "killed": total_killed,
-        "already_dead": total_already_dead,
-        "errors": total_errors,
-        "total": len(total_killed) + len(total_already_dead) + len(total_errors),
-        "task_count": len(all_data),
+        "killed": result["killed"],
+        "already_dead": result["already_dead"],
+        "errors": result["errors"],
+        "total": len(result["killed"]) + len(result["already_dead"]) + len(result["errors"]),
+        "task_count": len({str(e.get("task_id") or "") for e in result["killed"] + result["already_dead"] + result["errors"]}),
     }
 
 
 @router.get("/daemon")
 async def get_daemon(nest: str | None = None) -> dict[str, Any]:
-    """显示所有已注册的后台进程
+    """显示所有已注册的后台daemon
 
     Args:
-        nest: 🔧 Task#72：按nest过滤（"local"=本地，其他=远程nest名称，None=全部）
+        nest: 按nest过滤（"local"=本地，其他=远程nest名称，None=全部）
     """
-    # 🔧 Task#72：确定nest过滤参数
+    import asyncio
+
     nest_filter = None
     if nest:
         if nest.lower() == "local":
@@ -609,35 +608,35 @@ async def get_daemon(nest: str | None = None) -> dict[str, Any]:
         else:
             nest_filter = nest
 
-    cleaned = cleanup_dead_pids(None)
-    all_data = get_all_tasks()
+    cleaned = await asyncio.to_thread(cleanup_dead_daemons)
+    all_data = await asyncio.to_thread(list_daemons)
 
     tm = _get_task_manager()
+    # 按task分组
+    task_groups: dict[str, list] = {}
+    for daemon_id, entry in all_data.items():
+        entry_nest = entry.get("nest")
+        # 按nest过滤
+        if nest_filter is None:
+            matched = True
+        elif nest_filter == "local":
+            matched = entry_nest is None
+        else:
+            matched = entry_nest == nest_filter
+        if matched:
+            task_groups.setdefault(str(entry.get("task_id") or ""), []).append(entry)
+
     tasks = []
-    for task_id_str, entries in all_data.items():
-        tid = int(task_id_str)
-        task = tm.get_task(tid)
-
-        # 🔧 Task#72：按nest过滤
-        filtered_entries = []
-        for entry in entries:
-            entry_nest = entry.get("nest")
-            if nest_filter is None:
-                filtered_entries.append(entry)
-            elif nest_filter == "local":
-                if entry_nest is None:
-                    filtered_entries.append(entry)
-            else:
-                if entry_nest == nest_filter:
-                    filtered_entries.append(entry)
-
-        if filtered_entries:
-            tasks.append({
-                "task_id": tid,
-                "pids": [e["pid"] for e in filtered_entries],
-                "entries": filtered_entries,  # 🔧 Task#72：返回完整的nest信息
-                "task": task,
-            })
+    for task_key, entries in task_groups.items():
+        task = None
+        if task_key:
+            task = tm.get_task(int(task_key))
+        tasks.append({
+            "task_id": int(task_key) if task_key else None,
+            "pids": [e["pid"] for e in entries],
+            "entries": entries,  # 完整daemon条目（含id/command/nest/log_file）
+            "task": task,
+        })
 
     return {
         "cleaned": cleaned,

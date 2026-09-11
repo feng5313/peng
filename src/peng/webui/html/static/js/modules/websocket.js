@@ -224,20 +224,25 @@ function handleWebSocketMessage(data) {
           let item;
           if (lineNoInField && parts.length >= 4) {
             // 新格式: {ts}\t{source}\t{lineNo}\t{content}
-            const inlineLineNo = parseInt(parts[2]);
+            // 🔧 Task#1725 v2：行号统一用后端物理行号(fileLineStart+i)，
+            // 行内行号与物理行号可能有恒定偏移（多次runner重启的历史文件）
             item = {
               timestamp: parts[0],
               source: parts[1],
               taskId: state.currentTaskId || 0,
               content: parts.slice(3).join('\t'),
             };
-            item.fileLineNo = (inlineLineNo > 0 ? inlineLineNo : fileLineStart + i);
+            item.fileLineNo = fileLineStart + i;
           } else if (parts.length >= 4) {
             // 旧格式: {ts}\t{source}\t{taskId}\t{content}
+            // 🔧 Fix #1751：防御 —— 混合格式文件交界批次（旧行占多数）中，
+            // 新格式行号会被误判为旧格式taskId；行号(≥100000)不可能是事务ID，兜底当前事务
+            var tid = parseInt(parts[2]) || 0;
+            if (tid > 100000) tid = state.currentTaskId || 0;
             item = {
               timestamp: parts[0],
               source: parts[1],
-              taskId: parseInt(parts[2]) || 0,
+              taskId: tid,
               content: parts.slice(3).join('\t'),
             };
             item.fileLineNo = fileLineStart + i;
@@ -332,20 +337,28 @@ function handleWebSocketMessage(data) {
             state._totalLines = totalLines;
             state._appendCount = 0;
             if (history.length > 0) {
-              // 🔧 Fix Task#1008：防重复 —— 使用 fileLineNo 去重
-              const existingMaxLineNo = history.length > 0
-                ? (history[history.length - 1].fileLineNo || 0)
-                : 0;
-              const existingNewestTs = history[history.length - 1].timestamp;
-              const newOutputs = parsedOutputs.filter(o => {
-                if (o.fileLineNo && existingMaxLineNo > 0) {
-                  return o.fileLineNo > existingMaxLineNo;
-                }
-                return o.timestamp > existingNewestTs;
-              });
-              if (newOutputs.length > 0) {
-                history.push(...newOutputs);
+              // 🔧 Task#1725 致命修复：首批必须与已到的实时行【按行号合并】，绝不能丢弃！
+              // 旧逻辑"只保留fileLineNo>已有最大行号"会把整个首批丢掉——
+              // 实时行先到(如115586~115624)时，首批[115125~115624]全被过滤 →
+              // 缓存稀疏只剩实时行 → renderPageRange按页范围渲染大面积缺行
+              // → 半黑（部分缺行）/全黑（范围全缺）。这正是"正在输出时翻页变黑"的根因！
+              const existingByLn = new Map();
+              for (const h of history) {
+                if (h.fileLineNo != null) existingByLn.set(h.fileLineNo, h);
               }
+              const merged = [];
+              for (const o of parsedOutputs) {
+                // 首批为权威数据：重复行号以首批为准，跳过已有
+                if (o.fileLineNo != null && existingByLn.has(o.fileLineNo)) continue;
+                merged.push(o);
+              }
+              // 保留实时行中超出首批范围的新行（首批读取期间/之后新产生的）
+              const batchMaxLn = parsedOutputs.length > 0
+                ? (parsedOutputs[parsedOutputs.length - 1].fileLineNo || 0) : 0;
+              const tailRealtime = history.filter(h =>
+                h.fileLineNo != null && h.fileLineNo > batchMaxLn);
+              history.length = 0;
+              history.push(...merged, ...tailRealtime);
             } else {
               history.push(...parsedOutputs);
             }
@@ -498,20 +511,25 @@ function handlePageRangeBatch(data, totalLines, fileLineStart, fileLineEnd, hasM
     let item;
     if (lineNoInField && parts.length >= 4) {
       // 🔧 新格式: {ts}\t{source}\t{lineNo}\t{content} —— 第3字段是行号，taskId归属订阅事务
-      const fileLineNo = parseInt(parts[2]);
+      // 🔧 Task#1725 v2：行号统一用后端物理行号(fileLineStart+i)！
+      // 行内行号在经历过多次runner重启的文件里与物理行号有恒定偏移（如差4），
+      // 用它会让缓存行号与索引/翻页体系错位→缺行黑屏
       item = {
         timestamp: parts[0],
         source: parts[1],
         taskId: curTaskId || 0,
-        fileLineNo: (fileLineNo > 0 ? fileLineNo : fileLineStart + i),
+        fileLineNo: fileLineStart + i,
         content: parts.slice(3).join('\t'),
       };
     } else if (parts.length >= 4) {
       // 旧格式: {ts}\t{source}\t{taskId}\t{content} —— 行号用后端物理行号
+      // 🔧 Fix #1751：防御 —— 行号(≥100000)不可能是事务ID，兜底当前事务
+      var tid = parseInt(parts[2]) || 0;
+      if (tid > 100000) tid = curTaskId || 0;
       item = {
         timestamp: parts[0],
         source: parts[1],
-        taskId: parseInt(parts[2]) || 0,
+        taskId: tid,
         fileLineNo: fileLineStart + i,
         content: parts.slice(3).join('\t'),
       };
@@ -544,8 +562,12 @@ function handlePageRangeBatch(data, totalLines, fileLineStart, fileLineEnd, hasM
   //   会永不渲染，_loadingPage 挂到超时 → "经常加载超时"）
   if (pending) {
     state._loadingPage = null;
+    // 🔧 Task#1725：渲染后端实际返回的行范围（权威数据完整）。
+    // 旧逻辑 renderEnd=max(pending.end, fileLineEnd)：文件头夹紧时
+    // fileLineEnd<pending.end，渲染[pending.start, pending.end]里
+    // [fileLineEnd+1, pending.end]不存在 → 尾部缺行=半黑。
     const renderStart = Math.min(pending.start, fileLineStart || pending.start);
-    const renderEnd = Math.max(pending.end, fileLineEnd || pending.end);
+    const renderEnd = Math.min(pending.end, fileLineEnd || pending.end);
     renderPageRange(renderStart, renderEnd);
     var pi = getPageInfo(renderStart);
     if (pi) showSimpleToast('📄 第' + pi.page + '/' + pi.totalPages + '页', 'info');

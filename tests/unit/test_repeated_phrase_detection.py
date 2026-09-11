@@ -169,3 +169,72 @@ class TestRepeatedPhraseConfig:
 
         cfg = json.load(open("config/peng.json", encoding="utf-8"))
         assert cfg["llm"]["repeated_phrase_maxlen"] == 256
+
+
+class TestT1739CodeOutputNotDetected:
+    """#1739回归：C代码/格式串输出的合法重复 → 短语检测不得误报
+
+    风主明确指示：符号字母数字混合的不算单词/短语。unit资格收紧为：
+    首字符必须是字母或CJK，且含≥3个连续ASCII字母或含CJK字符。
+    """
+
+    @staticmethod
+    def _fprintf_snippet() -> str:
+        """构造#1739误报场景：bezier导出的fprintf格式串（占位符×6）"""
+        frag = ",%.4f"
+        return (
+            'fprintf(fp, "%s    {\\"i\\":%zu,\\"kind\\":\\"%s\\",\\"bez\\":[",'
+            "\n                i ? \",\\n\" : \"\", i, k" + frag * 6 + ");\n"
+        )
+
+    def test_fprintf_format_string_not_detected(self):
+        """C格式串占位符连续重复 → 不检出（thinking阈值）"""
+        state = {}
+        text = self._fprintf_snippet()
+        assert ToolExecutionEngine._scan_repeated_phrases(text, state, 10, 256) is False
+
+    def test_fprintf_format_string_streaming_not_detected(self):
+        """C格式串占位符流式输出 → 不检出"""
+        full = self._fprintf_snippet()
+        for step in (7, 23, 51):
+            state = {}
+            detected = False
+            for i in range(0, len(full), step):
+                if ToolExecutionEngine._scan_repeated_phrases(
+                    full[i : i + step], state, 10, 256
+                ):
+                    detected = True
+                    break
+            assert detected is False, f"chunk={step} 格式串仍误报"
+
+    def test_symbol_anchored_units_rejected(self):
+        """以标点开头的候选unit（符号锚定片段）→ 不检出"""
+        state = {}
+        text = (",f" * 12)
+        assert ToolExecutionEngine._scan_repeated_phrases(text, state, 8, 256) is False
+        state = {}
+        text = (".4f," * 10)
+        assert ToolExecutionEngine._scan_repeated_phrases(text, state, 8, 256) is False
+
+    def test_short_letter_run_units_rejected(self):
+        """孤立短字母组合（十六进制对等，无≥3字母核心）→ 不检出"""
+        state = {}
+        text = (" ff") * 12
+        assert ToolExecutionEngine._scan_repeated_phrases(text, state, 8, 256) is False
+
+    def test_real_phrase_repetition_still_detected(self):
+        """真正自然语言短语复读 → 仍检出（不因收紧而漏检）"""
+        state = {}
+        phrase = "let me check the result now"
+        assert ToolExecutionEngine._scan_repeated_phrases(
+            (phrase + " ") * 10, state, 10, 256
+        ) is True
+
+    def test_short_word_phrase_repetition_still_detected(self):
+        """含短词的短语复读（风主强调不可漏）→ 仍检出"""
+        state = {}
+        phrase = "of course of course"
+        # "of course"含"course"≥3字母核心，且首字符'o'是字母
+        assert ToolExecutionEngine._scan_repeated_phrases(
+            (phrase + " ") * 10, state, 10, 256
+        ) is True

@@ -421,35 +421,27 @@ def _clear_all_data(force: bool) -> int:
 
     total_deleted = 0
 
-    # 0. 杀死所有已注册的后台进程（data/pid.json中记录的）
+    # 0. 杀死所有已注册的后台daemon进程（data/daemon.json中记录的）
     print()
-    print("🔪 正在清理后台进程...")
+    print("🔪 正在清理后台daemon进程...")
     try:
-        from peng.common.pid_registry import cleanup_dead_pids, kill_task_pids, get_all_tasks
+        import peng.common.daemon_registry as dr
 
-        # 先清理已退出的进程记录
-        cleanup_dead_pids(None)
+        # 先清理已退出的daemon记录
+        dr.cleanup_dead_daemons()
 
-        # 获取所有已注册的后台进程并杀死
-        all_data = get_all_tasks()
-        if all_data:
-            total_killed = 0
-            total_errors = 0
-            for task_id_str in list(all_data.keys()):
-                task_id = int(task_id_str)
-                result = kill_task_pids(task_id)
-                total_killed += len(result["killed"]) + len(result["already_dead"])
-                total_errors += len(result["errors"])
-            if total_killed > 0:
-                print(f"  ✅ 已清理 {total_killed} 个后台进程")
-            if total_errors > 0:
-                print(f"  ⚠️  {total_errors} 个进程清理失败", file=sys.stderr)
-            if total_killed == 0 and total_errors == 0:
-                print(f"  ℹ️  没有已注册的后台进程")
-        else:
-            print(f"  ℹ️  没有已注册的后台进程")
+        # 杀死所有daemon
+        result = dr.kill_all_daemons_sync()
+        total_killed = len(result["killed"]) + len(result["already_dead"])
+        total_errors = len(result["errors"])
+        if total_killed > 0:
+            print(f"  ✅ 已清理 {total_killed} 个后台daemon")
+        if total_errors > 0:
+            print(f"  ⚠️  {total_errors} 个daemon清理失败", file=sys.stderr)
+        if total_killed == 0 and total_errors == 0:
+            print(f"  ℹ️  没有已注册的后台daemon")
     except Exception as e:
-        print(f"  ⚠️  清理后台进程失败（可忽略）: {e}", file=sys.stderr)
+        print(f"  ⚠️  清理后台daemon失败（可忽略）: {e}", file=sys.stderr)
 
     # 1. 终止所有其他数据库连接（在清空数据库之前）
     #    Web 服务等进程可能持有表锁，导致 DROP TABLE 被阻塞。

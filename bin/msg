@@ -110,6 +110,9 @@ _first_arg = _clean_args[0] if _clean_args else None
 if _first_arg is None:
     _clean_args = ["trees"]
     _first_arg = "trees"
+    # 标记无参数模式：impl 在输出末尾打印 provider 用量/费用页脚
+    # （远程模式下该标记经 cli_command 的 env 字段转发到远端，见 peng/cli/remote.py）
+    os.environ["PENG_CLI_NOARGS"] = "1"
 
 _needs_defaults = _first_arg in _msg_subcommands_needing_defaults or (
     _first_arg is not None

@@ -823,14 +823,41 @@ def _detect_line_no_in_field(batch_lines: list[str], file_line_start: int) -> bo
     """检测批次行是否为新格式（第3字段=行号）。
 
     🔧 Task#1725：新格式 {ts}\t{source}\t{lineNo}\t{content} 的行内行号 == 物理行号。
-    取批次首行验证：parts[2] == str(该行物理行号) → 新格式。
-    旧格式第3字段是固定task_id，不会恰好等于物理行号。
+    🔧 Task#1725 v2：严格递增判定（对历史行号偏移免疫）。
+    1694.out等经历过多次runner重启的文件，行内行号与物理行号存在恒定偏移
+    （如差4），旧判定 parts[2]==str(物理行号) 会误判False→前端按旧格式解析
+    →taskId=行号→Task#1435丢弃首批→缓存稀疏→翻页半黑/全黑。
+    新判定：批次内第3字段严格递增1（首尾差==行数-1）→ 行号（新格式）；
+    旧格式第3字段是固定task_id（恒定不变），两种模式互斥、判定稳健。
+
+    🔧 Fix #1751：差值众数判定 —— 多进程并发写（webui服务与fly service
+    各自持有内存计数器漂移）会在文件中产生交错的行号跳变行（实测task-2.out
+    物理行137451行号却是95387）。跳变行打破"严格递增1"导致整批判定为旧格式
+    → 前端按行号解析taskId → 缓存错key → 切换事务不渲染/翻页黑屏。
+    新算法：diffs = 第3字段 - 物理行号(file_line_start+i)，取众数，
+    众数占比≥75% 即判定新格式（容忍少数跳变行）。
     """
     if not batch_lines or file_line_start <= 0:
         return False
-    first = batch_lines[0].rstrip("\n")
-    parts = first.split("\t", 3)
-    return len(parts) >= 4 and parts[2] == str(file_line_start)
+    diffs: list[int] = []
+    for i, bl in enumerate(batch_lines[:20]):  # 采样前20行足够
+        parts = bl.rstrip("\n").split("\t", 3)
+        if len(parts) < 4:
+            return False
+        try:
+            nums_i = int(parts[2])
+        except ValueError:
+            return False
+        diffs.append(nums_i - (file_line_start + i))
+    if len(diffs) < 2:
+        return False
+    if len(set(diffs)) == 1:
+        # 恒定偏移或0（新格式行号==物理行号）
+        return True
+    # 差值众数（Counter.most_common），容忍少数跳变行
+    from collections import Counter
+    most_cnt = Counter(diffs).most_common(1)[0][1]
+    return most_cnt / len(diffs) >= 0.75
 
 
 async def _send_history_output_async(

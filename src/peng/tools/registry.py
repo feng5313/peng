@@ -478,13 +478,13 @@ class ToolRegistry(metaclass=MetaSingleton):
         """
         加载所有内置工具
 
-        包括: read, write, edit, bash, glob, grep, websearch, webfetch,
+        包括: read, write, edit, bash, daemon, glob, grep, websearch, webfetch,
               lsp, goto_definition, find_references,
               message, task, skill, info
         """
         if self._tools:
             return
-        from peng.tools.bash import BashTool
+        from peng.tools.bash import BashTool, DaemonTool
         from peng.tools.file import EditTool, LineEditTool, ReadTool, WriteTool
         from peng.tools.glob import GlobTool
         from peng.tools.grep import GrepTool
@@ -502,6 +502,7 @@ class ToolRegistry(metaclass=MetaSingleton):
         self.register(LineEditTool())
         # 命令执行
         self.register(BashTool())
+        self.register(DaemonTool())
         # 搜索
         self.register(GlobTool())
         self.register(GrepTool())

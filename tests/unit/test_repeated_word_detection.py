@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""事务#1653：重复词语无效输出检测误报修复的单元测试
+"""重复词语无效输出检测误报修复的单元测试
 
-背景（#7826误报场景）：技术分析文本中含大量"字母+数字"标识符序列：
+背景1（#1653，#7826误报场景）：技术分析文本中含大量"字母+数字"标识符序列：
 "c0=0-15, c1=16-31, c2=32-47, c3=48-63, c4=64-79, c5"
 原 _scan_repeated_words 分词只取连续ASCII字母，数字被当分隔符丢弃，
 c0/c1/c2/c3/c4/c5 全部切成 "c" → 6个连续相同token → 误判"重复词语无效
 输出" → 正常思考内容被丢弃最后2行。
 
-修复：英文token改为"连续ASCII字母+数字混合序列"（c0/x1/rgb8整体）。
-数字变化的标识符（c0,c1,c2...）token各不相同不再误报；
-完全相同标识符复读（c0 c0 c0...）仍可检出。
+背景2（#1739，C格式串误报场景）：LLM输出C代码 fprintf 格式串时，
+浮点占位符片段（%.4f→token"4f"）连续重复6次达到阈值，混合token被当作
+"单词"计数 → 正常代码输出被丢弃。风主明确指示：符号字母数字混合的
+不算单词！
+
+最终修复：含数字的字母数字混合token（c0/0xff/"4f"等）视为"其他内容"
+打断重复链、绝不计数；纯字母token（含单/短词 of/of/of）全部计数。
+中文/CJK检测逻辑不变。
 """
 
 import sys
@@ -164,17 +169,20 @@ def test_single_letter_repetition_detected():
     assert scan_words("c c c c c c c c", state) is True
 
 
-def test_alnum_identifier_repetition_detected():
-    """字母数字混合标识符复读（修复后新增能力） → 检出"""
+def test_alnum_identifier_repetition_not_detected():
+    """字母数字混合标识符复读（#1739修复） → 不检出（不算单词）
+
+    风主明确指示：符号字母数字混合的不算单词。混合token在代码输出中
+    高频合法重复（函数实参表、格式串等），不参与计数且打断重复链。
+    """
     state = {}
-    # 末尾带空格终结最后一个token
-    assert scan_words("c0 c0 c0 c0 c0 c0 ", state) is True
+    assert scan_words("c0 c0 c0 c0 c0 c0 ", state) is False
     state = {}
-    assert scan_words("x1 x1 x1 x1 x1 x1\n", state) is True
+    assert scan_words("x1 x1 x1 x1 x1 x1\n", state) is False
 
 
-def test_alnum_repetition_streaming_detected():
-    """字母数字标识符复读·流式跨chunk → 检出"""
+def test_alnum_repetition_streaming_not_detected():
+    """字母数字标识符复读·流式跨chunk → 不检出（#1739修复）"""
     full = "c0 c0 c0 c0 c0 c0 c0 "
     for step in (3, 10, 33):
         state = {}
@@ -183,7 +191,7 @@ def test_alnum_repetition_streaming_detected():
             if scan_words(full[i : i + step], state):
                 detected = True
                 break
-        assert detected is True, f"chunk={step} 流式漏检"
+        assert detected is False, f"chunk={step} 混合token仍误报"
 
 
 def test_cjk_single_char_repetition_detected():
@@ -236,14 +244,109 @@ def test_pending_tail_carries_across_chunks():
         if scan_words(ch, state):
             detected = True
     assert detected is True
-    # 纯数字+字母混合token跨chunk
+    # 纯字母token跨chunk后检出不变；混合token（#1739）跨chunk不计数
     state = {}
     chunks = ["ab", "c123 abc123 abc123 abc123 abc123 abc123 "]
     detected = False
     for ch in chunks:
         if scan_words(ch, state):
             detected = True
-    assert detected is True
+    assert detected is False
+
+
+# ==================== #1739 误报回归（C代码/格式串输出） ====================
+
+
+def _fprintf_format_string() -> str:
+    """构造#1739误报场景：C的fprintf浮点占位符格式串（bezier导出代码）"""
+    frag = ",%.4f"  # 占位符片段：百分号+点+数字f → token"4f"
+    return (
+        'fprintf(fp, "%s    {\\"i\\":%zu,\\"bez\\":["\n'
+        "                i ? \",\\n\" : \"\", i" + frag * 6 + ");\n"
+    )
+
+
+def test_fprintf_format_string_not_detected():
+    """#1739核心场景：C格式串浮点占位符连续重复 → 不检出"""
+    state = {}
+    assert scan_words(_fprintf_format_string(), state) is False
+
+
+def test_fprintf_format_string_streaming_not_detected():
+    """#1739核心场景·流式：格式串跨chunk输出 → 不检出"""
+    full = _fprintf_format_string()
+    for step in (5, 17, 64):
+        state = {}
+        detected = False
+        for i in range(0, len(full), step):
+            if scan_words(full[i : i + step], state):
+                detected = True
+                break
+        assert detected is False, f"chunk={step} 格式串仍误报"
+
+
+def test_code_output_with_hex_and_indices_not_detected():
+    """十六进制字面量/数组下标等混合token高频重复的代码输出 → 不检出"""
+    pairs = " ".join(f"0xff" for _ in range(10))
+    state = {}
+    assert scan_words(pairs, state) is False
+    state = {}
+    assert scan_words(" ".join(f"v[{i % 3}]" for i in range(30)), state) is False
+
+
+def test_mixed_token_breaks_word_chain():
+    """混合token打断重复链：实词复读被数字常量隔开 → 不检出
+
+    与#1688纯数字打断语义一致：代码中变量名复读夹数字常量是合法内容。
+    """
+    state = {}
+    assert scan_words("drive drive drive 0.033 drive drive drive ", state) is False
+
+
+def test_short_word_repetition_still_detected():
+    """风主强调：短词（of/of/of、a/a/a...）复读必须检出，不可漏"""
+    state = {}
+    assert scan_words("of of of of of of ", state) is True
+    state = {}
+    assert scan_words("a a a a a a a ", state) is True
+    state = {}
+    assert scan_words("is is is is is is ", state) is True
+
+
+def test_cjk_phrase_streaming_tiny_chunks_detected():
+    """中文词组复读·2字符恶劣流式切分 → 必须检出（#1739阶段2修复）
+
+    阶段2正则必须基于跨chunk累积缓冲：小chunk流式时每轮临时buf最多
+    约3个汉字，凑不齐threshold次词组重复长度，用临时buf会永远漏检。
+    """
+    text = "好的好的好的好的好的好的"
+    for step in (1, 2, 3, 5):
+        state = {}
+        detected = False
+        for i in range(0, len(text), step):
+            if scan_words(text[i : i + step], state):
+                detected = True
+                break
+        assert detected is True, f"chunk={step} 中文词组流式漏检"
+
+
+def test_cjk_single_char_streaming_tiny_chunks_detected():
+    """中文单字复读·小chunk流式 → 检出"""
+    text = "的的的的的的的的"
+    for step in (1, 2, 3):
+        state = {}
+        detected = False
+        for i in range(0, len(text), step):
+            if scan_words(text[i : i + step], state):
+                detected = True
+                break
+        assert detected is True, f"chunk={step} 中文单字流式漏检"
+
+
+def test_cplusplus_token_repetition_still_detected():
+    """纯字母token夹符号（c++/c++/...）仍检出（token"c"纯字母）"""
+    state = {}
+    assert scan_words("c++ c++ c++ c++ c++ c++ c++", state) is True
 
 
 if __name__ == "__main__":

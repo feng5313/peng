@@ -147,7 +147,6 @@ def _mock_task_manager(context: str, checklist: str) -> MagicMock:
 
 
 class TestHistoryHasChanges:
-    @patch.dict("sys.modules", {"peng.task.manager": None})
     def test_no_changes(self, history_repo, monkeypatch):
         """当前 db 与备份 commit 一致 → False"""
         ctx = _ctx([{"role": "user", "content": "a"}])
@@ -156,7 +155,6 @@ class TestHistoryHasChanges:
         monkeypatch.setitem(__import__("sys").modules, "peng.task.manager", fake_mod)
         assert HistoryBackupManager.has_changes(998001, commit) is False
 
-    @patch.dict("sys.modules", {"peng.task.manager": None})
     def test_stats_only_change_is_no_change(self, history_repo, monkeypatch):
         """当前 db 仅统计字段不同（messages相同）→ False（关键用例）"""
         backup_ctx = _ctx([{"role": "user", "content": "a"}], tokens=100)
@@ -166,7 +164,6 @@ class TestHistoryHasChanges:
         monkeypatch.setitem(__import__("sys").modules, "peng.task.manager", fake_mod)
         assert HistoryBackupManager.has_changes(998001, commit) is False
 
-    @patch.dict("sys.modules", {"peng.task.manager": None})
     def test_message_change_detected(self, history_repo, monkeypatch):
         ctx1 = _ctx([{"role": "user", "content": "a"}])
         commit = HistoryBackupManager.backup(998001, ctx1, "l", "cl")
@@ -175,7 +172,6 @@ class TestHistoryHasChanges:
         monkeypatch.setitem(__import__("sys").modules, "peng.task.manager", fake_mod)
         assert HistoryBackupManager.has_changes(998001, commit) is True
 
-    @patch.dict("sys.modules", {"peng.task.manager": None})
     def test_checklist_change_detected(self, history_repo, monkeypatch):
         ctx = _ctx([{"role": "user", "content": "a"}])
         commit = HistoryBackupManager.backup(998001, ctx, "l", "old")

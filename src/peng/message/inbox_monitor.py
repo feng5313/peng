@@ -207,9 +207,9 @@ class InboxMonitor:
                     receiver = msg.get("receiver")
                     content = msg.get("content")
                     if receiver == AGENT_NAME:
-                        content = f"\n{ANSI_COLORS['blue']}{ANSI_COLORS['bold']}{sender} ：{ANSI_COLORS['green']}{content}{ANSI_COLORS['reset']}\n"
+                        content = f"{ANSI_COLORS['blue']}{ANSI_COLORS['bold']}{sender} ：{ANSI_COLORS['green']}{content}{ANSI_COLORS['reset']}\n"
                     else:
-                        content = f"\n{ANSI_COLORS['green']}{ANSI_COLORS['bold']}{sender} ：{ANSI_COLORS['blue']}{content}{ANSI_COLORS['reset']}\n"
+                        content = f"{ANSI_COLORS['green']}{ANSI_COLORS['bold']}{sender} ：{ANSI_COLORS['blue']}{content}{ANSI_COLORS['reset']}\n"
                     # 把无主回复消息转为根消息
                     if msg_id:
                         try:

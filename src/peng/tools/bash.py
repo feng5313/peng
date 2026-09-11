@@ -34,6 +34,7 @@ from typing import Any
 from peng.common.colors import get_bash_colors
 from peng.common.paths import *
 from peng.nest.protocol import NestError
+from peng.task.info import is_urgent_content
 from peng.tools.base import DualOutput, Tool, ToolError
 from peng.common.truncation import truncate_output
 
@@ -169,6 +170,8 @@ class BashTool(Tool):
 调用的命令必须有持续stdout/stderr输出，如果长时间（3分钟）无输出会被认定为卡死，导致心跳超时强制结束！
 如果无法保证命令进程有持续stdout/stderr输出，也应该定时检测命令进程CPU占用，确认运行正常，以免心跳超时强制结束！
 ⚠️ 运行命令必须说明目的（purpose参数），要简明扼要（4-200个字符），否则将被拒绝执行！
+内置命令 stop：停止daemon工具启动的后台进程。用法： stop <daemon_id>（可多个id）或 stop all 清理全部。
+  长时间运行的命令建议改用daemon工具（非阻塞后台运行）。
 """
 
     @property
@@ -179,7 +182,7 @@ class BashTool(Tool):
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": f"要执行的shell命令（当前平台: {platform_name}）",
+                    "description": f"要执行的shell命令（当前平台: {platform_name}）。stop <daemon_id> 为停止daemon的内置命令",
                 },
                 "purpose": {
                     "type": "string",
@@ -225,8 +228,19 @@ class BashTool(Tool):
         except Exception:
             pass
 
-    async def _interrupt_monitor(self, task_manager, task_id, message_id):
+    async def _interrupt_monitor(
+        self, task_manager, task_id, message_id, check_all: bool = False
+    ):
         """中断监控协程：定期检查事务状态/info/根消息回复/Ctrl+C
+
+        Args:
+            task_manager: 事务管理器
+            task_id: 当前事务ID
+            message_id: 当前根消息ID
+            check_all: 是否检查全部中断条件（含sleep的命令为True，保持原有行为：
+                任何未读info/任何新回复都打断）；其他命令为False，仅检查
+                事务状态变更 + 感叹号开头的紧急未读info/新回复（事务#1860），
+                普通消息/info不打断命令（与思考流打断策略一致）
 
         Returns:
             中断原因字符串，None表示未中断
@@ -237,8 +251,9 @@ class BashTool(Tool):
         while True:
             await asyncio.sleep(check_interval)
 
-            # 条件1: 事务状态不再是 running/accepting
-            # 覆盖 cancel_task/pause_task/restart_task/resume_task 所有场景
+            # 条件1: 事务状态不再是 running/accepting（所有启用监控的命令都检查：
+            # cancel/pause等系统级控制操作必须立即响应，覆盖所有场景）
+            task = None
             if task_manager and task_id:
                 try:
                     task = task_manager.db.get_task(task_id)
@@ -250,33 +265,103 @@ class BashTool(Tool):
                 except Exception as e:
                     logger.debug(f"[interrupt_monitor] 检查事务状态失败: {e}")
 
-                # 条件2: info字段有未读信息
+                # 条件2: info字段检查
+                # check_all（含sleep命令，原有行为）：任何未读info都打断
+                # 否则（事务#1860）：仅感叹号开头的紧急未读info打断
                 try:
-                    info_field = task.get("info", "[]") or "[]"
+                    if task is None:
+                        info_field = "[]"
+                    else:
+                        info_field = task.get("info", "[]") or "[]"
                     from peng.task.info import parse_info_to_list_with_status, get_unread_info_items
 
                     info_list = parse_info_to_list_with_status(info_field)
                     unread_items = get_unread_info_items(info_list)
-                    if unread_items:
-                        # 收集未读info内容
-                        info_contents = [item["content"] for item in unread_items]
-                        info_text = "\n".join(f"  - {c}" for c in info_contents)
-                        return f"收到info注入信息，命令已终止。请立刻处理：\n{info_text}"
+                    if check_all:
+                        if unread_items:
+                            # 收集未读info内容
+                            info_contents = [item["content"] for item in unread_items]
+                            info_text = "\n".join(f"  - {c}" for c in info_contents)
+                            return f"收到info注入信息，命令已终止。请立刻处理：\n{info_text}"
+                    else:
+                        for item in unread_items:
+                            if is_urgent_content(item.get("content")):
+                                content = (item.get("content") or "").replace("\\n", "\n")
+                                return (
+                                    "收到感叹号开头的紧急info，命令已终止。请立刻处理：\n"
+                                    f"  - {content.strip()[:200]}"
+                                )
                 except Exception as e:
                     logger.debug(f"[interrupt_monitor] 检查info字段失败: {e}")
 
             # 条件3: 根消息有新回复
             if message_id:
-                try:
-                    from peng.message.database import MessageDatabase
+                if check_all:
+                    # 原有行为：回复计数增加即打断
+                    try:
+                        from peng.message.database import MessageDatabase
 
-                    msg_db = MessageDatabase()
-                    reply_count = msg_db.get_reply_count(message_id)
-                    if _last_known_reply_count >= 0 and reply_count > _last_known_reply_count:
-                        return f"根消息#{message_id}收到新回复（当前{reply_count}条），命令已终止。请立刻用message工具查看并处理。"
-                    _last_known_reply_count = reply_count
-                except Exception as e:
-                    logger.debug(f"[interrupt_monitor] 检查消息回复失败: {e}")
+                        msg_db = MessageDatabase()
+                        reply_count = msg_db.get_reply_count(message_id)
+                        if _last_known_reply_count >= 0 and reply_count > _last_known_reply_count:
+                            return f"根消息#{message_id}收到新回复（当前{reply_count}条），命令已终止。请立刻用message工具查看并处理。"
+                        _last_known_reply_count = reply_count
+                    except Exception as e:
+                        logger.debug(f"[interrupt_monitor] 检查消息回复失败: {e}")
+                else:
+                    # 事务#1860：仅感叹号开头的紧急processing回复打断
+                    # （processing=未处理待注入，与 tool_engine._get_processing_messages
+                    #  消费语义一致，处理后标记done不会重复触发）
+                    try:
+                        from peng.config import get_agent_name
+                        from peng.message.database import MessageDatabase
+
+                        msg_db = MessageDatabase()
+                        replies = msg_db.get_processing_replies(
+                            message_id, receiver=get_agent_name()
+                        )
+                        for reply in replies:
+                            if is_urgent_content(reply.get("content")):
+                                content = (reply.get("content") or "").replace("\\n", "\n")
+                                return (
+                                    f"根消息#{message_id}收到感叹号开头的紧急消息"
+                                    f"#{reply.get('id')} [{reply.get('sender')}]，"
+                                    f"命令已终止。请立刻处理：{content.strip()[:200]}"
+                                )
+                    except Exception as e:
+                        logger.debug(f"[interrupt_monitor] 检查紧急消息回复失败: {e}")
+
+    async def _handle_stop_builtin(self, command: str):
+        """stop内置命令：停止daemon工具启动的后台进程（bash/daemon工具通用）
+
+        拦截规则：命令首词为 stop，且其余部分为空、纯daemon id列表（或all）。
+        避免误拦截真实shell命令：如 "stop; rm xx"、"stop && xx" 等不拦截。
+
+        Args:
+            command: 原始命令
+
+        Returns:
+            拦截返回DualOutput结果，未拦截返回None（继续正常执行）
+        """
+        m = re.match(r"^\s*stop(?:\s+(.+?))?\s*$", command)
+        if not m:
+            return None
+        rest = (m.group(1) or "").strip()
+
+        from peng.common.daemon_registry import stop_daemon_ids, stop_all_daemons
+
+        if not rest:
+            usage = "用法: stop <daemon_id> [daemon_id2 ...] 或 stop all 清理全部daemon"
+            return DualOutput(summary=f"\n{usage}", display=usage)
+        if rest == "all":
+            output = await stop_all_daemons()
+            return DualOutput(summary=f"\n{output}", display=output)
+        ids = rest.split()
+        # 全部是纯id形式才拦截（防止误拦截真实shell命令）
+        if not all(re.fullmatch(r"[A-Za-z0-9_.\-]+", i) for i in ids):
+            return None
+        output = await stop_daemon_ids(ids)
+        return DualOutput(summary=f"\n{output}", display=output)
 
     async def execute(self, **kwargs: Any) -> str:
         """执行shell命令（通过 nest 远程执行）"""
@@ -294,6 +379,11 @@ class BashTool(Tool):
         # 安全检查
         if not self._is_command_safe(command):
             raise ToolError("命令被拒绝：包含危险模式")
+
+        # 🔧 stop内置命令：停止daemon后台进程
+        stop_result = await self._handle_stop_builtin(command)
+        if stop_result is not None:
+            return stop_result
 
         # 检查 sleep 时长
         sleep_error = self._check_sleep_duration(command)
@@ -365,8 +455,10 @@ class BashTool(Tool):
         task_id = self.get_context("task_id")
         message_id = self.get_context("message_id")
 
-        # 判断是否需要中断监控（含sleep的命令 或 有 task_manager + task_id 的长命令）
-        enable_monitor = self._contains_sleep(command) and task_manager and task_id
+        # 判断是否需要中断监控（事务#1860：所有命令都启用监控——
+        # 感叹号开头的紧急新回复消息/未读info需打断正在运行的bash进程；
+        # 含sleep的命令传check_all=True保持原有行为：任何未读info/新回复都打断）
+        enable_monitor = task_manager and task_id
 
         try:
             # 创建远程执行任务
@@ -377,7 +469,10 @@ class BashTool(Tool):
             if enable_monitor:
                 # 带中断监控的执行模式：远程命令 + 中断监控，任一先完成即返回
                 monitor_task = asyncio.ensure_future(
-                    self._interrupt_monitor(task_manager, task_id, message_id)
+                    self._interrupt_monitor(
+                        task_manager, task_id, message_id,
+                        check_all=self._contains_sleep(command),
+                    )
                 )
 
                 try:
@@ -583,13 +678,18 @@ class BashTool(Tool):
                 )
             )
 
-            # 判断是否需要中断监控（含sleep的命令）
-            enable_monitor = self._contains_sleep(command) and task_manager and task_id
+            # 判断是否需要中断监控（事务#1860：所有命令都启用监控，同_execute_via_nest——
+            # 感叹号开头的紧急新回复消息/未读info需打断正在运行的bash进程；
+            # 含sleep的命令传check_all=True保持原有行为：任何未读info/新回复都打断）
+            enable_monitor = task_manager and task_id
 
             if enable_monitor:
                 # 带监控的执行模式：命令执行 + 中断监控，任一先完成即返回
                 monitor_task = asyncio.ensure_future(
-                    self._interrupt_monitor(task_manager, task_id, message_id)
+                    self._interrupt_monitor(
+                        task_manager, task_id, message_id,
+                        check_all=self._contains_sleep(command),
+                    )
                 )
                 # SIGINT handler: 收到Ctrl+C立即取消所有任务
                 interrupted_by_signal = False
@@ -826,17 +926,18 @@ class BashTool(Tool):
                 # 返回脚本文件名（不带路径）
                 return os.path.basename(part)
 
-        # 策略 2: 如果没有脚本文件，取第一个词作为进程名
-        process_name = os.path.basename(parts[0])
-        return process_name
+        # 策略 2: 使用完整命令行作为匹配模式
+        # （比仅取第一个词精确得多，如 "sleep 105" 不会误匹配所有sleep进程）
+        return " ".join(parts) if parts else None
 
     async def _register_daemon_pids(
         self, command: str, proc, task_id
     ) -> str | None:
-        """检测并注册nohup等后台进程的PID
+        """检测并注册nohup等后台命令产生的daemon进程
 
         在命令执行成功后，如果检测到是nohup等守护进程命令，
-        查找产生的后台进程PID并注册到pid.json。
+        查找产生的后台进程PID并注册到daemon.json（daemon_registry，
+        每个PID一个daemon条目，可用 stop <id> 停止）。
 
         Args:
             command: 原始shell命令
@@ -857,7 +958,7 @@ class BashTool(Tool):
             return None
 
         try:
-            from peng.common.pid_registry import add_pids
+            import peng.common.daemon_registry as dr
 
             # 使用pgrep查找该命令产生的子进程
             pattern = self._extract_daemon_process_pattern(command)
@@ -878,29 +979,37 @@ class BashTool(Tool):
                 if result.returncode == 0 and result.stdout.strip():
                     pids = [int(p) for p in result.stdout.strip().split('\n') if p.strip()]
                     if pids:
-                        # 🔧 Task#72：传递nest来源（本地执行时nest为None）
-                        nest_name = self.get_context("nest")
-                        add_pids(task_id, pids, nest=nest_name)
-                        pid_list = ", ".join(str(p) for p in pids)
+                        nest_name = dr.normalize_nest(self.get_context("nest"))
+                        ids = []
+                        for pid in pids:
+                            entry = dr.register_daemon(
+                                task_id=task_id,
+                                command=command,
+                                pid=pid,
+                                nest=nest_name,
+                                platform=sys.platform if nest_name is None else None,
+                            )
+                            ids.append(entry["id"])
+                        id_list = ", ".join(ids)
                         return (
-                            f"{GREEN}📋 已注册后台进程PID: [{pid_list}] "
-                            f"(task#{task_id})，"
-                            f"可用 task kill {task_id} 清理{RESET}"
+                            f"{GREEN}📋 已注册后台进程daemon: [{id_list}] "
+                            f"(PID {pids}, task#{task_id})，"
+                            f"可用 stop {ids[0]} 停止，task kill {task_id} 清理{RESET}"
                         )
             except (subprocess.TimeoutExpired, ValueError, OSError) as e:
                 logger.debug(f"pgrep查找后台进程失败: {e}")
 
         except Exception as e:
-            logger.debug(f"注册后台进程PID失败: {e}")
+            logger.debug(f"注册后台进程daemon失败: {e}")
 
         return None
 
     async def _register_remote_daemon_pids(
         self, client, command: str, task_id
     ) -> str | None:
-        """🔧 Task#72：通过远程nest检测并注册后台进程的PID
+        """通过远程nest检测并注册后台进程daemon
 
-        在远程nest上执行pgrep查找后台进程，将远程PID和nest来源一起注册。
+        在远程nest上执行pgrep查找后台进程，将远程PID和nest来源一起注册到daemon.json。
 
         Args:
             client: nest客户端
@@ -916,7 +1025,7 @@ class BashTool(Tool):
         RESET = _COLORS.get("RESET", "")
 
         try:
-            from peng.common.pid_registry import add_pids
+            import peng.common.daemon_registry as dr
 
             pattern = self._extract_daemon_process_pattern(command)
             if not pattern:
@@ -937,18 +1046,26 @@ class BashTool(Tool):
                     pids = [int(p) for p in stdout.split('\n') if p.strip()]
                     if pids:
                         nest_name = self.get_context("nest") or getattr(client, '_nest_name', None)
-                        add_pids(task_id, pids, nest=nest_name)
-                        pid_list = ", ".join(str(p) for p in pids)
+                        ids = []
+                        for pid in pids:
+                            entry = dr.register_daemon(
+                                task_id=task_id,
+                                command=command,
+                                pid=pid,
+                                nest=nest_name,
+                            )
+                            ids.append(entry["id"])
+                        id_list = ", ".join(ids)
                         return (
-                            f"{GREEN}📋 已注册远程后台进程PID: [{pid_list}] "
-                            f"(task#{task_id}, nest={nest_name})，"
-                            f"可用 task kill {task_id} 清理{RESET}"
+                            f"{GREEN}📋 已注册远程后台进程daemon: [{id_list}] "
+                            f"(PID {pids}, task#{task_id}, nest={nest_name})，"
+                            f"可用 stop {ids[0]} 停止，task kill {task_id} 清理{RESET}"
                         )
             except (ValueError, OSError) as e:
                 logger.debug(f"远程pgrep查找后台进程失败: {e}")
 
         except Exception as e:
-            logger.debug(f"注册远程后台进程PID失败: {e}")
+            logger.debug(f"注册远程后台进程daemon失败: {e}")
 
         return None
 
@@ -1261,3 +1378,177 @@ class BashTool(Tool):
             return "\n".join(backup_info_parts)
 
         return ""
+
+
+class DaemonTool(BashTool):
+    """daemon工具：非阻塞后台运行shell命令
+
+    参数同bash工具，区别：命令在后台daemon进程运行（不等待完成），
+    立刻返回daemon id并提示退出方式（stop <id>）。
+
+    - 本地nest: /bin/bash -c + start_new_session（会话首进程，pgid==pid，可killpg整组杀）
+    - 远程Linux nest: setsid nohup ... & echo DAEMON_PID=$!
+    - 远程macOS nest: nohup ... & echo DAEMON_PID=$!
+    - Windows: PowerShell Start-Process（wmic在Win11 24H2+已移除）
+
+    stdout/stderr 重定向到工作目录 .peng/daemon/daemon_<id>.log，
+    进程元数据注册到 data/daemon.json（daemon_registry）。
+
+    stop内置命令同bash工具： stop <id> / stop all
+    """
+
+    ALIASES = ()
+
+    @property
+    def name(self) -> str:
+        return "daemon"
+
+    @property
+    def primary_name(self) -> str:
+        return "daemon"
+
+    @property
+    def description(self) -> str:
+        is_win, platform_name = self._get_nest_platform()
+        win_cmds = "dir, type, cd, del, copy, move, mkdir, cls"
+        unix_cmds = "ls, cat, pwd, rm, cp, mv, mkdir, clear"
+        return f"""非阻塞后台daemon运行命令（命令在后台daemon进程运行，不等待完成，适合长时间运行的服务/训练/监控任务）。
+当前操作系统为: {platform_name}
+参数同bash工具，请使用正确的命令语法： {win_cmds if is_win else unix_cmds} 等。
+立即返回 daemon id，stdout/stderr 写入日志文件（用read工具读取查看输出）。
+停止方式： 用bash或daemon工具执行 stop <daemon_id>（或 stop all 清理全部）；也可用 task kill -d <daemon_id>。
+启动多个daemon时逐个启动并记录id，任务完成后务必stop清理！
+⚠️ 运行命令必须说明目的（purpose参数），要简明扼要（4-200个字符），否则将被拒绝执行！
+"""
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        _, platform_name = self._get_nest_platform()
+        return {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": f"要后台运行的shell命令（当前平台: {platform_name}）。stop <daemon_id> 为停止daemon的内置命令",
+                },
+                "purpose": {
+                    "type": "string",
+                    "description": "运行该命令的目的说明（必填，4-200个字符）。大模型调用daemon工具时必须说明执行该命令的目的，否则将被拒绝。",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "启动命令的超时时间（毫秒，默认30000，daemon本身不受超时限制）",
+                    "default": 30000,
+                },
+            },
+            "required": ["command", "purpose"],
+        }
+
+    def _resolve_platform(self, is_local: bool, is_win: bool, nest_name: str) -> str:
+        """获取daemon运行机器的平台标识（用于记录和stop时构建kill命令）"""
+        if is_local:
+            return sys.platform  # linux/darwin/win32
+        try:
+            from peng.tools._nest_helper import get_nest_platform
+
+            return get_nest_platform(nest_name).lower()
+        except Exception as e:
+            logger.debug(f"获取nest '{nest_name}'平台失败: {e}")
+            return "windows" if is_win else ""
+
+    async def execute(self, **kwargs: Any) -> str:
+        """非阻塞启动daemon进程，立刻返回daemon id"""
+        command: str = kwargs.get("command", "")
+        timeout: int = kwargs.get("timeout", 30000)
+        purpose: str = kwargs.get("purpose", "").strip()
+
+        # 目的说明检查（同bash工具）
+        if not purpose or len(purpose) < 4 or len(purpose) > 200:
+            raise ToolError(
+                "命令被拒绝：必须通过 purpose 参数简明扼要地说明运行该命令的目的（4-200字符）。"
+                "请说明你为什么要运行这个命令，例如 purpose='后台启动训练任务'。"
+            )
+
+        # 安全检查（同bash工具）
+        if not self._is_command_safe(command):
+            raise ToolError("命令被拒绝：包含危险模式")
+
+        # 🔧 stop内置命令：停止daemon后台进程
+        stop_result = await self._handle_stop_builtin(command)
+        if stop_result is not None:
+            return stop_result
+
+        if not command.strip():
+            raise ToolError("命令不能为空")
+
+        nest_name = self.get_context("nest") or "local"
+        is_local_nest = nest_name == "local"
+        task_id = self.get_context("task_id")
+        workdir = self.get_context("workdir")
+
+        is_win, _ = self._get_nest_platform()
+        platform = self._resolve_platform(is_local_nest, is_win, nest_name)
+
+        import peng.common.daemon_registry as dr
+
+        try:
+            daemon_id = dr.generate_daemon_id()
+            if is_local_nest:
+                # 本地nest：直接在本地启动daemon进程（任务进程即在本机）
+                self._check_protected_paths(command)
+                backup_info = self._backup_files_if_needed(command)
+                if backup_info:
+                    logger.info(backup_info)
+                pid, log_file = dr.start_local_daemon(command, workdir, daemon_id)
+                entry = dr.register_daemon(
+                    task_id=task_id,
+                    command=command,
+                    pid=pid,
+                    nest=None,
+                    log_file=log_file,
+                    workdir=str(workdir) if workdir else None,
+                    platform=platform,
+                    daemon_id=daemon_id,
+                )
+            else:
+                # 远程nest：通过nest在远程机器启动daemon
+                client = self._get_nest_client()
+                if not client:
+                    raise NestError(f"Nest '{nest_name}' 客户端不可用，无法远程启动daemon")
+                pid, log_file = await dr.start_remote_daemon(
+                    client,
+                    command=command,
+                    workdir=workdir,
+                    daemon_id=daemon_id,
+                    is_windows=is_win,
+                    platform=platform,
+                    timeout=timeout,
+                )
+                entry = dr.register_daemon(
+                    task_id=task_id,
+                    command=command,
+                    pid=pid,
+                    nest=nest_name,
+                    log_file=log_file,
+                    workdir=str(workdir) if workdir else None,
+                    platform=platform,
+                    daemon_id=daemon_id,
+                )
+        except ToolError:
+            raise
+        except NestError:
+            raise
+        except Exception as e:
+            raise ToolError(f"daemon启动失败: {e}") from e
+
+        # 构建返回信息
+        daemon_id = entry["id"]
+        nest_hint = "" if entry.get("nest") is None else f", nest={entry['nest']}"
+        output = (
+            f"\n✅ daemon {daemon_id} 已启动 (PID {entry['pid']}{nest_hint})\n"
+            f"命令: {command}\n"
+            f"日志: {entry['log_file']}（用read工具读取查看输出）\n"
+            f"停止: stop {daemon_id}（bash/daemon工具内置命令），或 task kill -d {daemon_id}"
+        )
+        display = f"\ndaemon {daemon_id} 已启动 (PID {entry['pid']})，停止方式: stop {daemon_id}"
+        return DualOutput(summary=output, display=display)

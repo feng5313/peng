@@ -279,7 +279,7 @@ class TaskTimer(metaclass=MetaSingleton):
                 get_output_manager().write_output(
                     task_id=task_id,
                     source="system",
-                    content=f"\n🕑 [{now[:19]}] 吉时已到...\n",
+                    content=f"🕑 [{now[:19]}] 吉时已到...\n",
                 )
 
                 logger.info(

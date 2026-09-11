@@ -4,7 +4,10 @@
 为文件修改工具调用提供自动备份和一键回退功能：
 1. git管理工作目录：使用备份分支 peng_backups/task#id，每次工具调用前用临时索引创建镜像commit
 2. 非git工作目录：在备份目录（配置路径或系统temp）初始化git仓库，同步镜像并commit
-3. 外部文件（工作目录外）：备份到备份仓库，保留目录结构
+3. 外部文件（工作目录外）：备份到本地git仓库，保留目录结构
+   - Windows平台：带盘符的外部文件备份到该文件同盘符根目录 \\.peng\\backups\\task#id
+     （如 D:\\work\\f.txt → D:\\.peng\\backups\\task#N），避免跨盘符复制
+   - 其他平台/UNC路径：备份到 peng 服务 data/file_backups/task#id
 
 设计原则：
 - 不干扰用户工作区（git使用临时索引文件）
@@ -408,6 +411,40 @@ def _is_abs_path_excluded(abs_path: str) -> bool:
     parts = abs_path.replace("\\", "/").split("/")
     # 末段是文件名（或目录名——目录名也参与判断，build 目录本身整个排除）
     return any(_is_excluded_dirname(part) for part in parts)
+
+
+def _strip_drive_rel(file_path: str) -> str:
+    """绝对路径 → 备份仓库内相对路径（去根分隔符；Windows 盘符路径去盘符）
+
+    🔧 事务#1847：Windows 目录名不能含 ':'（mkdir 抛 WinError 123），且
+    os.path.join/pathlib 拼接含盘符路径（如 "D:/x"）时会视为绝对路径直接
+    替换前缀（dst 恒等于源文件路径，copy2(源, 源) 抛 WinError 32）。
+    因此 __external__/盘符仓库内的 rel 一律去盘符：
+    - "D:\\peng\\x" → "peng/x"；"/home/x" → "home/x"
+    """
+    clean = str(file_path).replace("\\", "/")
+    drive, rest = ntpath.splitdrive(clean)
+    if len(drive) == 2 and drive[1] == ":":
+        return rest.lstrip("/")
+    return clean.lstrip("/")
+
+
+def _git_repo_valid(repo_path: str) -> bool:
+    """验证目录是有效 git 仓库（.git 存在且 rev-parse 成功）
+
+    🔧 事务#1847：`.git` 目录存在 ≠ 仓库有效——Windows 上 rmtree 因文件锁
+    部分失败会留下残缺 .git（如仅 objects/），此时 git 操作全部 rc=128。
+    """
+    if not os.path.isdir(os.path.join(repo_path, ".git")):
+        return False
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--git-dir"], cwd=repo_path,
+            capture_output=True, timeout=10,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
 
 
 def _load_gitignore_spec(root: str) -> Any:
@@ -945,8 +982,9 @@ class ToolBackupManager:
            （git 工作目录用临时索引；非 git 工作目录用备份目录中的独立 git 仓库）
         2. history context：备份到 data/history/task#id（HistoryBackupManager）
         3. checklist：与 history 一同备份（checklist.md）
-        4. 外部文件基线：data/file_backups/task#id HEAD（ExternalFileBackup），
-           回滚时从该 commit 全量恢复 workdir 外文件
+        4. 外部文件基线：各备份仓库 HEAD（ExternalFileBackup；默认 data 仓库 +
+           Windows 盘符 /.peng/backups 仓库），回滚时从这些 commit 全量恢复
+           workdir 外文件
 
         失败不阻塞迭代（返回 None，仅记录日志）。
 
@@ -1033,19 +1071,13 @@ class ToolBackupManager:
             if history_commit:
                 meta["history_commit"] = history_commit
 
-            # 3. 外部文件基线：记录 data/file_backups/task#id 的当前 HEAD，
-            #    回滚时从该 commit 全量恢复 workdir 外文件（无需迭代开始时同步）
+            # 3. 外部文件基线：记录各备份仓库的当前 HEAD（🔧 多仓库：
+            #    默认 data 仓库 + Windows 各盘符 \.peng\backups 仓库），
+            #    回滚时从这些 commit 全量恢复 workdir 外文件（无需迭代开始时同步）
             try:
-                ext_repo = ExternalFileBackup._get_backup_repo(task_id)
-                result = subprocess.run(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=ext_repo,
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    meta["external_head_commit"] = result.stdout.strip()
+                ext_heads = ExternalFileBackup.get_all_heads(task_id)
+                if ext_heads:
+                    meta["external_head_commit"] = ext_heads
             except Exception as e:
                 logger.debug(f"迭代快照外部文件基线获取失败(task#{task_id}): {e}")
 
@@ -1860,7 +1892,18 @@ class ToolBackupManager:
             if not _ensure_dir(backup_repo, nest_name):
                 return None
 
-            if not _path_exists(f"{backup_repo}/.git", nest_name):
+            # 🔧 本地用 _git_repo_valid 验证（残缺 .git 自动重建，事务#1847）；
+            # 远程 nest 保持存在性探测（远程重建需多次往返，残缺时 git 操作
+            # 返回非零由上层日志暴露）
+            repo_ready = (
+                _git_repo_valid(backup_repo)
+                if not nest_name or nest_name == "local"
+                else _path_exists(f"{backup_repo}/.git", nest_name)
+            )
+            if not repo_ready:
+                if not nest_name or nest_name == "local":
+                    # 清除残缺 .git 残留（Windows rmtree 文件锁可能留下半初始化状态）
+                    shutil.rmtree(os.path.join(backup_repo, ".git"), ignore_errors=True)
                 result = _run_git(["init"], cwd=backup_repo, nest_name=nest_name)
                 if result.returncode != 0:
                     logger.warning(f"git init失败: {result.stderr}")
@@ -2013,9 +2056,9 @@ class ToolBackupManager:
         if _is_abs_path_excluded(src_path):
             logger.debug(f"外部文件跳过（排除规则）: {src_path}")
             return
-        # 计算相对路径（去掉根目录分隔符）
-        src_path_clean = src_path.replace("\\", "/")
-        rel = src_path_clean.lstrip("/")
+        # 🔧 计算相对路径：去盘符（Windows 目录名不能含':'，含盘符路径会被
+        # os.path.join/pathlib 视为绝对路径导致 dst 恒等于源文件）
+        rel = _strip_drive_rel(src_path)
         dst = f"{backup_repo}/__external__/{rel}"
 
         if not nest_name or nest_name == "local":
@@ -2108,13 +2151,11 @@ class ToolBackupManager:
                         msg += f"，{ctx_msg}"
 
                 # 迭代快照：从外部文件基线 commit 全量恢复 workdir 外文件
+                # （🔧 多仓库：str=旧格式默认仓库；dict=各仓库基线）
                 if is_iteration:
                     ext_head = rollback_meta.get("external_head_commit")
                     if ext_head:
-                        ext_repo = ExternalFileBackup._get_backup_repo(task_id)
-                        ext_restored = ExternalFileBackup.restore_all(
-                            task_id, ext_repo, ext_head
-                        )
+                        ext_restored = ExternalFileBackup.restore_all(task_id, ext_head)
                         if ext_restored > 0:
                             msg += f"，恢复 {ext_restored} 个外部文件"
                         elif ext_restored == 0:
@@ -2189,23 +2230,12 @@ class ToolBackupManager:
             ext_head = rollback_meta.get("external_head_commit")
             if ext_head:
                 try:
-                    ext_repo = ExternalFileBackup._get_backup_repo(task_id)
-                    result = subprocess.run(
-                        ["git", "ls-tree", "-r", "--name-only", ext_head],
-                        cwd=ext_repo, capture_output=True, text=True, timeout=15,
-                    )
-                    if result.returncode == 0:
-                        rel_paths = [ln.strip() for ln in result.stdout.split("\n") if ln.strip()]
-                        abs_paths: list[str] = []
-                        for rel in rel_paths:
-                            if rel.startswith("__external__/"):
-                                rel = rel[len("__external__/"):]
-                            abs_path = rel if ntpath.isabs(rel) else "/" + rel
-                            abs_paths.append(abs_path)
-                        if abs_paths and ExternalFileBackup.check_changes(
-                            task_id, abs_paths, ext_head
-                        ):
-                            ext_changed_flag = True
+                    # 🔧 多仓库基线：遍历默认 data 仓库 + Windows 各盘符仓库 ls-tree
+                    abs_paths = ExternalFileBackup.list_baseline_files(task_id, ext_head)
+                    if abs_paths and ExternalFileBackup.check_changes(
+                        task_id, abs_paths, ext_head
+                    ):
+                        ext_changed_flag = True
                 except Exception as e:
                     logger.debug(f"外部文件基线检测失败(task#{task_id}): {e}")
         else:
@@ -2234,7 +2264,8 @@ class ToolBackupManager:
         """回滚前创建撤销快照（保存当前文件状态，在 nest 上执行）
 
         同时备份当前 history（在本地 data/history，通过 HistoryBackupManager）
-        和外部文件（在本地 data/file_backups，通过 ExternalFileBackup）。
+        和外部文件（通过 ExternalFileBackup；Windows 盘符文件入同盘符
+        /.peng/backups 仓库，其余入本地 data/file_backups）。
         """
         if not workdir:
             return None
@@ -2415,9 +2446,9 @@ class ToolBackupManager:
 
             if external_files:
                 # 优先从 backup_repo/__external__/ 恢复（nest端，支持远程）
+                # 🔧 rel 与 _copy_external_file 一致去盘符（Windows 目录名不能含':'）
                 for ext_fp in external_files:
-                    ext_clean = ext_fp.replace("\\", "/")
-                    rel = ext_clean.lstrip("/")
+                    rel = _strip_drive_rel(ext_fp)
                     src = f"{backup_repo}/__external__/{rel}"
                     if _path_exists(src, nest_name):
                         if not nest_name or nest_name == "local":
@@ -3012,11 +3043,17 @@ class HistoryBackupManager:
 
     @staticmethod
     def _get_history_repo(task_id: int) -> str:
-        """获取/创建 history 备份仓库路径（本地 data/history/task#id）"""
+        """获取/创建 history 备份仓库路径（本地 data/history/task#id）
+
+        🔧 用 _git_repo_valid 验证（残缺 .git 自动重建，同 ExternalFileBackup._ensure_repo）。
+        """
         repo_path = os.path.join(HistoryBackupManager._get_history_base(), f"task#{task_id}")
         Path(repo_path).mkdir(parents=True, exist_ok=True)
 
-        if not os.path.exists(os.path.join(repo_path, ".git")):
+        if not _git_repo_valid(repo_path):
+            # 残缺/不存在 .git → 清除残留重新初始化
+            # （工作区已有的 context.json/checklist.md 保留，init 后 add -A 提交）
+            shutil.rmtree(os.path.join(repo_path, ".git"), ignore_errors=True)
             subprocess.run(["git", "init"], cwd=repo_path, capture_output=True, timeout=10)
             subprocess.run(
                 ["git", "config", "user.email", "peng@history"], cwd=repo_path, capture_output=True
@@ -3024,7 +3061,9 @@ class HistoryBackupManager:
             subprocess.run(
                 ["git", "config", "user.name", "Peng History"], cwd=repo_path, capture_output=True
             )
-            Path(os.path.join(repo_path, "context.json")).write_text("{}", encoding="utf-8")
+            ctx = os.path.join(repo_path, "context.json")
+            if not os.path.exists(ctx):
+                Path(ctx).write_text("{}", encoding="utf-8")
             subprocess.run(["git", "add", "-A"], cwd=repo_path, capture_output=True)
             subprocess.run(
                 ["git", "commit", "-m", "init", "--allow-empty"], cwd=repo_path, capture_output=True
@@ -3443,26 +3482,91 @@ class ExternalFileBackup:
 
     完全独立于文件备份（ToolBackupManager）和 history 备份（HistoryBackupManager）：
     - 始终在本地（peng服务端）执行
-    - 备份目录固定为 peng 服务的 data/file_backups/task#id
     - 每次备份使用 git commit，支持多版本
     - 用于 git 场景下工作目录外的文件变更备份
+
+    备份仓库位置（🔧 事务#1847：Windows平台避免跨盘符复制）：
+    - Windows 平台且文件路径带盘符（如 D:\\work\\f.txt）→
+      该文件同盘符根目录 \\.peng\\backups\\task#id（如 D:\\.peng\\backups\\task#5）
+    - 其他（非 Windows 平台 / UNC 路径 / 无盘符）→
+      peng 服务 data/file_backups/task#id（默认仓库）
+
+    仓库 key 约定：`""` = 默认 data 仓库；`"D"` = 盘符仓库（大写字母）。
+    回滚 meta 中的基线 commit 字段（external_backup_commit/external_head_commit）
+    兼容两种格式：
+    - str（旧格式/仅默认仓库）：该 commit 位于默认 data 仓库，所有文件均查默认仓库
+    - dict {repo_key: commit}：各仓库记录各自基线，文件按自己盘符 key 查询
     """
 
     @staticmethod
-    def _get_backup_repo(task_id: int) -> str:
-        """获取/创建外部文件备份仓库路径（本地 data/file_backups/task#id）"""
-        try:
-            from peng.config.loader import load_config
+    def _split_drive_key(file_path: str) -> str | None:
+        """Windows 平台提取文件路径的盘符字母（大写）
 
-            config = load_config()
-            base = str(config.paths.data_dir_path / "file_backups")
-        except Exception:
-            base = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data", "file_backups")
-        repo_path = os.path.join(base, f"task#{task_id}")
+        仅当 peng 服务本地运行在 Windows（os.name == "nt"）且路径带单盘符
+        （如 "D:\\x" / "d:/x"）时返回盘符大写字母（如 "D"）；
+        非 Windows 平台 / Unix 路径 / UNC 路径（\\\\server\\share）返回 None。
+        （远程 Windows nest 返回的路径在 Linux 服务端不启用盘符仓库——
+        ExternalFileBackup 本就是纯本地备份，远程路径本地不可访问）
+        """
+        if os.name != "nt":
+            return None
+        drive = ntpath.splitdrive(str(file_path))[0]
+        if len(drive) == 2 and drive[1] == ":":
+            return drive[0].upper()
+        return None
+
+    @staticmethod
+    def _repo_key(file_path: str) -> str:
+        """文件对应的备份仓库 key：盘符字母（Windows 盘符路径）或 ""（默认仓库）"""
+        return ExternalFileBackup._split_drive_key(file_path) or ""
+
+    @staticmethod
+    def _repo_path_for_key(task_id: int, key: str) -> str:
+        """仓库 key → 备份仓库路径（仅计算路径，不创建目录）
+
+        key="D" → D:\\.peng\\backups\\task#id；key="" → 默认 data 仓库（会确保存在）
+        """
+        if not key:
+            return ExternalFileBackup._get_backup_repo(task_id)
+        return ntpath.join(ntpath.join(f"{key}:\\", ".peng", "backups"), f"task#{task_id}")
+
+    @staticmethod
+    def _get_backup_repo_for(task_id: int, file_path: str) -> str:
+        """按文件路径定位备份仓库（确保仓库已初始化且有效）
+
+        Windows 盘符路径 → 同盘符根目录 \\.peng\\backups\\task#id（避免跨盘符复制）；
+        其他 → 默认 data 仓库。
+        🔧 默认分支显式经过 _ensure_repo（残缺 .git 自动重建）——不能依赖
+        _get_backup_repo 的内部实现保证（测试 mock 会整体替换它）。
+        """
+        key = ExternalFileBackup._split_drive_key(file_path)
+        if key:
+            return ExternalFileBackup._ensure_repo(
+                ExternalFileBackup._repo_path_for_key(task_id, key)
+            )
+        return ExternalFileBackup._ensure_repo(
+            ExternalFileBackup._get_backup_repo(task_id)
+        )
+
+    @staticmethod
+    def _ensure_repo(repo_path: str) -> str:
+        """确保备份仓库目录存在并完成 git 初始化（幂等，自动修复残缺残留）
+
+        🔧 事务#1847 epyc 真实测试发现：Windows 上 rmtree 可能因文件锁部分失败，
+        留下残缺 .git（如仅有 objects/）——仅检查 .git 存在性会误判已初始化而
+        跳过 git init，导致后续 git 操作全部 rc=128 静默失败（备份返回 None）。
+        改用 `git rev-parse --git-dir` 验证仓库有效性，无效时清除残缺 .git 重建。
+        """
         Path(repo_path).mkdir(parents=True, exist_ok=True)
-
-        if not os.path.exists(os.path.join(repo_path, ".git")):
-            subprocess.run(["git", "init"], cwd=repo_path, capture_output=True, timeout=10)
+        if not _git_repo_valid(repo_path):
+            # 残缺/不存在 .git → 清除残留后重新初始化
+            # （git init 对已存在的 .git 也会补全结构，rmtree 是双保险）
+            shutil.rmtree(os.path.join(repo_path, ".git"), ignore_errors=True)
+            r = subprocess.run(
+                ["git", "init"], cwd=repo_path, capture_output=True, text=True, timeout=15
+            )
+            if r.returncode != 0:
+                logger.warning(f"备份仓库 git init 失败({repo_path}): {r.stderr[:200]}")
             subprocess.run(
                 ["git", "config", "user.email", "peng@files"], cwd=repo_path, capture_output=True
             )
@@ -3473,18 +3577,160 @@ class ExternalFileBackup:
             subprocess.run(
                 ["git", "commit", "-m", "init", "--allow-empty"], cwd=repo_path, capture_output=True
             )
-
         return repo_path
 
     @staticmethod
+    def _resolve_base(
+        task_id: int, file_path: str, commit_spec: str | dict[str, str] | None
+    ) -> tuple[str, str, str | None]:
+        """解析文件对应的 (备份仓库路径, 仓库key, 基线commit)
+
+        - commit_spec=None → (文件自己的仓库, 文件key, "HEAD")（与各自仓库 HEAD 对比）
+        - str（旧格式）→ (默认 data 仓库, "", str)——旧数据全部位于默认仓库
+        - dict → 文件自己仓库 + 文件key + dict[文件key]；dict 缺该仓库条目 → ("", "", None)
+          （无基线，check_changes 视为新增、restore 跳过）
+
+        Returns:
+            (repo_path, repo_key, base_commit)；base_commit 为 None 表示无基线
+        """
+        if commit_spec is None:
+            key = ExternalFileBackup._repo_key(file_path)
+            return ExternalFileBackup._get_backup_repo_for(task_id, file_path), key, "HEAD"
+        if isinstance(commit_spec, dict):
+            key = ExternalFileBackup._repo_key(file_path)
+            commit = str(commit_spec.get(key) or "")
+            if not commit:
+                return "", key, None
+            return ExternalFileBackup._get_backup_repo_for(task_id, file_path), key, commit
+        # 旧格式 str：历史备份全部位于默认 data 仓库
+        return ExternalFileBackup._get_backup_repo(task_id), "", str(commit_spec)
+
+    @staticmethod
+    def _iter_repo_bases(
+        task_id: int, commit_spec: str | dict[str, str] | None
+    ) -> list[tuple[str, str, str]]:
+        """展开基线 commit 为 [(repo_key, repo_path, commit), ...] 列表（跨仓库）
+
+        - str（旧格式）→ [("", 默认仓库, str)]
+        - dict → 各 repo_key 对应仓库（跳过无效条目；盘符仓库不强制创建）
+        - None/空 → []
+        """
+        if not commit_spec:
+            return []
+        if isinstance(commit_spec, dict):
+            out: list[tuple[str, str, str]] = []
+            for key, commit in commit_spec.items():
+                if not commit:
+                    continue
+                k = str(key)
+                if k:
+                    # 盘符仓库：仅计算路径，不存在时由调用方跳过（只读操作不创建）
+                    out.append((k, ExternalFileBackup._repo_path_for_key(task_id, k), str(commit)))
+                else:
+                    out.append(("", ExternalFileBackup._get_backup_repo(task_id), str(commit)))
+            return out
+        return [("", ExternalFileBackup._get_backup_repo(task_id), str(commit_spec))]
+
+    @staticmethod
+    def _existing_drive_keys(task_id: int) -> list[str]:
+        """枚举 Windows 本地已存在备份仓库的盘符字母列表（A-Z）"""
+        if os.name != "nt":
+            return []
+        keys: list[str] = []
+        for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            repo = ExternalFileBackup._repo_path_for_key(task_id, c)
+            if os.path.isdir(os.path.join(repo, ".git")):
+                keys.append(c)
+        return keys
+
+    @staticmethod
+    def get_all_heads(task_id: int) -> str | dict[str, str]:
+        """获取全部外部文件备份仓库的当前 HEAD commit
+
+        覆盖：默认 data 仓库 + Windows 各盘符 \\.peng\\backups\\task#id 仓库（已存在时）。
+        仅默认仓库有内容 → 返回 str（兼容旧 meta 格式）；
+        涉及盘符仓库 → 返回 {repo_key: commit}。
+        """
+        heads: dict[str, str] = {}
+        # 默认仓库（确保存在）
+        try:
+            default_repo = ExternalFileBackup._get_backup_repo(task_id)
+            r = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=default_repo,
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                heads[""] = r.stdout.strip()
+        except Exception as e:
+            logger.debug(f"外部文件基线: 默认仓库HEAD获取失败(task#{task_id}): {e}")
+        # Windows 盘符仓库（已存在的）
+        for key in ExternalFileBackup._existing_drive_keys(task_id):
+            try:
+                repo = ExternalFileBackup._repo_path_for_key(task_id, key)
+                r = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=repo,
+                    capture_output=True, text=True, timeout=5,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    heads[key] = r.stdout.strip()
+            except Exception as e:
+                logger.debug(f"外部文件基线: 盘符{key}:仓库HEAD获取失败(task#{task_id}): {e}")
+        if not heads:
+            return ""
+        if set(heads.keys()) == {""}:
+            return heads[""]
+        return heads
+
+    @staticmethod
+    def _get_backup_repo(task_id: int) -> str:
+        """获取/创建外部文件备份仓库路径（本地 data/file_backups/task#id）
+
+        保持单参数签名（测试与既有代码依赖）。
+        """
+        try:
+            from peng.config.loader import load_config
+
+            config = load_config()
+            base = str(config.paths.data_dir_path / "file_backups")
+        except Exception:
+            base = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data", "file_backups")
+        repo_path = os.path.join(base, f"task#{task_id}")
+        return ExternalFileBackup._ensure_repo(repo_path)
+
+    @staticmethod
     def _to_repo_path(file_path: str) -> str:
-        """将绝对文件路径转换为备份仓库内的相对路径（去掉根分隔符）"""
+        """将绝对文件路径转换为备份仓库内的相对路径（去掉根分隔符）
+
+        🔧 仅适用于默认 data 仓库（保留盘符段，与历史数据结构一致，如 D:/x → D:/x）。
+        盘符仓库必须用 _repo_rel（去盘符）——Windows 目录名不能含 ':'。
+        """
         clean = file_path.replace("\\", "/")
         return clean.lstrip("/")
 
     @staticmethod
-    def backup(task_id: int, file_paths: list[str], label: str = "") -> str | None:
-        """备份外部文件到本地 git 仓库
+    def _repo_rel(file_path: str, repo_key: str) -> str:
+        """文件在其备份仓库内的相对路径（POSIX 分隔，按仓库类型计算）
+
+        - 盘符仓库（repo_key 非空）：去掉盘符前缀——Windows 目录名不能含 ':'，
+          os.path.join 也会把含盘符的路径当绝对路径处理（🔧 事务#1847 真实测试发现的
+          Windows 路径语义陷阱：join(仓库, "D:/x") == "D:/x" 恒等于源文件路径，
+          导致 copy2(源, 源) 抛 WinError 32）。如 D:\\peng\\x → peng/x
+        - 默认仓库（repo_key=""）：保留完整路径含盘符段（Linux peng 的
+          data/file_backups 历史数据结构），如 D:\\peng\\x → D:/peng/x
+
+        Args:
+            file_path: 外部文件绝对路径
+            repo_key: 备份仓库 key（""=默认；盘符字母）
+        """
+        if repo_key:
+            return _strip_drive_rel(file_path)
+        return ExternalFileBackup._to_repo_path(file_path)
+
+    @staticmethod
+    def backup(
+        task_id: int, file_paths: list[str], label: str = ""
+    ) -> str | dict[str, str] | None:
+        """备份外部文件到本地 git 仓库（🔧 按文件仓库分组，Windows 盘符文件入同盘符仓库）
 
         Args:
             task_id: 事务ID
@@ -3492,15 +3738,18 @@ class ExternalFileBackup:
             label: 备份标签
 
         Returns:
-            commit hash，失败返回 None
+            仅默认仓库（data）→ commit hash 字符串（兼容旧 meta 格式）；
+            涉及盘符仓库 → {repo_key: commit}（key="" 为默认仓库，"D" 等为盘符仓库）；
+            无可备份文件或全部失败 → None
         """
         if not file_paths:
             return None
 
         try:
-            repo = ExternalFileBackup._get_backup_repo(task_id)
             backed_up = 0
             skipped_excluded = 0
+            # 按仓库分组复制（repo_key → (repo_path, 该仓库实际备份的文件)）
+            groups: dict[str, tuple[str, list[str]]] = {}
             for fp in file_paths:
                 if not os.path.exists(fp):
                     continue
@@ -3508,13 +3757,19 @@ class ExternalFileBackup:
                 if _is_abs_path_excluded(fp):
                     skipped_excluded += 1
                     continue
-                rel = ExternalFileBackup._to_repo_path(fp)
-                dst = os.path.join(repo, rel)
+                key = ExternalFileBackup._repo_key(fp)
+                if key not in groups:
+                    groups[key] = (ExternalFileBackup._get_backup_repo_for(task_id, fp), [])
+                # 🔧 按仓库类型计算 rel：盘符仓库去盘符（Windows 目录名不能含 ':'，
+                # 且含盘符路径会让 os.path.join 视为绝对路径导致 dst==源文件）
+                rel = ExternalFileBackup._repo_rel(fp, key)
+                dst = os.path.join(groups[key][0], rel)
                 Path(os.path.dirname(dst)).mkdir(parents=True, exist_ok=True)
                 if os.path.isfile(fp):
                     shutil.copy2(fp, dst)
                 elif os.path.isdir(fp):
                     shutil.copytree(fp, dst, dirs_exist_ok=True)
+                groups[key][1].append(fp)
                 backed_up += 1
 
             if skipped_excluded:
@@ -3524,96 +3779,146 @@ class ExternalFileBackup:
             if backed_up == 0:
                 return None
 
-            # 🔧 去重检测：文件内容与 HEAD 完全一致时复用 HEAD commit，
-            # 避免无变化时产生冗余空 commit（--allow-empty 已移除）
-            changed = ExternalFileBackup.check_changes(task_id, file_paths)
-            if not changed:
-                result = subprocess.run(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=repo, capture_output=True, text=True, timeout=5,
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    logger.debug(
-                        f"外部文件备份去重 task#{task_id}: 无变化，复用HEAD {result.stdout.strip()[:8]}"
-                    )
-                    return result.stdout.strip()
-
-            subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True, timeout=10)
             timestamp = datetime.now().isoformat(timespec="seconds")
-            msg = f"external files backup: {label}\n\nTask#{task_id} @ {timestamp}"
-            subprocess.run(
-                ["git", "commit", "-m", msg],
-                cwd=repo,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
+            commits: dict[str, str] = {}
+            for key, (repo, files) in groups.items():
+                # 🔧 去重检测：文件内容与该仓库 HEAD 完全一致时复用 HEAD commit，
+                # 避免无变化时产生冗余空 commit（--allow-empty 已移除）
+                commit_hash: str | None = None
+                if not ExternalFileBackup.check_changes(task_id, files):
+                    result = subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=repo, capture_output=True, text=True, timeout=5,
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        commit_hash = result.stdout.strip()
+                        logger.debug(
+                            f"外部文件备份去重 task#{task_id}[{key or 'default'}]: "
+                            f"无变化，复用HEAD {commit_hash[:8]}"
+                        )
+                if not commit_hash:
+                    subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True, timeout=10)
+                    msg = f"external files backup: {label}\n\nTask#{task_id} @ {timestamp}"
+                    subprocess.run(
+                        ["git", "commit", "-m", msg],
+                        cwd=repo,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    result = subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=repo,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        commit_hash = result.stdout.strip()
+                    else:
+                        logger.warning(
+                            f"外部文件备份commit后获取HEAD失败 task#{task_id}[{key or 'default'}]: "
+                            f"rc={result.returncode} {str(result.stderr)[:150]}"
+                        )
+                if commit_hash:
+                    commits[key] = commit_hash
 
-            result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=repo,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode == 0:
-                commit_hash = result.stdout.strip()
+            if not commits:
+                return None
+            # 仅默认仓库 → str（100%兼容旧 meta 格式）；涉及盘符仓库 → dict
+            if set(commits.keys()) == {""}:
                 logger.debug(
-                    f"外部文件备份成功 task#{task_id} commit={commit_hash[:8]} files={backed_up}"
+                    f"外部文件备份成功 task#{task_id} commit={commits[''][:8]} files={backed_up}"
                 )
-                return commit_hash
+                return commits[""]
+            parts = ", ".join(f"{k or 'default'}:{v[:8]}" for k, v in commits.items())
+            logger.debug(
+                f"外部文件备份成功 task#{task_id}（{len(commits)} 个仓库）"
+                f"files={backed_up} [{parts}]"
+            )
+            return commits
         except Exception as e:
             logger.warning(f"外部文件备份失败 task#{task_id}: {e}")
         return None
 
     @staticmethod
-    def restore_all(task_id: int, repo_path: str, commit_hash: str) -> int:
-        """从指定 commit 全量恢复所有外部文件到原始路径
+    def list_baseline_files(
+        task_id: int, commit_spec: str | dict[str, str] | None
+    ) -> list[str]:
+        """列出基线 commit 中备份的全部外部文件绝对路径（跨仓库合并）
 
-        迭代开始快照记录 ExternalFileBackup 仓库的 HEAD 作为基线，
-        回滚时用 git ls-tree 列出该 commit 下全部文件并逐个恢复
-        （不修改备份仓库工作树）。
+        遍历基线涉及的每个备份仓库（默认 data 仓库 + Windows 各盘符仓库）
+        执行 git ls-tree，将仓库相对路径反推为原始绝对路径。
+        仓库不存在或 ls-tree 失败时跳过该仓库（只读操作，不创建仓库）。
 
         Args:
             task_id: 事务ID
-            repo_path: 备份仓库路径
-            commit_hash: 基线 commit hash
+            commit_spec: 基线 commit（str=旧格式默认仓库；dict={repo_key: commit}）
+
+        Returns:
+            外部文件绝对路径列表（可能为空）
+        """
+        abs_paths: list[str] = []
+        for repo_key, repo, base in ExternalFileBackup._iter_repo_bases(task_id, commit_spec):
+            if not base or not os.path.isdir(repo):
+                continue
+            try:
+                result = subprocess.run(
+                    ["git", "ls-tree", "-r", "--name-only", base],
+                    cwd=repo,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+            except Exception as e:
+                logger.debug(f"外部文件基线ls-tree异常({repo}): {e}")
+                continue
+            if result.returncode != 0:
+                logger.warning(f"外部文件基线ls-tree失败({repo}): {result.stderr[:200]}")
+                continue
+            for rel in (ln.strip() for ln in result.stdout.split("\n") if ln.strip()):
+                if rel.startswith("__external__/"):
+                    rel = rel[len("__external__/"):]
+                if repo_key:
+                    # 盘符仓库：备份时去掉了盘符（目录名不能含':'），加回盘符
+                    abs_path = f"{repo_key}:/{rel}"
+                else:
+                    # 默认仓库：rel 可能是含盘符的 Windows 路径或 Unix 路径
+                    abs_path = rel if ntpath.isabs(rel) else "/" + rel
+                abs_paths.append(abs_path)
+        return abs_paths
+
+    @staticmethod
+    def restore_all(
+        task_id: int, commit_spec: str | dict[str, str] | None
+    ) -> int:
+        """从基线 commit 全量恢复所有外部文件到原始路径（🔧 支持多仓库）
+
+        迭代开始快照记录各备份仓库的 HEAD 作为基线（get_all_heads），
+        回滚时遍历基线涉及的每个仓库，用 git ls-tree 列出该 commit 下
+        全部文件并逐个恢复（不修改备份仓库工作树）。
+
+        Args:
+            task_id: 事务ID
+            commit_spec: 基线 commit（str=旧格式默认仓库；dict={repo_key: commit}）
 
         Returns:
             成功恢复的文件数
         """
-        if not commit_hash or not repo_path or not os.path.isdir(repo_path):
+        if not commit_spec:
             return 0
 
         try:
-            # 列出 commit 中所有文件（相对仓库路径）
-            result = subprocess.run(
-                ["git", "ls-tree", "-r", "--name-only", commit_hash],
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            if result.returncode != 0:
-                logger.warning(f"外部文件全量恢复: ls-tree失败 {result.stderr[:200]}")
+            abs_paths = ExternalFileBackup.list_baseline_files(task_id, commit_spec)
+            if not abs_paths:
                 return 0
 
-            rel_paths = [ln.strip() for ln in result.stdout.split("\n") if ln.strip()]
-            if not rel_paths:
-                return 0
-
-            # 相对路径转绝对路径（备份时去掉了根分隔符）
-            abs_paths: list[str] = []
-            for rel in rel_paths:
-                if rel.startswith("__external__/"):
-                    rel = rel[len("__external__/"):]
-                # Windows 盘符路径（ntpath.isabs=True）直接使用，Unix 路径补根分隔符
-                abs_path = rel if ntpath.isabs(rel) else "/" + rel
-                abs_paths.append(abs_path)
-
-            # 该仓库只存 workdir 外部文件，无需过滤 workdir
-            restored = ExternalFileBackup.restore(task_id, abs_paths, commit_hash)
-            logger.info(f"外部文件全量恢复 task#{task_id}: {restored} 个文件 from {commit_hash[:8]}")
+            restored = ExternalFileBackup.restore(task_id, abs_paths, commit_spec)
+            if isinstance(commit_spec, dict):
+                base_desc = ",".join(f"{k or 'default'}:{v[:8]}" for k, v in commit_spec.items())
+            else:
+                base_desc = str(commit_spec)[:8]
+            logger.info(f"外部文件全量恢复 task#{task_id}: {restored} 个文件 from {base_desc}")
             return restored
         except Exception as e:
             logger.warning(f"外部文件全量恢复失败 task#{task_id}: {e}", exc_info=True)
@@ -3621,17 +3926,22 @@ class ExternalFileBackup:
 
     @staticmethod
     def check_changes(
-        task_id: int, file_paths: list[str], commit_hash: str | None = None
+        task_id: int,
+        file_paths: list[str],
+        commit_hash: str | dict[str, str] | None = None,
     ) -> list[str]:
-        """检查外部文件是否有变化
+        """检查外部文件是否有变化（🔧 按文件定位备份仓库，支持多仓库基线）
 
         使用 git hash-object 逐文件比较 blob hash，不修改备份仓库工作树。
 
         Args:
             task_id: 事务ID
             file_paths: 外部文件绝对路径列表
-            commit_hash: 比较基准commit（默认HEAD）。回滚预检测时传入快照记录的
-                external_backup_commit/external_head_commit 基线。
+            commit_hash: 比较基准commit。None=各文件自己仓库的HEAD（默认）；
+                str=旧格式基线（一律查默认 data 仓库——历史数据全部在那里）；
+                dict={repo_key: commit} 各仓库基线（缺某仓库条目视为该文件新增）。
+                回滚预检测时传入快照记录的 external_backup_commit/
+                external_head_commit 基线。
 
         Returns:
             变化的文件路径列表（绝对路径）
@@ -3640,12 +3950,15 @@ class ExternalFileBackup:
             return []
 
         try:
-            repo = ExternalFileBackup._get_backup_repo(task_id)
-            base = commit_hash or "HEAD"
             changed: list[str] = []
 
             for fp in file_paths:
-                rel = ExternalFileBackup._to_repo_path(fp)
+                repo, repo_key, base = ExternalFileBackup._resolve_base(task_id, fp, commit_hash)
+                if base is None:
+                    # 基线 dict 缺该仓库条目 → 视为新增文件
+                    changed.append(fp)
+                    continue
+                rel = ExternalFileBackup._repo_rel(fp, repo_key)
 
                 if not os.path.exists(fp):
                     # 文件被删除：检查基准commit中是否存在
@@ -3692,8 +4005,12 @@ class ExternalFileBackup:
             return []
 
     @staticmethod
-    def restore(task_id: int, file_paths: list[str], commit_hash: str | None = None) -> int:
-        """从备份恢复外部文件
+    def restore(
+        task_id: int,
+        file_paths: list[str],
+        commit_hash: str | dict[str, str] | None = None,
+    ) -> int:
+        """从备份恢复外部文件（🔧 按文件定位备份仓库，支持多仓库基线）
 
         使用 `git show <commit>:<path>` 直接从指定 commit（默认 HEAD）读取文件内容，
         不修改备份仓库工作树，避免 undo 快照覆盖 HEAD 的问题。
@@ -3701,7 +4018,9 @@ class ExternalFileBackup:
         Args:
             task_id: 事务ID
             file_paths: 外部文件绝对路径列表
-            commit_hash: 恢复源 commit hash（默认使用 HEAD）
+            commit_hash: 恢复源 commit。None=各文件自己仓库的HEAD（默认）；
+                str=旧格式基线（一律从默认 data 仓库恢复）；
+                dict={repo_key: commit} 各仓库基线（缺条目的文件跳过恢复）。
 
         Returns:
             成功恢复的文件数
@@ -3710,12 +4029,13 @@ class ExternalFileBackup:
             return 0
 
         try:
-            repo = ExternalFileBackup._get_backup_repo(task_id)
-            source = commit_hash or "HEAD"
             restored = 0
 
             for fp in file_paths:
-                rel = ExternalFileBackup._to_repo_path(fp)
+                repo, repo_key, source = ExternalFileBackup._resolve_base(task_id, fp, commit_hash)
+                if source is None:
+                    continue  # 基线 dict 缺该仓库条目：无备份可恢复
+                rel = ExternalFileBackup._repo_rel(fp, repo_key)
 
                 # 用 git show 直接从 commit 读取文件内容，不污染工作树
                 result = subprocess.run(
@@ -3735,10 +4055,19 @@ class ExternalFileBackup:
 
             logger.info(
                 f"外部文件恢复 task#{task_id}: {restored} 个文件 "
-                f"(from {source[:8] if len(source) > 8 else source})"
+                f"(from {ExternalFileBackup._baseline_desc(commit_hash)})"
             )
             return restored
 
         except Exception as e:
             logger.warning(f"外部文件恢复失败 task#{task_id}: {e}")
             return 0
+
+    @staticmethod
+    def _baseline_desc(commit_spec: str | dict[str, str] | None) -> str:
+        """基线 commit 的简短描述（用于日志）"""
+        if commit_spec is None:
+            return "HEAD"
+        if isinstance(commit_spec, dict):
+            return ",".join(f"{k or 'default'}:{str(v)[:8]}" for k, v in commit_spec.items())
+        return str(commit_spec)[:8]

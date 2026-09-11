@@ -178,6 +178,14 @@ def _save_ui_settings(settings: dict, config_path: Path | None = None) -> bool:
             if key in settings:
                 config["webui"][key] = settings[key]
 
+        # xterm 配置（行号显示开关等）
+        if "xterm" in settings:
+            xterm = settings["xterm"]
+            if not isinstance(config["webui"].get("xterm"), dict):
+                config["webui"]["xterm"] = {}
+            if "show_line_numbers" in xterm:
+                config["webui"]["xterm"]["show_line_numbers"] = bool(xterm["show_line_numbers"])
+
         _save_webui_json(config)
 
         logger.info(f"UI设置已保存到配置: {settings}")

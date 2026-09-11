@@ -57,6 +57,49 @@ class LLMError(Exception):
 _THINKING_TAG_PATTERN = re.compile(r"<think\>(.*?)\</think\>", re.DOTALL)
 
 
+# 多模态附件part估算token数（与MessageHistory.estimate_tokens保持一致）
+_MULTIMODAL_PART_ESTIMATED_TOKENS = 1000
+
+
+def estimate_messages_tokens(messages: list[dict] | None) -> int:
+    """估算消息列表的输入token数（事务#1807）
+
+    算法与 MessageHistory.estimate_tokens（tool_engine.py）一致：
+    JSON序列化字符数 / 3.5（混合中英文平均token比率），多模态content中
+    非text part按固定附件token数估算。client不能import tool_engine
+    （会循环导入），故此处独立实现，两处算法需保持同步。
+
+    用于chat_stream选择provider时校验目标provider的上下文能力，
+    防止切换到装不下当前上下文的provider后必然400超限（事务#1805）。
+    """
+    if not messages:
+        return 0
+    total_chars = 0
+    part_tokens = 0
+    for msg in messages:
+        if not msg:
+            continue
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list):
+            # 多模态消息：text part按字符估算，附件part按固定token估算
+            text_chars = 0
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_chars += len(part.get("text", ""))
+                else:
+                    part_tokens += _MULTIMODAL_PART_ESTIMATED_TOKENS
+            total_chars += text_chars + 100  # 100: 消息结构开销
+            continue
+        try:
+            msg_str = json.dumps(msg, ensure_ascii=False)
+        except (TypeError, ValueError):
+            msg_str = str(msg)
+        total_chars += len(msg_str)
+
+    # 混合中英文：平均约 3.5 字符/token；附件按固定 token 数累加
+    return total_chars * 2 // 7 + part_tokens
+
+
 @dataclass
 class StreamChunk:
     """流式响应块"""
@@ -223,6 +266,125 @@ async def load_task_agents_md(task: dict | None) -> str | None:
     except Exception as e:
         logger.warning(f"[LLM Client] load_task_agents_md 失败(忽略): {e}")
         return None
+
+
+# ==================== 任务技能远程发现（事务#1827） ====================
+
+# (nest_name, workdir_abs, skill_name) -> (mtime_ns, size, content) 缓存
+_skill_md_cache: dict[tuple[str, str, str], tuple[int, int, str]] = {}
+
+
+def _strip_line_prefix(lines: list[str], offset: int = 1) -> str:
+    """剥离 nest read 返回行的行号前缀（"N: content"），按 offset 起始递增"""
+    out = []
+    for i, line in enumerate(lines):
+        prefix = f"{i + offset}: "
+        out.append(line[len(prefix):] if line.startswith(prefix) else line)
+    return "\n".join(out)
+
+
+async def list_remote_skill_dirs(nest_name: str, workdir: str) -> list[str]:
+    """通过 nest 协议列出远程 nest 工作目录下 skills/ 子目录名（每个含 SKILL.md 的为一个 skill）
+
+    仅返回目录名列表（不读取内容，内容按需经 read_remote_skill_md 获取）。失败静默返回空列表。
+    """
+    from peng.nest.client import send_request
+    from peng.nest.protocol import NestError
+
+    skills_dir = str(Path(workdir) / "skills")
+    try:
+        read_resp = await asyncio.wait_for(
+            send_request(
+                "read", {"path": skills_dir, "offset": 1, "limit": 1000},
+                timeout=_AGENTS_MD_READ_TIMEOUT, nest_name=nest_name,
+            ),
+            timeout=_AGENTS_MD_READ_TIMEOUT + 5,
+        )
+        if read_resp.error or not isinstance(read_resp.data, dict):
+            return []
+        # nest 目录读取返回 {"type":"directory","entries":[{"name","is_dir",...}]}（见 local._read_directory）
+        data = read_resp.data
+        if data.get("type") != "directory":
+            return []
+        entries = data.get("entries") or []
+        names = [e.get("name") for e in entries if e.get("is_dir") and e.get("name")]
+        return [n for n in names if n]
+    except (NestError, asyncio.TimeoutError) as e:
+        logger.warning(f"[LLM Client] 列出远程nest skills目录失败(忽略): {nest_name}:{skills_dir}: {e}")
+        return []
+    except Exception as e:
+        logger.warning(f"[LLM Client] 列出远程nest skills目录异常(忽略): {nest_name}:{skills_dir}: {e}")
+        return []
+
+
+async def read_remote_skill_md(nest_name: str, workdir: str, name: str) -> str | None:
+    """通过 nest 协议读取远程 nest 工作目录 skills/<name>/SKILL.md 内容（带 mtime+size 缓存）
+
+    stat+read 组合实现缓存；文件不存在/读取失败静默返回 None（不影响事务）。
+    """
+    from peng.nest.client import send_request
+    from peng.nest.protocol import NestError
+
+    skill_md_name = "SKILL.md"
+    try:
+        from peng.config import load_config
+        skill_md_name = load_config().paths.skill_md_name
+    except Exception:
+        pass
+
+    remote_path = str(Path(workdir) / "skills" / name / skill_md_name)
+    try:
+        # 1. stat 获取 mtime/size（用于缓存判断）
+        stat_resp = await asyncio.wait_for(
+            send_request(
+                "stat", {"path": remote_path},
+                timeout=_AGENTS_MD_READ_TIMEOUT, nest_name=nest_name,
+            ),
+            timeout=_AGENTS_MD_READ_TIMEOUT + 5,
+        )
+        if stat_resp.error or not isinstance(stat_resp.data, dict):
+            return None  # 文件不存在或stat失败 → None（调用方跳过）
+        try:
+            mtime_ns = int(float(stat_resp.data.get("mtime", 0) or 0) * 1e9)
+        except (TypeError, ValueError):
+            mtime_ns = 0
+        size = stat_resp.data.get("size", 0) or 0
+
+        # 2. 缓存命中（mtime+size 未变）直接返回缓存内容
+        cache_key = (nest_name, str(Path(workdir).resolve()), name)
+        cached = _skill_md_cache.get(cache_key)
+        if cached and cached[0] == mtime_ns and cached[1] == size:
+            logger.debug(f"[LLM Client] SKILL.md 缓存命中: {nest_name}:{remote_path}")
+            return cached[2]
+
+        # 3. read 读取内容（lines 带行号前缀需剥离）
+        read_resp = await asyncio.wait_for(
+            send_request(
+                "read", {"path": remote_path, "offset": 1, "limit": 2000},
+                timeout=_AGENTS_MD_READ_TIMEOUT, nest_name=nest_name,
+            ),
+            timeout=_AGENTS_MD_READ_TIMEOUT + 5,
+        )
+        if read_resp.error or not isinstance(read_resp.data, dict):
+            return None
+        lines = read_resp.data.get("lines") or []
+        content = _strip_line_prefix(lines, offset=1)
+        if read_resp.data.get("end", 0) >= read_resp.data.get("total_lines", 0):
+            content += "\n" if content else ""
+        if read_resp.data.get("total_lines", 0) > len(lines):
+            logger.warning(f"[LLM Client] SKILL.md 超过2000行已截断: {nest_name}:{remote_path}")
+        _skill_md_cache[cache_key] = (mtime_ns, size, content)
+        logger.info(f"[LLM Client] 已读取远程nest SKILL.md: {nest_name}:{remote_path} ({len(content)}字符)")
+        return content
+    except (NestError, asyncio.TimeoutError) as e:
+        if _is_agents_md_not_found(e):
+            return None  # nest端文件不存在 → None（调用方跳过）
+        logger.warning(f"[LLM Client] 读取远程nest SKILL.md失败(忽略): {nest_name}:{remote_path}: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"[LLM Client] 读取远程nest SKILL.md异常(忽略): {nest_name}:{remote_path}: {e}")
+        return None
+
 
 
 @dataclass
@@ -429,6 +591,49 @@ class GLMClient:
         """关闭客户端"""
         await self._client.aclose()
 
+    def refresh_provider_vars(self, content: str | None = None) -> None:
+        """按当前有效 provider 解析配置并更新临时变量（不发起请求）
+
+        __init__ 只填入全局默认值，provider 专属临时变量
+        （provider/compact_threshold/thinking_mode/thinking_type/provider_config）
+        在 chat_stream 选中 provider 后才同步。事务恢复后首轮迭代的 compact
+        检查发生在首次请求之前，需先调用本方法按当前有效 provider
+        更新临时变量，与 chat_stream 连上 provider 后的更新保持同一套字段。
+
+        Args:
+            content: 事务content（可选）。传入时解析其中的@<provider>标记
+                （favorites/locked/forbidden），使预热与 chat_stream 的 provider
+                选择保持一致；否则纯按 priority 自动选择（预热结果会污染
+                self.provider，导致 chat_stream 锁定语法@<provider>!失效）
+        """
+        favorites = None
+        locked = False
+        forbidden = None
+        if content:
+            fetch_result = self.config.fetch_providers(content)
+            if fetch_result:
+                favorites, locked, forbidden = fetch_result
+        provider_data = self.config.get_provider(
+            current=self.provider,
+            favorites=favorites,
+            locked=locked,
+            forbidden=forbidden,
+        )
+        if not provider_data:
+            logger.warning("[LLM Client] 预热provider临时变量失败: 无可用provider")
+            return
+        provider = provider_data["provider"]
+        if provider != self.provider:
+            logger.info(
+                f"[LLM Client] 预热provider临时变量: {self.provider or 'None'} → {provider} "
+                f"(compact_threshold={provider_data['compact_threshold']})"
+            )
+        self.provider = provider
+        self.compact_threshold = provider_data["compact_threshold"]
+        self.thinking_mode = provider_data["thinking_mode"]
+        self.thinking_type = provider_data.get("thinking_type")
+        self.provider_config = provider_data  # 保存完整配置（含 price_* 字段）
+
     async def chat_stream(
         self,
         message_id: int | None = None,
@@ -494,9 +699,34 @@ class GLMClient:
                     prefer_vision = bool(extract_file_refs(mm_source))
                 except Exception as e:
                     logger.debug(f"[LLM Client] 多模态引用检测失败(忽略): {e}")
+            # 请求消息中已携带多模态附件part（read等工具结果附件，或上下文恢复的
+            # 未发送附件）时必须使用vision provider，否则文本provider收到不支持的
+            # 消息格式会报400并误触发该provider冷却
+            if not prefer_vision:
+                try:
+                    from peng.llm.multimodal import messages_have_attachment_parts
+
+                    if messages_have_attachment_parts(messages):
+                        prefer_vision = True
+                        logger.info(
+                            "[LLM Client] 检测到请求携带多模态附件，优先选择vision provider"
+                        )
+                except Exception as e:
+                    logger.debug(f"[LLM Client] 附件part检测失败(忽略): {e}")
             # failed 参数优先级：显式传入 > retry推断
             # 对于429限流错误，调用方可传 failed=False 来保持同一provider
             should_mark_failed = failed if failed is not None else (retry and retry > 0)
+            # 上下文能力校验（事务#1807）：估算当前请求输入token，禁止切换到
+            # 装不下当前上下文的provider（有效compact_threshold不足者），防止
+            # 事务#1805式"切换→400超限→重试→再切换"持续严重错误循环
+            min_context_tokens = None
+            try:
+                est = estimate_messages_tokens(messages)
+                if est > 0:
+                    # 5%余量覆盖tools schema等未计入的请求开销
+                    min_context_tokens = int(est * 1.05)
+            except Exception as e:
+                logger.debug(f"[LLM Client] 请求token估算失败(忽略，不限制provider选择): {e}")
             provider_data = self.config.get_provider(
                 current=self.provider,
                 favorites=favorite_providers,
@@ -505,6 +735,7 @@ class GLMClient:
                 locked=provider_locked,
                 forbidden=forbidden_providers,
                 prefer_vision=prefer_vision,
+                min_context_tokens=min_context_tokens,
             )
         else:
             provider_data = None
@@ -529,13 +760,13 @@ class GLMClient:
                     is_error_output = False
                     if self.provider and self.error:
                         # 有错误信息：显示"大模型报错"+ 错误详情
-                        content = f"\n💠 {ANSI_COLORS['blue']} 大模型API报错 {ANSI_COLORS['bright_yellow']}{self.error} {ANSI_COLORS['blue']}，已切换： {ANSI_COLORS['reset']}{old} {self.provider} →- {new} {provider} \n"
+                        content = f"💠 {ANSI_COLORS['blue']} 大模型API报错 {ANSI_COLORS['bright_yellow']}{self.error} {ANSI_COLORS['blue']}，已切换： {ANSI_COLORS['reset']}{old} {self.provider} →- {new} {provider} \n"
                         is_error_output = True
                     elif self.provider:
                         # 无错误信息但 provider 发生变化（优先级自动调整/冷却到期等）：显示"切换大模型"
-                        content = f"\n💠 {ANSI_COLORS['blue']} 切换大模型： {ANSI_COLORS['reset']}{old} {self.provider} →- {new} {provider} \n"
+                        content = f"💠 {ANSI_COLORS['blue']} 切换大模型： {ANSI_COLORS['reset']}{old} {self.provider} →- {new} {provider} \n"
                     else:
-                        content = f"\n💠 {ANSI_COLORS.get('blue')} 连接大模型： {ANSI_COLORS.get('reset')} {new} {provider} \n"
+                        content = f"💠 {ANSI_COLORS.get('blue')} 连接大模型： {ANSI_COLORS.get('reset')} {new} {provider} \n"
                     # 系统报错去重：重复的报错不输出（切换/连接信息不受影响）
                     if not is_error_output or self._should_report_error(content, task_id):
                         get_output_manager().write_output(
@@ -626,6 +857,29 @@ class GLMClient:
                 f"effective_thinking={effective_thinking}, "
                 f"thinking_type={current_thinking_type}"
             )
+
+            # 🔧 事务#1819：附件降级闭环 —— 选定的provider不支持多模态时，
+            # 把消息中的附件part降级为文本提示再发送。防止附件发给不支持
+            # vision的provider导致HTTP 400（content.type参数非法）并误冷却
+            # 该provider（事务#1818死循环诱因之一）。vision值已经loader
+            # 运行期禁用检查（禁用时为"disabled"）。
+            _vision_cfg = str(provider_data.get("vision", "disabled")).lower()
+            _provider_vision_ok = _vision_cfg in ("true", "yes", "on", "enabled", "only")
+            if not _provider_vision_ok:
+                try:
+                    from peng.llm.multimodal import (
+                        demote_messages_attachments,
+                        messages_have_attachment_parts,
+                    )
+
+                    if messages_have_attachment_parts(messages):
+                        logger.warning(
+                            f"[LLM Client] provider {self.provider} 不支持多模态，"
+                            f"已将请求中的附件降级为文本提示"
+                        )
+                        messages = demote_messages_attachments(messages)
+                except Exception as e:
+                    logger.debug(f"[LLM Client] 附件降级检查失败(忽略): {e}")
 
             payload: dict[str, Any] = {
                 "model": effective_model,
@@ -799,6 +1053,26 @@ class GLMClient:
             self._client.headers["Authorization"] = f"Bearer {current_api_key}"
             logger.debug(f"[LLM Client] 发送POST请求: {url}")
             logger.debug(f"[LLM Client] payload keys: {list(payload.keys())}")
+            # 🔧 事务#1864：prefill阶段追踪——请求发出前启动。本地大模型
+            # （如s-qwen3.8）长上下文prefill期间SSE流无任何chunk返回，
+            # chunk驱动的心跳会停更导致超时误杀。追踪线程定期更新心跳+
+            # 写prefill状态文件（webui/CLI显示百分比），首个SSE行到达即停止。
+            _prefill_est_tokens = 0
+            try:
+                _prefill_est_tokens = int(estimate_messages_tokens(messages))
+            except Exception:
+                pass
+            try:
+                from peng.llm.prefill_tracker import get_prefill_tracker
+
+                get_prefill_tracker().start_request(
+                    task_id=task_id,
+                    est_tokens=_prefill_est_tokens,
+                    provider=self.provider,
+                    compact_threshold=self.compact_threshold,
+                )
+            except Exception as _pf_err:
+                logger.debug(f"[LLM Client] prefill追踪启动失败(忽略): {_pf_err}")
             # 使用手动上下文管理替代 async with，避免 GeneratorExit
             # 传播到 __aexit__ 时触发 "athrow(): asynchronous generator is already running"
             cm = self._client.stream("POST", url, json=payload)
@@ -877,6 +1151,14 @@ class GLMClient:
                         break
                     line_count += 1
                     if line_count == 1:
+                        # 🔧 事务#1864：SSE流首个数据行到达，prefill阶段结束，
+                        # 停止prefill追踪（心跳恢复正常chunk驱动语义）
+                        try:
+                            from peng.llm.prefill_tracker import get_prefill_tracker
+
+                            get_prefill_tracker().finish_request(task_id)
+                        except Exception:
+                            pass
                         logger.debug(f"[LLM Client] 第一行: {line[:200]}")
                     if line_count <= 3 or line_count % 100 == 0:
                         logger.debug(f"[LLM Client] 第{line_count}行: {line[:200]}")
@@ -1203,6 +1485,14 @@ class GLMClient:
                 if self.provider and self.config:
                     self.config.mark_success(self.provider)
             finally:
+                # 🔧 事务#1864：流结束（正常/异常/中断）兜底停止prefill追踪，
+                # 防止请求失败后追踪线程残留持续更新心跳掩盖真卡死（幂等操作）
+                try:
+                    from peng.llm.prefill_tracker import get_prefill_tracker
+
+                    get_prefill_tracker().finish_request(task_id)
+                except Exception:
+                    pass
                 # 手动退出上下文管理器，确保 HTTP 连接被关闭
                 # 捕获 RuntimeError：当 GeneratorExit 触发时，Python 会自动清理嵌套的
                 # 异步生成器，此时再手动调用 __aexit__ 会因 "asynchronous generator is already running" 而失败

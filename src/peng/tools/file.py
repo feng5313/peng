@@ -755,10 +755,25 @@ MAX_IMAGE_PIXELS_LABEL = f"{MAX_IMAGE_PIXELS // (1024 * 1024)}M 像素"
 # 本地 fallback 时补充 mimetypes 不识别的图片扩展名（与 nest local.py 保持一致）
 _EXTRA_IMAGE_EXTENSIONS = {".webp", ".ico", ".tiff", ".tif", ".avif", ".heic", ".heif"}
 
+# 主流大模型 vision API（OpenAI/Anthropic/Gemini/GLM/DeepSeek 等）普遍支持的
+# 图片 MIME 白名单。BMP/TIFF/ICO/AVIF/HEIC 等不在其中——GLM 对 BMP 返回
+# 400"图片输入格式/解析错误"（事务#1822：1400x700 截图 BMP 像素≤1M 原样
+# 透传触发），故非白名单格式进入上下文前必须统一转码 PNG（无损）
+PROVIDER_SAFE_IMAGE_MIMES = frozenset(
+    {"image/jpeg", "image/png", "image/gif", "image/webp"}
+)
 
-def downscale_image_bytes(data: bytes, mime: str) -> tuple[bytes, str, bool]:
-    """
-    将图片缩放到 MAX_IMAGE_PIXELS（1M 像素）以内。
+
+def normalize_image_bytes(data: bytes, mime: str) -> tuple[bytes, str, str]:
+    """规范化图片字节流：全量解码验证 + 缩放至 1M 像素内 + 转码为 provider 通用格式。
+
+    三项处理（🔧 事务#1834 新增格式转码）：
+    1. 全量解码验证（load）：截断/损坏数据在 load() 时抛异常，由调用方拒绝入库
+    2. 等比缩放到 MAX_IMAGE_PIXELS 以内（仅内存中处理，不修改原图）
+    3. 格式规范化：mime 不在 PROVIDER_SAFE_IMAGE_MIMES 白名单（BMP/TIFF/ICO
+       等 provider 普遍不支持的格式）时转码为 PNG（无损，截图类体积通常更小）；
+       像素≤1M 时原样透传非白名单格式会在部分 provider（GLM 不支持 BMP）
+       触发 400 图片解析错误，清除附件重试又丢失视觉信息，导致反复报错
 
     仅在内存中处理，不修改磁盘上的原图文件。
 
@@ -767,62 +782,119 @@ def downscale_image_bytes(data: bytes, mime: str) -> tuple[bytes, str, bool]:
         mime: 原始 MIME 类型
 
     Returns:
-        (图片字节流, MIME 类型, 是否发生了缩放)。
-        未超过像素上限时原样返回；无法解码时由调用方容错处理。
+        (图片字节流, MIME 类型, 转换说明)。未发生转换时说明为空串。
+
+    Raises:
+        PIL.UnidentifiedImageError: PIL 完全不识别的格式（缺解码插件）
+        其余解码异常: 数据截断/损坏（调用方应拒绝该附件入库）
     """
     import io
 
     from PIL import Image, ImageOps
 
     with Image.open(io.BytesIO(data)) as src:
+        # 🔧 事务#1819：强制全量解码验证 —— Image.open 是懒加载（只读头部），
+        # 截断/损坏文件在缩放或发送前都不会暴露问题，必须在读取时 load()
+        # 全量解码，损坏数据一律在此拒绝（配合 _build_binary_attachment）
+        src.load()
         # 按 EXIF orientation 摆正像素方向（重编码后 EXIF 会丢失，避免方向错误）
         src = ImageOps.exif_transpose(src) or src
         width, height = src.size
-        if width * height <= MAX_IMAGE_PIXELS:
-            return data, mime, False
+        needs_downscale = width * height > MAX_IMAGE_PIXELS
+        if needs_downscale:
+            # 等比缩放到 1M 像素以内
+            scale = (MAX_IMAGE_PIXELS / (width * height)) ** 0.5
+            new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+            img = src.resize(new_size, Image.LANCZOS)
+        elif mime not in PROVIDER_SAFE_IMAGE_MIMES:
+            # 非白名单格式转码：脱离源文件句柄复制后再编码
+            img = src.copy()
+        else:
+            # 白名单格式且未超像素上限：原样返回
+            return data, mime, ""
 
-        # 等比缩放到 1M 像素以内
-        scale = (MAX_IMAGE_PIXELS / (width * height)) ** 0.5
-        new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
-        img = src.resize(new_size, Image.LANCZOS)
-
-    # 重新编码：JPEG/WEBP 有损压缩控制体积，其余格式统一转 PNG（支持 alpha 等全部模式）
-    if mime == "image/webp":
-        if img.mode not in ("RGB", "RGBA"):
-            img = img.convert("RGBA")
-        fmt, save_kwargs, out_mime = "WEBP", {"quality": 85}, "image/webp"
-    elif mime == "image/jpeg":
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        fmt, save_kwargs, out_mime = "JPEG", {"quality": 85}, "image/jpeg"
-    else:
-        fmt, save_kwargs, out_mime = "PNG", {}, "image/png"
+        # 重新编码。缩放时按原格式重编码（JPEG/WEBP 有损压缩控制体积）；
+        # 转码或其余格式统一 PNG（支持全部像素模式，无损）
+        if needs_downscale and mime == "image/webp":
+            if img.mode not in ("RGB", "RGBA"):
+                img = img.convert("RGBA")
+            fmt, save_kwargs, out_mime = "WEBP", {"quality": 85}, "image/webp"
+        elif needs_downscale and mime == "image/jpeg":
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            fmt, save_kwargs, out_mime = "JPEG", {"quality": 85}, "image/jpeg"
+        else:
+            # PNG 不支持 CMYK 模式，其余模式（1/L/LA/P/RGB/RGBA/I;16等）均可
+            if img.mode == "CMYK":
+                img = img.convert("RGB")
+            fmt, save_kwargs, out_mime = "PNG", {}, "image/png"
 
     buf = io.BytesIO()
     img.save(buf, format=fmt, **save_kwargs)
-    return buf.getvalue(), out_mime, True
+    notes = []
+    if needs_downscale:
+        notes.append(f"已缩放至 ≤{MAX_IMAGE_PIXELS_LABEL}")
+    if out_mime != mime:
+        short = out_mime.split("/", 1)[1].upper()  # png→PNG jpeg→JPEG
+        notes.append(f"已转换为{short}通用格式")
+    if notes:
+        notes.append("原图未修改")
+    return buf.getvalue(), out_mime, f"（{'，'.join(notes)}）"
 
 
 def _build_binary_attachment(file_path: str, b64_data: str, mime: str) -> DualOutput:
     """
     构建图片/PDF 附件输出。
 
-    图片会缩放到 MAX_IMAGE_PIXELS（1M 像素）以内（仅内存中处理，不修改原图），
-    缩放失败时保留原始数据并记录日志。
+    图片会缩放到 MAX_IMAGE_PIXELS（1M 像素）以内，并转码为 provider 通用
+    格式（PROVIDER_SAFE_IMAGE_MIMES 白名单外的 BMP/TIFF 等统一转 PNG，
+    仅内存中处理，不修改原图）。
+
+    🔧 事务#1819：图片完整性校验 —— 读取时用 PIL 全量解码验证（Image.open
+    是懒加载，必须 load() 才能暴露截断/损坏），解码失败（如截图脚本写入
+    截断的BMP）判定文件损坏，返回错误提示而非把损坏附件放进上下文。
+    损坏附件一旦进入上下文，所有 provider 都会 HTTP 400 拒绝，且换
+    provider 也无法恢复，曾导致事务#1818无限重试死循环。
+
+    🔧 事务#1834：非白名单格式（BMP/TIFF/ICO等）原样透传会被部分 provider
+    （GLM不支持BMP）以400"图片输入格式/解析错误"拒绝，清除附件重试又丢失
+    视觉信息导致模型反复read反复失败（事务#1822），故统一转码PNG后入库。
+
+    例外：PIL 完全不识别的格式（UnidentifiedImageError，如无插件时的
+    heic/avif）无法验证，保留原始数据交由 vision provider 判断。
     """
     import base64
 
-    note = ""
-    if mime.startswith("image/"):
-        try:
-            data, mime, downscaled = downscale_image_bytes(base64.b64decode(b64_data), mime)
-            if downscaled:
-                b64_data = base64.b64encode(data).decode("utf-8")
-                note = f"（已缩放至 ≤{MAX_IMAGE_PIXELS_LABEL}，原图未修改）"
-        except Exception as e:
-            logger.warning(f"read 图片缩放失败，保留原始数据: {e}")
-
     kind = "图片" if mime.startswith("image/") else "PDF"
+    if kind == "图片":
+        try:
+            raw = base64.b64decode(b64_data)
+            data, mime, note = normalize_image_bytes(raw, mime)
+            if note:
+                b64_data = base64.b64encode(data).decode("utf-8")
+            else:
+                note = ""
+        except Exception as e:
+            from PIL import UnidentifiedImageError
+
+            if isinstance(e, UnidentifiedImageError) or (
+                type(e).__name__ == "UnidentifiedImageError"
+            ):
+                # PIL 不识别该格式（可能缺解码插件）：无法本地验证，
+                # 保留原始数据（provider 端可能支持）
+                logger.warning(f"read 图片格式无法本地验证(PIL不识别)，保留原始数据: {file_path}: {e}")
+                note = ""
+            else:
+                # 可识别格式但解码失败（截断/损坏）：拒绝入库，防止污染上下文
+                logger.warning(f"read 图片解码失败(文件可能损坏)，拒绝作为附件返回: {file_path}: {e}")
+                msg = f"{kind} 读取失败: 文件损坏或格式异常（无法解码），请检查源文件或重新生成"
+                return DualOutput(
+                    summary=msg,
+                    display=f"❌ {msg}: {file_path}\n解码错误: {e}",
+                )
+    else:
+        note = ""
+
     msg = f"{kind} 读取成功{note}"
     data_url = f"data:{mime};base64,{b64_data}"
     return DualOutput(
@@ -881,7 +953,7 @@ READ_DESCRIPTION = """从远程 nest 读取文件或目录。如果路径不存�
 - 当您知道要读取多个文件时，请并行调用此工具。
 - 避免重复的小切片（30 行块）。如果需要更多上下文，请读取更大的窗口。
 - 多模态大模型可以用此工具可以读取支持的图片、音频、视频、PDF等文件格式，并将其作为文件附件返回，然后识别。
-- 读取图片时自动等比缩放到 1M 像素以内后再返回（仅在内存中处理，原图不会被修改）。"""
+- 读取图片时自动等比缩放到 1M 像素以内后再返回，并转换为provider通用格式（BMP/TIFF等转PNG；仅在内存中处理，原图不会被修改）。"""
 
 
 class ReadTool(Tool):
@@ -1142,7 +1214,8 @@ WRITE_DESCRIPTION = """向远程 nest 写入文件。
 - 如果是现有文件，您必须先使用 Read 工具读取文件内容。如果您没有先读取文件，此工具将失败。
 - 始终优先编辑代码库中的现有文件。除非明确要求，否则不要写入新文件。
 - 绝不要主动创建文档文件（*.md）或 README 文件。仅在用户明确要求时才创建文档文件。
-- 仅在用户明确要求时才使用表情符号。除非被要求，否则避免将表情符号写入文件。"""
+- 仅在用户明确要求时才使用表情符号。除非被要求，否则避免将表情符号写入文件。
+- ⚠️ 写入文件必须说明目的（purpose参数），要简明扼要（4-200个字符），否则将被拒绝执行！"""
 
 
 class WriteTool(Tool):
@@ -1169,14 +1242,26 @@ class WriteTool(Tool):
                     "type": "string",
                     "description": "要写入文件的内容",
                 },
+                "purpose": {
+                    "type": "string",
+                    "description": "写入该文件的目的说明（必填，4-200个字符）。大模型调用write工具时必须说明写入目的，否则将被拒绝。",
+                },
             },
-            "required": ["filePath", "content"],
+            "required": ["filePath", "content", "purpose"],
         }
 
     async def execute(self, **kwargs: Any) -> DualOutput:
         """执行写入文件 - 通过 nest 远程，local nest 不可用时本地 fallback"""
         file_path: str = kwargs.get("filePath", "")
         content: str = kwargs.get("content", "")
+
+        # 目的说明检查：大模型必须说明写入文件的目的（参考 bash 工具 purpose 校验）
+        purpose: str = (kwargs.get("purpose") or "").strip()
+        if not purpose or len(purpose) < 4 or len(purpose) > 200:
+            raise ToolError(
+                "写入被拒绝：必须通过 purpose 参数简明扼要地说明写入该文件的目的（4-200字符）。"
+                "例如 purpose='初始化配置文件'。"
+            )
 
         # 🔧 data/ 目录文件始终写入本地项目目录（跨 nest 共享数据）
         from peng.common.paths import resolve_local_data_path
@@ -1323,6 +1408,7 @@ EDIT_DESCRIPTION = """在文件中执行精确字符串替换。
 - 仅在用户明确要求时才使用表情符号。除非被要求，否则避免将表情符号添加到文件中。
 - 使用 `replaceAll` 替换和重命名文件中的字符串。如果您想重命名变量，此参数很有用。
 - 如果报错oldString匹配问题，可尝试使用line_edit行编辑工具，用行号精确指定编辑范围。
+- ⚠️ 编辑文件必须说明目的（purpose参数），要简明扼要（4-200个字符），否则将被拒绝执行！
 """
 
 
@@ -1358,8 +1444,12 @@ class EditTool(Tool):
                     "type": "boolean",
                     "description": "替换所有出现的 oldString（默认为 false）",
                 },
+                "purpose": {
+                    "type": "string",
+                    "description": "执行该编辑的目的说明（必填，4-200个字符）。大模型调用edit工具时必须说明编辑目的，否则将被拒绝。",
+                },
             },
-            "required": ["filePath", "oldString", "newString"],
+            "required": ["filePath", "oldString", "newString", "purpose"],
         }
 
     async def execute(self, **kwargs: Any) -> DualOutput:
@@ -1368,6 +1458,14 @@ class EditTool(Tool):
         oldString: str = kwargs.get("oldString", "")
         newString: str = kwargs.get("newString", "")
         replace_all: bool = kwargs.get("replaceAll", False)
+
+        # 目的说明检查：大模型必须说明编辑文件的目的（参考 bash 工具 purpose 校验）
+        purpose: str = (kwargs.get("purpose") or "").strip()
+        if not purpose or len(purpose) < 4 or len(purpose) > 200:
+            raise ToolError(
+                "编辑被拒绝：必须通过 purpose 参数简明扼要地说明本次编辑的目的（4-200字符）。"
+                "例如 purpose='修复空指针异常'。"
+            )
 
         # 参数验证
         if not file_path:
@@ -1537,7 +1635,8 @@ LINE_EDIT_DESCRIPTION = """按行号编辑文件：删除指定行范围、替�
 - 操作前必须先使用 read 工具读取同一文件的相关行号区域，且 read 的行号范围需覆盖 line_edit 的操作区域。否则将拒绝编辑并提示先 read。
 - ⚠️ 重要：每次 line_edit 操作会改变文件行数，后续操作的行号会偏移！
   返回结果中的"编辑后行号预览"显示了编辑点附近的最新行号，务必参考此预览确定下一次操作的行号。
-  如果不确定当前行号，请先用 read 工具重新读取文件确认。"""
+  如果不确定当前行号，请先用 read 工具重新读取文件确认。
+- ⚠️ 行编辑必须说明目的（purpose参数），要简明扼要（4-200个字符），否则将被拒绝执行！"""
 
 
 def _build_local_context(
@@ -1633,8 +1732,12 @@ class LineEditTool(Tool):
                     "enum": ["before", "after"],
                     "description": "插入位置（默认 after）。insert 操作时有效",
                 },
+                "purpose": {
+                    "type": "string",
+                    "description": "执行该行编辑的目的说明（必填，4-200个字符）。大模型调用line_edit工具时必须说明编辑目的，否则将被拒绝。",
+                },
             },
-            "required": ["filePath", "operation"],
+            "required": ["filePath", "operation", "purpose"],
         }
 
     async def execute(self, **kwargs: Any) -> DualOutput:
@@ -1646,6 +1749,14 @@ class LineEditTool(Tool):
         line = kwargs.get("line")
         content: str = kwargs.get("content", "")
         position: str = kwargs.get("position", "after")
+
+        # 目的说明检查：大模型必须说明行编辑的目的（参考 bash 工具 purpose 校验）
+        purpose: str = (kwargs.get("purpose") or "").strip()
+        if not purpose or len(purpose) < 4 or len(purpose) > 200:
+            raise ToolError(
+                "行编辑被拒绝：必须通过 purpose 参数简明扼要地说明本次编辑的目的（4-200字符）。"
+                "例如 purpose='删除冗余日志代码'。"
+            )
 
         # 归一化：LLM 有时用 <br> 代替换行符，统一替换为 \n
         if content:
@@ -1952,6 +2063,8 @@ __all__ = [
     "get_mime_type",
     "is_image_file",
     "is_pdf_file",
+    "PROVIDER_SAFE_IMAGE_MIMES",
+    "normalize_image_bytes",
     "find_similar_files",
     # 替换器
     "simple_replacer",

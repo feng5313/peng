@@ -13,6 +13,19 @@ function debouncedSaveFilters() {
   }, 500);
 }
 
+// 🔧 防抖保存 xterm 行号显示开关到后端（/api/config/ui-settings → data/webui.json 覆盖层）
+let _saveLineNoTimer = null;
+function debouncedSaveLineNumbers() {
+  if (_saveLineNoTimer) clearTimeout(_saveLineNoTimer);
+  _saveLineNoTimer = setTimeout(() => {
+    fetch('/api/config/ui-settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ xterm: { show_line_numbers: !!state.webuiConfig.xterm.show_line_numbers } })
+    }).catch(err => console.warn('保存行号显示配置失败:', err));
+  }, 500);
+}
+
 function initOutputFilters() {
   // 初始化checkbox状态
   const filters = document.querySelectorAll('.filter-checkbox input[type="checkbox"]');
@@ -31,11 +44,28 @@ function initOutputFilters() {
       });
     }
   });
+
+  // 🔧 xterm 行号显示开关（默认不勾选，持久化到后端 xterm 配置）
+  // 注意：loadWebUIConfig() 已在 initOutputFilters() 之前 await 完成（init.js），此处 state 即为持久化值
+  const lineNoToggle = document.getElementById('xterm-line-numbers-toggle');
+  if (lineNoToggle) {
+    lineNoToggle.checked = state.webuiConfig.xterm.show_line_numbers === true;
+    lineNoToggle.addEventListener('change', (e) => {
+      state.webuiConfig.xterm.show_line_numbers = e.target.checked;
+      // 重绘当前显示内容（静默无toast；底部锚定精确恢复滚动位置，视口不跳变）
+      refreshOutputWithFilters(false, true);
+      // 防抖保存到后端配置文件
+      debouncedSaveLineNumbers();
+    });
+  }
 }
 
 
 // 根据当前过滤器重新显示输出
-function refreshOutputWithFilters() {
+// @param {boolean} [showToast=true] - 是否显示"已更新过滤输出"toast（行号切换等场景传 false 静默重绘）
+// @param {boolean} [exactScroll=false] - 精确恢复滚动位置（底部锚定）。重绘不改变内容行数的场景（行号开关）
+//   必须传 true：默认的 scrollPages 页级恢复在 clear() 后 buffer 变短时会被 clamp 到顶部，视口跳变
+function refreshOutputWithFilters(showToast = true, exactScroll = false) {
   if (!state.output) {
     console.warn('state.output为null，无法刷新输出');
     return;
@@ -44,6 +74,8 @@ function refreshOutputWithFilters() {
   const buffer = state.output.buffer.active;
   const viewportY = buffer.viewportY;
   const rows = state.output.rows;
+  // 🔧 底部锚定精确恢复基准：视口顶部距内容底部的渲染行数（重绘前后保持不变）
+  const linesFromBottom = Math.max(0, buffer.length - viewportY);
 
   // 清空终端
   state.output.clear(); state.currentColor = '';
@@ -69,14 +101,24 @@ function refreshOutputWithFilters() {
       // 🔧 Fix Task#1111: 使用 writeAndScroll 替代坏掉的 write callback
       const pages = Math.ceil(viewportY / rows);
       const restoreScroll = () => {
-        if (state.output) state.output.scrollPages(pages);
+        if (!state.output) return;
+        if (exactScroll) {
+          // 🔧 底部锚定精确恢复：先到底部，再回退到"视口顶部距内容底部 linesFromBottom 行"处。
+          // writeAndScroll 重置 isUserScrolling 后写入完成时视口已在底部，此处消除其影响并精确定位，
+          // 视口相对内容的位置与重绘前完全一致（滚动条位置不因行号开关切换而改变）。
+          state.output.scrollToBottom();
+          const nb = state.output.buffer.active;
+          state.output.scrollToLine(Math.max(0, nb.length - linesFromBottom));
+        } else {
+          state.output.scrollPages(pages);
+        }
       };
       if (chunks.length > 0) {
         writeAndScroll(chunks.join(''), restoreScroll);
       } else {
         setTimeout(restoreScroll, 0);
       }
-      showSimpleToast(`已更新过滤输出。`, 'success');
+      if (showToast !== false) showSimpleToast(`已更新过滤输出。`, 'success');
     }
   }
 }

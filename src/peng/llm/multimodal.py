@@ -187,6 +187,12 @@ def build_content_part(
 ) -> dict[str, Any] | None:
     """构建 OpenAI/qwen 兼容的多模态 content part
 
+    🔧 事务#1834：图片统一走 normalize_image_bytes 规范化（解码验证 +
+    缩放至1M像素 + BMP/TIFF等非白名单格式转PNG）——@file=引用/附件路径
+    此前原样 base64 透传，BMP 会被不支持该格式的 provider（GLM）以
+    400"图片输入格式/解析错误"拒绝（事务#1822反复报错根因之一）。
+    规范化失败（PIL缺插件/数据异常）时降级保留原始数据交provider判断。
+
     Args:
         kind: classify_file 返回的类型（image/video/audio/pdf）
         path: 文件路径（用于 mime 判断）
@@ -196,13 +202,22 @@ def build_content_part(
         content part dict；失败返回 None
     """
     mime = guess_mime(path)
-    b64 = base64.b64encode(data).decode("utf-8")
 
     if kind == "image":
+        try:
+            from peng.tools.file import normalize_image_bytes
+
+            data, mime, _note = normalize_image_bytes(data, mime)
+        except Exception as e:
+            # 降级：无法本地解码验证时保留原始数据（provider端可能支持）
+            logger.warning(f"[Multimodal] 图片规范化失败，保留原始数据 {path}: {e}")
+        b64 = base64.b64encode(data).decode("utf-8")
         return {
             "type": "image_url",
             "image_url": {"url": f"data:{mime};base64,{b64}"},
         }
+
+    b64 = base64.b64encode(data).decode("utf-8")
     if kind == "video":
         return {
             "type": "video_url",
@@ -263,6 +278,41 @@ async def load_multimodal_parts(
     return abs_path, part, "ok"
 
 
+# 多模态附件 part 类型集合（OpenAI/qwen 兼容格式的多模态 content part；
+# 与 tool_engine.MessageHistory._ATTACHMENT_PART_TYPES 保持一致）
+ATTACHMENT_PART_TYPES = frozenset(
+    {
+        "image_url",
+        "video_url",
+        "input_audio",
+        "input_image",
+        "input_video",
+        "input_file",
+        "file",
+        "audio",
+    }
+)
+
+
+def has_attachment_part(content: Any) -> bool:
+    """content（list 多模态格式）中是否包含附件 part（图片/视频/音频/PDF等）"""
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(p, dict) and p.get("type") in ATTACHMENT_PART_TYPES for p in content
+    )
+
+
+def messages_have_attachment_parts(messages: list[dict] | None) -> bool:
+    """消息列表（OpenAI格式）中是否存在待发送的多模态附件part"""
+    if not messages:
+        return False
+    for m in messages:
+        if isinstance(m, dict) and has_attachment_part(m.get("content")):
+            return True
+    return False
+
+
 def strip_multimodal_content(content: Any) -> Any:
     """将多模态 content 降级为纯文本（用于不支持vision的provider）
 
@@ -276,3 +326,52 @@ def strip_multimodal_content(content: Any) -> Any:
         if isinstance(part, dict) and part.get("type") == "text":
             texts.append(part.get("text", ""))
     return "\n".join(t for t in texts if t)
+
+
+# 附件降级为文本时的默认提示（当前provider不支持多模态）
+ATTACHMENT_DEMOTED_NOTICE = (
+    "[系统提示：本消息原附带的多模态附件（图片/视频/音频/PDF）未能发送："
+    "当前大模型provider不支持多模态输入。如需查看附件内容，"
+    "请切换到支持vision的provider后重新调用read工具读取原文件。]"
+)
+
+
+def demote_messages_attachments(
+    messages: list[dict], notice: str = ATTACHMENT_DEMOTED_NOTICE
+) -> list[dict]:
+    """将消息列表中所有附件part降级为文本提示（事务#1819）
+
+    发送前闭环保护：选定provider不支持多模态时，把消息中的附件part
+    替换为说明文本，防止附件发给不支持vision的provider导致HTTP 400
+    （content.type参数非法）并误冷却该provider（事务#1818死循环诱因之一）。
+
+    不修改原列表：含附件的消息构建浅拷贝替换，其余消息原样复用。
+
+    Args:
+        messages: OpenAI 格式消息列表
+        notice: 降级说明文本
+
+    Returns:
+        降级后的消息列表（无附件时返回原列表）
+    """
+    if not messages:
+        return messages
+    result: list[dict] = []
+    changed = False
+    for m in messages:
+        content = m.get("content") if isinstance(m, dict) else None
+        if not has_attachment_part(content):
+            result.append(m)
+            continue
+        texts = [
+            p.get("text", "")
+            for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        ]
+        text = "\n".join(t for t in texts if t)
+        new_content = (text + "\n" if text else "") + notice
+        new_msg = dict(m)
+        new_msg["content"] = new_content
+        result.append(new_msg)
+        changed = True
+    return result if changed else messages

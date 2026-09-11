@@ -146,7 +146,7 @@ class Executor:
                     task_id=task_id,
                 )
                 # 大模型思考/输出期间定期更新心跳，防止心跳超时被误杀
-                # 默认 heartbeat_timeout=180s，每 60 秒更新一次心跳确保安全
+                # 心跳超时默认值来自 config monitor.default_heartbeat_timeout，每 60 秒更新一次心跳确保安全
                 now = time.time()
                 if now - last_heartbeat > 60:
                     try:

@@ -1,7 +1,10 @@
 """
-ReadTool 图片缩放单元测试 (#1716)
+ReadTool 图片规范化单元测试 (#1716 缩放 + #1834 格式转码)
 
-read 工具读取多模态图片时，把分辨率降低到 1M 像素以内（禁止修改原图）。
+read 工具读取多模态图片时：
+1. 把分辨率降低到 1M 像素以内（禁止修改原图）(#1716)
+2. 非白名单格式（BMP/TIFF等）转码为 provider 通用 PNG (#1834)
+   —— GLM 等 provider 不支持 BMP，原样透传触发 400"图片输入格式/解析错误"
 """
 
 import base64
@@ -11,9 +14,10 @@ from PIL import Image
 
 from peng.tools.file import (
     MAX_IMAGE_PIXELS,
+    PROVIDER_SAFE_IMAGE_MIMES,
     ReadTool,
     _build_binary_attachment,
-    downscale_image_bytes,
+    normalize_image_bytes,
 )
 
 
@@ -33,14 +37,14 @@ def _make_png(width: int, height: int, mode: str = "RGBA") -> bytes:
     return buf.getvalue()
 
 
-class TestDownscaleImageBytes:
-    """downscale_image_bytes 核心缩放逻辑测试"""
+class TestNormalizeImageBytes:
+    """normalize_image_bytes 核心规范化逻辑测试"""
 
     def test_large_jpeg_downscaled(self):
         """超过 1M 像素的 JPEG 被等比缩放到 1M 像素以内"""
         data = _make_jpeg(3000, 2000)  # 6M 像素
-        out, mime, changed = downscale_image_bytes(data, "image/jpeg")
-        assert changed is True
+        out, mime, note = normalize_image_bytes(data, "image/jpeg")
+        assert note, "缩放必须产生转换说明"
         assert mime == "image/jpeg"
         with Image.open(io.BytesIO(out)) as img:
             w, h = img.size
@@ -48,30 +52,73 @@ class TestDownscaleImageBytes:
             # 等比缩放
             assert abs(w / h - 3000 / 2000) < 0.01
 
-    def test_small_image_unchanged(self):
-        """未超过 1M 像素的图片原样返回（零损失）"""
+    def test_small_whitelist_image_unchanged(self):
+        """白名单格式未超过 1M 像素的图片原样返回（零损失）"""
         data = _make_jpeg(800, 600)  # 0.48M 像素
-        out, mime, changed = downscale_image_bytes(data, "image/jpeg")
-        assert changed is False
+        out, mime, note = normalize_image_bytes(data, "image/jpeg")
+        assert note == ""
         assert out == data
         assert mime == "image/jpeg"
+
+    def test_small_bmp_converted_to_png(self):
+        """(#1834 事故场景) 像素≤1M 的 BMP 必须转码 PNG——GLM 不支持 BMP"""
+        img = Image.new("RGB", (1400, 700), color=(200, 50, 50))  # 0.98M 像素
+        buf = io.BytesIO()
+        img.save(buf, format="BMP")
+        data = buf.getvalue()
+        out, mime, note = normalize_image_bytes(data, "image/bmp")
+        assert mime == "image/png"
+        assert "PNG" in note and "原图未修改" in note
+        with Image.open(io.BytesIO(out)) as img:
+            assert img.format == "PNG"
+            assert img.size == (1400, 700)
+
+    def test_tiff_converted_to_png(self):
+        """TIFF 非白名单格式转码 PNG"""
+        img = Image.new("RGB", (80, 60))
+        buf = io.BytesIO()
+        img.save(buf, format="TIFF")
+        out, mime, note = normalize_image_bytes(buf.getvalue(), "image/tiff")
+        assert mime == "image/png" and note
+
+    def test_oversized_bmp_downscale_and_convert(self):
+        """超 1M 像素的非白名单格式：缩放+转码双重处理"""
+        img = Image.new("RGB", (1400, 1000))  # 1.4M 像素
+        buf = io.BytesIO()
+        img.save(buf, format="BMP")
+        out, mime, note = normalize_image_bytes(buf.getvalue(), "image/bmp")
+        assert mime == "image/png"
+        assert "缩放" in note and "PNG" in note
+        with Image.open(io.BytesIO(out)) as img:
+            assert img.size[0] * img.size[1] <= MAX_IMAGE_PIXELS
 
     def test_original_bytes_untouched(self):
         """函数不修改输入字节流（原图保护）"""
         data = _make_jpeg(4000, 3000)
         snapshot = bytes(data)
-        downscale_image_bytes(data, "image/jpeg")
+        normalize_image_bytes(data, "image/jpeg")
         assert data == snapshot
 
     def test_rgba_png_keeps_alpha(self):
         """RGBA PNG 缩放后保持透明通道"""
         data = _make_png(2000, 2000)  # 4M 像素
-        out, mime, changed = downscale_image_bytes(data, "image/png")
-        assert changed is True
+        out, mime, note = normalize_image_bytes(data, "image/png")
+        assert note
         assert mime == "image/png"
         with Image.open(io.BytesIO(out)) as img:
             assert img.mode == "RGBA"
             assert img.size[0] * img.size[1] <= MAX_IMAGE_PIXELS
+
+    def test_rgba_tiff_alpha_preserved_after_convert(self):
+        """带 alpha 的非白名单格式转 PNG 保留透明通道"""
+        data = _make_png(64, 64, mode="RGBA")
+        # 以 TIFF mime 送入（模拟 RGBA TIFF）
+        buf = io.BytesIO()
+        Image.open(io.BytesIO(data)).save(buf, format="TIFF")
+        out, mime, _ = normalize_image_bytes(buf.getvalue(), "image/tiff")
+        assert mime == "image/png"
+        with Image.open(io.BytesIO(out)) as img:
+            assert img.mode == "RGBA"
 
     def test_webp_downscaled(self):
         """WebP 缩放后保持 WebP 格式"""
@@ -79,8 +126,8 @@ class TestDownscaleImageBytes:
         buf = io.BytesIO()
         img.save(buf, format="WEBP")
         data = buf.getvalue()
-        out, mime, changed = downscale_image_bytes(data, "image/webp")
-        assert changed is True
+        out, mime, note = normalize_image_bytes(data, "image/webp")
+        assert note
         assert mime == "image/webp"
         with Image.open(io.BytesIO(out)) as out_img:
             assert out_img.size[0] * out_img.size[1] <= MAX_IMAGE_PIXELS
@@ -93,20 +140,29 @@ class TestDownscaleImageBytes:
         buf = io.BytesIO()
         img.save(buf, format="JPEG", exif=exif)
         data = buf.getvalue()
-        out, _, changed = downscale_image_bytes(data, "image/jpeg")
-        assert changed is True
+        out, _, note = normalize_image_bytes(data, "image/jpeg")
+        assert note
         with Image.open(io.BytesIO(out)) as out_img:
             w, h = out_img.size
             # orientation=6 摆正后为竖图（高 > 宽）
             assert h > w
             assert w * h <= MAX_IMAGE_PIXELS
 
+    def test_whitelist_contents(self):
+        """白名单 = 主流 provider vision API 普遍支持的格式"""
+        assert PROVIDER_SAFE_IMAGE_MIMES == {
+            "image/jpeg",
+            "image/png",
+            "image/gif",
+            "image/webp",
+        }
+
 
 class TestBuildBinaryAttachment:
     """_build_binary_attachment 附件构建测试"""
 
     def test_corrupt_image_fallback(self):
-        """损坏的图片数据容错：保留原始数据不抛异常"""
+        """PIL 完全不识别的数据容错：保留原始数据不抛异常"""
         raw = b"not-an-image"
         out = _build_binary_attachment(
             "x.png", base64.b64encode(raw).decode(), "image/png"
@@ -115,8 +171,32 @@ class TestBuildBinaryAttachment:
         url = out.attachments[0]["url"]
         assert base64.b64decode(url.split(",", 1)[1]) == raw
 
+    def test_truncated_bmp_rejected(self):
+        """(#1819) 截断的 BMP（可识别格式但解码失败）拒绝入库"""
+        img = Image.new("RGB", (700, 290))
+        buf = io.BytesIO()
+        img.save(buf, format="BMP")
+        raw = buf.getvalue()
+        out = _build_binary_attachment(
+            "x.bmp", base64.b64encode(raw[: len(raw) // 2]).decode(), "image/bmp"
+        )
+        assert not out.attachments
+        assert "失败" in out.summary
+
+    def test_bmp_attachment_converted(self):
+        """(#1834) BMP 附件 mime 转为 image/png，summary 带转换说明"""
+        img = Image.new("RGB", (700, 290))
+        buf = io.BytesIO()
+        img.save(buf, format="BMP")
+        out = _build_binary_attachment(
+            "ok.bmp", base64.b64encode(buf.getvalue()).decode(), "image/bmp"
+        )
+        assert out.attachments
+        assert out.attachments[0]["mime"] == "image/png"
+        assert "读取成功" in out.summary and "PNG" in out.summary
+
     def test_pdf_passthrough(self):
-        """PDF 不做图片缩放，原样透传"""
+        """PDF 不做图片规范化，原样透传"""
         pdf = b"%PDF-1.4 fake"
         out = _build_binary_attachment(
             "x.pdf", base64.b64encode(pdf).decode(), "application/pdf"
@@ -155,7 +235,7 @@ class TestReadToolLocalImage:
         assert p.read_bytes() == data
 
     async def test_local_read_small_image_no_downscale(self, tmp_path):
-        """本地读取小图不缩放，原样返回"""
+        """本地读取白名单小图不缩放，原样返回"""
         p = tmp_path / "small.png"
         data = _make_png(500, 400, mode="RGB")
         p.write_bytes(data)
@@ -163,6 +243,21 @@ class TestReadToolLocalImage:
         result = await tool._execute_local_read(str(p), 1, 2000)
         assert result.attachments
         assert "已缩放" not in result.summary
+        assert p.read_bytes() == data
+
+    async def test_local_read_small_bmp_converted(self, tmp_path):
+        """(#1834) 本地读取小 BMP 转码 PNG 后作为附件返回，原图不变"""
+        img = Image.new("RGB", (600, 400))
+        buf = io.BytesIO()
+        img.save(buf, format="BMP")
+        data = buf.getvalue()
+        p = tmp_path / "shot.bmp"
+        p.write_bytes(data)
+        tool = ReadTool()
+        result = await tool._execute_local_read(str(p), 1, 2000)
+        assert result.attachments
+        assert result.attachments[0]["mime"] == "image/png"
+        # 磁盘原图保持 BMP 不被修改
         assert p.read_bytes() == data
 
     async def test_local_read_pdf(self, tmp_path):

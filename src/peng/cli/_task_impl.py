@@ -16,8 +16,10 @@
     task up <ID>                提高优先级（递归提高子事务）
     task down <ID>              降低优先级（递归降低子事务）
     task delete <ID>            递归删除事务及其所有子事务
-    task kill <ID>              杀死指定事务的所有后台进程
-    task daemon                 显示所有已注册的后台进程
+    task kill <ID>              杀死指定事务的所有后台daemon进程
+    task kill -d <daemon_id>    杀死指定daemon id的后台进程（可多个-d）
+    task killall                杀死daemon.json中记录的所有后台daemon进程
+    task daemon                 显示所有已注册的后台daemon
     task retry <ID>             重试事务
     task recover                恢复中断的事务
     task start <ID>             启动待定事务
@@ -61,7 +63,14 @@ from peng.task.info import (
     parse_info_to_list_with_status,
     serialize_info_list,
 )
-from peng.common.pid_registry import kill_task_pids, cleanup_dead_pids, get_all_tasks
+from peng.common.daemon_registry import (
+    cleanup_dead_daemons,
+    kill_all_daemons_sync,
+    kill_daemon_by_id_sync,
+    kill_task_daemons_sync,
+    list_daemons,
+    normalize_nest,
+)
 
 import logging
 
@@ -155,7 +164,6 @@ def get_context_total_tokens(context):
     return _get(context)
 
 
-
 def get_context_cost(context):
     """获取事务累计费用（转发到 database 模块级函数）"""
     from peng.task.database import get_context_cost as _get
@@ -174,7 +182,7 @@ def _get_cost_html_color(cost: float) -> str:
     """根据费用返回RGB渐变HTML颜色码（绿→橙红线性插值）。"""
     if cost <= 0:
         return "#3fb950"
-    lo = 0.1   # 0.1元 → 绿
+    lo = 0.1  # 0.1元 → 绿
     hi = 10.0  # 10元 → 橙红
     ratio = (cost - lo) / (hi - lo) if cost > lo else 0.0
     ratio = min(max(ratio, 0.0), 1.0)
@@ -183,6 +191,7 @@ def _get_cost_html_color(cost: float) -> str:
     b = int(80 + (60 - 80) * ratio)
     return f"rgb({r},{g},{b})"
 
+
 def _get_consumption_html_color(total_tokens: int) -> str:
     """根据总token消耗返回RGB渐变HTML颜色码（蓝→紫线性插值）。
 
@@ -190,7 +199,7 @@ def _get_consumption_html_color(total_tokens: int) -> str:
     """
     if total_tokens <= 0:
         return "#4682ff"
-    lo = 100_000   # 100K → 蓝
+    lo = 100_000  # 100K → 蓝
     hi = 2_000_000  # 2M → 紫
     ratio = (total_tokens - lo) / (hi - lo) if total_tokens > lo else 0.0
     ratio = min(max(ratio, 0.0), 1.0)
@@ -471,9 +480,7 @@ def cmd_trees(args):
     for root in root_tasks:
         rid = root["id"]
         subtree_nodes = subtree_map.get(rid, [])
-        tree_text = tm.db.build_tree_text_from_batch(
-            rid, subtree_nodes, content_max_len=80
-        )
+        tree_text = tm.db.build_tree_text_from_batch(rid, subtree_nodes, content_max_len=80)
         if tree_text:
             print(tree_text)
 
@@ -523,12 +530,17 @@ def print_tree_recursive(
     _cost = meta.get("total_cost", 0.0)
     if _cost > 0:
         from peng.task.database import _get_cost_ansi as _gc_ansi
+
         _cost_c = _gc_ansi(_cost)
         cost_info = f" [{_cost_c}费用{_cost:.2f}元{Colors.RESET}]"
     if tokens > 2000 and status in ["running", "paused"]:
         color = get_context_color(tokens, task.get("provider", ""))
         is_danger = color == "context_red"
-        COLORS_MAP = {"context_red": Colors.CONTEXT_RED, "yellow": Colors.YELLOW, "green": Colors.GREEN}
+        COLORS_MAP = {
+            "context_red": Colors.CONTEXT_RED,
+            "yellow": Colors.YELLOW,
+            "green": Colors.GREEN,
+        }
         cc = COLORS_MAP[color]
         comment = f"{cc}{'降智' if is_danger else '安全'}{Colors.RESET}"
         print(
@@ -778,7 +790,7 @@ def _md_to_html(md_text: str, nest: str = None) -> str:
             else:
                 close_lists()
                 flush_table()
-                result.append('<pre><code>')
+                result.append("<pre><code>")
                 in_code = True
             continue
         if in_code:
@@ -791,7 +803,7 @@ def _md_to_html(md_text: str, nest: str = None) -> str:
                 # Check if next line is separator
                 in_table = True
             # Skip separator row (|---|---|)
-            if _re.match(r'^\|[-\s:|]+\|$', stripped):
+            if _re.match(r"^\|[-\s:|]+\|$", stripped):
                 table_rows.append("")  # placeholder
                 continue
             table_rows.append(stripped)
@@ -820,21 +832,21 @@ def _md_to_html(md_text: str, nest: str = None) -> str:
             close_lists()
             result.append(f"<h1>{_h(stripped[2:])}</h1>")
         # Unordered list
-        elif _re.match(r'^[-*]\s+', stripped):
+        elif _re.match(r"^[-*]\s+", stripped):
             if not in_ul:
                 close_lists()
                 result.append('<ul class="md-list">')
                 in_ul = True
-            item = _re.sub(r'^[-*]\s+', '', stripped)
+            item = _re.sub(r"^[-*]\s+", "", stripped)
             item = _md_inline(item, nest)
             result.append(f"<li>{item}</li>")
         # Ordered list
-        elif _re.match(r'^\d+\.\s+', stripped):
+        elif _re.match(r"^\d+\.\s+", stripped):
             if not in_ol:
                 close_lists()
                 result.append('<ol class="md-list">')
                 in_ol = True
-            item = _re.sub(r'^\d+\.\s+', '', stripped)
+            item = _re.sub(r"^\d+\.\s+", "", stripped)
             item = _md_inline(item, nest)
             result.append(f"<li>{item}</li>")
         else:
@@ -856,7 +868,7 @@ def _convert_paths_to_links(text: str, nest: str = None) -> str:
     # 步骤1：保护URL（先匹配保存，最后替换）
     url_matches = []
     text = _re.sub(
-        r'https?:\/\/[a-zA-Z0-9\-._~:/?#\[\]@!$&\'()*+,;=%]+',
+        r"https?:\/\/[a-zA-Z0-9\-._~:/?#\[\]@!$&\'()*+,;=%]+",
         lambda m: _protect_url(m.group(), url_matches),
         text,
     )
@@ -881,9 +893,9 @@ def _convert_paths_to_links(text: str, nest: str = None) -> str:
     unix_matches = []
     # 通用正则：含扩展名的路径优先，无扩展名路径其次，家目录最后
     unix_pattern = (
-        r'(?:[~/]?[a-zA-Z0-9_\-\.+]+/)+[a-zA-Z0-9_\-+\u0080-\uffff]+\.[a-zA-Z0-9_\-+]+(?![a-zA-Z0-9_\-+])'
-        r'|(?:[~/]?[a-zA-Z0-9_\-\.+]+/)+[a-zA-Z0-9_\-\.+]+/?'
-        r'|~\/[^\s]+'
+        r"(?:[~/]?[a-zA-Z0-9_\-\.+]+/)+[a-zA-Z0-9_\-+\u0080-\uffff]+\.[a-zA-Z0-9_\-+]+(?![a-zA-Z0-9_\-+])"
+        r"|(?:[~/]?[a-zA-Z0-9_\-\.+]+/)+[a-zA-Z0-9_\-\.+]+/?"
+        r"|~\/[^\s]+"
     )
     text = _re.sub(unix_pattern, lambda m: _protect_unix(m.group(), unix_matches), text)
 
@@ -892,22 +904,39 @@ def _convert_paths_to_links(text: str, nest: str = None) -> str:
 
     # URL → <a href="url">url</a>（保留原始URL，不需要 nest）
     for placeholder, original_url in url_matches:
-        all_replacements.append((placeholder, f'<a href="{original_url}" class="file-link">{original_url}</a>'))
+        all_replacements.append(
+            (placeholder, f'<a href="{original_url}" class="file-link">{original_url}</a>')
+        )
 
     # filePath/path= → <a href="editor://path?nest=nestname">path</a>
     for placeholder, original_path in param_matches:
-        nest_param = f'?nest={nest}' if nest else ''
-        all_replacements.append((placeholder, f'<a href="editor://{original_path}{nest_param}" class="file-link">{original_path}</a>'))
+        nest_param = f"?nest={nest}" if nest else ""
+        all_replacements.append(
+            (
+                placeholder,
+                f'<a href="editor://{original_path}{nest_param}" class="file-link">{original_path}</a>',
+            )
+        )
 
     # Windows盘符路径 → <a href="editor://path?nest=nestname">path</a>
     for placeholder, original_path in win_drive_matches:
-        nest_param = f'?nest={nest}' if nest else ''
-        all_replacements.append((placeholder, f'<a href="editor://{original_path}{nest_param}" class="file-link">{original_path}</a>'))
+        nest_param = f"?nest={nest}" if nest else ""
+        all_replacements.append(
+            (
+                placeholder,
+                f'<a href="editor://{original_path}{nest_param}" class="file-link">{original_path}</a>',
+            )
+        )
 
     # Unix路径 → <a href="editor://path?nest=nestname">path</a>
     for placeholder, original_path in unix_matches:
-        nest_param = f'?nest={nest}' if nest else ''
-        all_replacements.append((placeholder, f'<a href="editor://{original_path}{nest_param}" class="file-link">{original_path}</a>'))
+        nest_param = f"?nest={nest}" if nest else ""
+        all_replacements.append(
+            (
+                placeholder,
+                f'<a href="editor://{original_path}{nest_param}" class="file-link">{original_path}</a>',
+            )
+        )
 
     for placeholder, replacement in all_replacements:
         text = text.replace(placeholder, replacement)
@@ -918,40 +947,41 @@ def _convert_paths_to_links(text: str, nest: str = None) -> str:
 def _protect_url(match_text: str, matches: list) -> str:
     """剥离URL末尾标点符号，生成占位符"""
     import re as _re
-    tp = _re.search(r'[.,;:!?)\]]+$', match_text)
+
+    tp = _re.search(r"[.,;:!?)\]]+$", match_text)
     url = match_text[: -len(tp.group())] if tp else match_text
-    placeholder = f'\x00URL_PH_{len(matches)}\x00'
+    placeholder = f"\x00URL_PH_{len(matches)}\x00"
     matches.append((placeholder, url))
-    return placeholder + (tp.group() if tp else '')
+    return placeholder + (tp.group() if tp else "")
 
 
 def _protect_param(path: str, matches: list) -> str:
     """生成 filePath/path= 参数的占位符"""
-    placeholder = f'\x00PARAM_PH_{len(matches)}\x00'
+    placeholder = f"\x00PARAM_PH_{len(matches)}\x00"
     matches.append((placeholder, path))
     return placeholder
 
 
 def _protect_win_drive(match_text: str, matches: list) -> str:
     """生成 Windows 盘符路径的占位符"""
-    if match_text.startswith('\x00'):
+    if match_text.startswith("\x00"):
         return match_text
-    cleaned_path = match_text.rstrip('.,;:!?)\\]')  # 简单清理尾部标点
+    cleaned_path = match_text.rstrip(".,;:!?)\\]")  # 简单清理尾部标点
     if not cleaned_path or len(cleaned_path) < 3:
         return match_text
-    placeholder = f'\x00WINDRIVE_PH_{len(matches)}\x00'
+    placeholder = f"\x00WINDRIVE_PH_{len(matches)}\x00"
     matches.append((placeholder, cleaned_path))
     return placeholder
 
 
 def _protect_unix(match_text: str, matches: list) -> str:
     """生成 Unix/Linux 路径的占位符"""
-    if match_text.startswith('\x00'):
+    if match_text.startswith("\x00"):
         return match_text
-    real_path = match_text.rstrip('.,;:!?)\\]')  # 简单清理尾部标点
+    real_path = match_text.rstrip(".,;:!?)\\]")  # 简单清理尾部标点
     if not real_path:
         return match_text
-    placeholder = f'\x00UNIX_PH_{len(matches)}\x00'
+    placeholder = f"\x00UNIX_PH_{len(matches)}\x00"
     matches.append((placeholder, real_path))
     return placeholder
 
@@ -974,29 +1004,30 @@ def _md_inline(text: str, nest: str = None) -> str:
 
     # 用占位符保护 *，防止被误解析为斜体标记
     # 先保护 **（加粗标记），再保护单独的 *
-    AST_PH = '\x00AST\x00'
-    BOLD_PH = '\x00BLD\x00'
-    text = text.replace('**', BOLD_PH)
-    text = text.replace('*', AST_PH)
-    text = text.replace(BOLD_PH, '**')  # 还原加粗标记
+    AST_PH = "\x00AST\x00"
+    BOLD_PH = "\x00BLD\x00"
+    text = text.replace("**", BOLD_PH)
+    text = text.replace("*", AST_PH)
+    text = text.replace(BOLD_PH, "**")  # 还原加粗标记
 
     # Bold: **text**
-    text = _re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+    text = _re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
 
     # Italic: *text* — 此时 * 已被占位符保护，不会误匹配乘号
-    text = _re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<em>\1</em>', text)
+    text = _re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<em>\1</em>", text)
 
     # 还原被保护的乘号
-    text = text.replace(AST_PH, '*')
+    text = text.replace(AST_PH, "*")
 
     # Inline code: `text` — ⚠️ 行内代码块内不应再转换路径超链接（已做HTML转义）
-    text = _re.sub(r'`(.+?)`', r'<code>\1</code>', text)
+    text = _re.sub(r"`(.+?)`", r"<code>\1</code>", text)
 
     return text
 
 
 class _SafeHtml(str):
     """标记字符串为安全HTML，在 _kv_table_html 中不被转义"""
+
     pass
 
 
@@ -1012,8 +1043,8 @@ def _kv_table_html(rows: list) -> str:
             val_html = val  # 已经是安全HTML，不转义
         else:
             val_html = _h(val)
-        parts.append(f'<tr><th>{_h(key)}</th><td>{val_html}</td></tr>')
-    parts.append('</table>')
+        parts.append(f"<tr><th>{_h(key)}</th><td>{val_html}</td></tr>")
+    parts.append("</table>")
     return "\n".join(parts)
 
 
@@ -1047,12 +1078,23 @@ def _cmd_show_html(args):
     # [状态]
     _status = task.get("status", "pending")
     _status_html_colors = {
-        "pending": "#e6edf3", "running": "#58a6ff", "completed": "#3fb950",
-        "failed": "#f85149", "cancelled": "#8b949e", "paused": "#39c5cf",
+        "pending": "#e6edf3",
+        "running": "#58a6ff",
+        "completed": "#3fb950",
+        "failed": "#f85149",
+        "cancelled": "#8b949e",
+        "paused": "#39c5cf",
         "interrupted": "#ff6b6b",
     }
-    _status_names = {"pending": "待执行", "running": "执行中", "completed": "已完成",
-                     "failed": "已失败", "cancelled": "已取消", "paused": "已暂停", "interrupted": "已中断"}
+    _status_names = {
+        "pending": "待执行",
+        "running": "执行中",
+        "completed": "已完成",
+        "failed": "已失败",
+        "cancelled": "已取消",
+        "paused": "已暂停",
+        "interrupted": "已中断",
+    }
     _sname = _status_names.get(_status, _status)
     _scolor = _status_html_colors.get(_status, "#e6edf3")
     title_spans.append(f'<span style="color:{_scolor};font-weight:bold;">[{_h(_sname)}]</span>')
@@ -1077,6 +1119,7 @@ def _cmd_show_html(args):
         if _provider_name:
             try:
                 from peng.config.loader import load_config
+
                 _cfg = load_config()
                 _pcfg = _cfg.llm.get_provider(current=_provider_name, locked=True)
                 _price_hit = _pcfg.get("price_input_hit", 0) or 0
@@ -1084,8 +1127,10 @@ def _cmd_show_html(args):
                 _price_out = _pcfg.get("price_output", 0) or 0
             except Exception:
                 pass
+
         def _fmt_m(n):
-            return f"{n / 1_000_000:.3f}".rstrip('0').rstrip('.') + "M"
+            return f"{n / 1_000_000:.3f}".rstrip("0").rstrip(".") + "M"
+
         title_spans.append(
             f'<span style="color:{_cost_html_color};font-weight:bold;">[费用{_cost:.2f}元]</span>'
             f'<span style="font-size:0.8em;color:#8b949e;">[输入命中缓存{_fmt_m(_usage["input_hit"])} ({_price_hit}元/M) 未命中{_fmt_m(_usage["input_miss"])} ({_price_miss}元/M) 输出{_fmt_m(_usage["output"])} ({_price_out}元/M)]</span>'
@@ -1095,12 +1140,21 @@ def _cmd_show_html(args):
     # ── 内容 ──
     content_text = task.get("content", "")
     if content_text:
-        parts.append(f'<div class="task-content">{_md_to_html(content_text, task.get("nest"))}</div>')
+        parts.append(
+            f'<div class="task-content">{_md_to_html(content_text, task.get("nest"))}</div>'
+        )
 
     # ── 基本信息 ──
     status = task.get("status", "pending")
-    status_names = {"pending": "待执行", "running": "执行中", "completed": "已完成",
-                    "failed": "已失败", "cancelled": "已取消", "paused": "已暂停", "interrupted": "已中断"}
+    status_names = {
+        "pending": "待执行",
+        "running": "执行中",
+        "completed": "已完成",
+        "failed": "已失败",
+        "cancelled": "已取消",
+        "paused": "已暂停",
+        "interrupted": "已中断",
+    }
     status_name = status_names.get(status, status)
     progress = task.get("progress", 0)
     model_str = "小模型" if task.get("small_model") else "大模型"
@@ -1127,22 +1181,22 @@ def _cmd_show_html(args):
         ("心跳", format_datetime(task.get("heartbeat_at"))),
     ]
     # 心跳超时行：添加设置/重置超链接（参考定时器实现）
-    _heartbeat_value = task.get('heartbeat_timeout') or 0
+    _heartbeat_value = task.get("heartbeat_timeout") or 0
     _default_heartbeat = get_default_heartbeat_timeout()
     _heartbeat_display = _heartbeat_value if _heartbeat_value > 0 else _default_heartbeat
     _heartbeat_is_custom = _heartbeat_value > 0
     _heartbeat_links = f'<a href="javascript:void(0)" onclick="editTaskHeartbeat({task["id"]}, {_heartbeat_value})" style="margin-left:4ch; font-size:0.85em; color:#58a6ff; text-decoration:underline;">设置</a>'
     if _heartbeat_is_custom:
         _heartbeat_links += f' <a href="javascript:void(0)" onclick="resetTaskHeartbeat({task["id"]})" style="margin-left:1ch; font-size:0.85em; color:#f85149; text-decoration:underline;">重置默认</a>'
-    _heartbeat_cell = _SafeHtml(f'{_heartbeat_display} 秒{_heartbeat_links}')
+    _heartbeat_cell = _SafeHtml(f"{_heartbeat_display} 秒{_heartbeat_links}")
     time_rows.append(("心跳超时", _heartbeat_cell))
     time_rows.append(("超时", f"{task.get('timeout', 0)} 秒"))
     # 定时器行：添加设置/清除超链接
-    timer_value = task.get('timer', 0)
+    timer_value = task.get("timer", 0)
     timer_links = f'<a href="javascript:void(0)" onclick="editTaskTimer({task["id"]}, {timer_value})" style="margin-left:4ch; font-size:0.85em; color:#58a6ff; text-decoration:underline;">设置</a>'
     if timer_value and timer_value > 0:
         timer_links += f' <a href="javascript:void(0)" onclick="clearTaskTimer({task["id"]})" style="margin-left:1ch; font-size:0.85em; color:#f85149; text-decoration:underline;">清除</a>'
-    timer_cell = _SafeHtml(f'{timer_value} 秒{timer_links}')
+    timer_cell = _SafeHtml(f"{timer_value} 秒{timer_links}")
     time_rows.append(("定时器", timer_cell))
     parts.append(_section_html("⏰ 时间", _kv_table_html(time_rows)))
 
@@ -1157,9 +1211,16 @@ def _cmd_show_html(args):
     parts.append(_section_html("🔗 关联", _kv_table_html(relation_rows)))
 
     # ── 工作环境 ──
-    if task.get("worktree_path") or task.get("workdir") or task.get("branch_name") or task.get("nest"):
+    if (
+        task.get("worktree_path")
+        or task.get("workdir")
+        or task.get("branch_name")
+        or task.get("nest")
+    ):
         wt_rows = []
-        _edit_link = lambda field, current_val: _SafeHtml(f'{_h_with_links(current_val, task.get("nest"))} <a href="javascript:void(0)" onclick="editTaskField({task["id"]}, \'{field}\')" style="margin-left:4ch; font-size:0.85em; color:#58a6ff; text-decoration:underline;">设置</a>')
+        _edit_link = lambda field, current_val: _SafeHtml(
+            f'{_h_with_links(current_val, task.get("nest"))} <a href="javascript:void(0)" onclick="editTaskField({task["id"]}, \'{field}\')" style="margin-left:4ch; font-size:0.85em; color:#58a6ff; text-decoration:underline;">设置</a>'
+        )
         if task.get("nest"):
             wt_rows.append(("鹏🐣窝", _edit_link("nest", task["nest"])))
         if task.get("workdir"):
@@ -1176,26 +1237,45 @@ def _cmd_show_html(args):
         if task.get("process_id"):
             exec_rows.append(("进程ID", str(task["process_id"])))
         if task.get("error"):
-            exec_rows.append(("错误", (_h_with_links(task["error"], task.get("nest")), "text-error")))
+            exec_rows.append(
+                ("错误", (_h_with_links(task["error"], task.get("nest")), "text-error"))
+            )
         if task.get("result"):
             result = task["result"]
             if len(result) > 500:
-                exec_rows.append(("结果", (_h_with_links(result[:500], task.get("nest")) + "... (已截断)")))
+                exec_rows.append(
+                    ("结果", (_h_with_links(result[:500], task.get("nest")) + "... (已截断)"))
+                )
             else:
                 exec_rows.append(("结果", _h_with_links(result, task.get("nest"))))
         parts.append(_section_html("⚙️ 执行信息", _kv_table_html(exec_rows)))
 
     # ── 子事务配置 ──
     if task.get("subtask_config"):
-        parts.append(_section_html("🔧 子事务配置", f'<div class="task-text">{_h_with_links(task["subtask_config"], task.get("nest"))}</div>'))
+        parts.append(
+            _section_html(
+                "🔧 子事务配置",
+                f'<div class="task-text">{_h_with_links(task["subtask_config"], task.get("nest"))}</div>',
+            )
+        )
 
     # ── Tool Call 日志 ──
     if task.get("tool_calls_log") and task.get("tool_calls_log") != "[]":
-        parts.append(_section_html("📝 Tool Call 日志", f'<div class="task-text">{_h_with_links(task["tool_calls_log"], task.get("nest"))}</div>'))
+        parts.append(
+            _section_html(
+                "📝 Tool Call 日志",
+                f'<div class="task-text">{_h_with_links(task["tool_calls_log"], task.get("nest"))}</div>',
+            )
+        )
 
     # ── Tool Result 日志 ──
     if task.get("tool_results_log") and task.get("tool_results_log") != "[]":
-        parts.append(_section_html("📝 Tool Result 日志", f'<div class="task-text">{_h_with_links(task["tool_results_log"], task.get("nest"))}</div>'))
+        parts.append(
+            _section_html(
+                "📝 Tool Result 日志",
+                f'<div class="task-text">{_h_with_links(task["tool_results_log"], task.get("nest"))}</div>',
+            )
+        )
 
     # ── 描述 ──
     if task.get("description"):
@@ -1264,25 +1344,34 @@ def _cmd_show_html(args):
     # 添加系统提示词超链接（可点击展开）
     system_prompt_link = (
         '<div class="task-section" id="system-prompt-section-' + str(task["id"]) + '">'
-        '<h3 class="system-prompt-toggle" onclick="toggleSystemPrompt(' + str(task["id"]) + ', this)" style="cursor:pointer;text-decoration:underline;color:#58a6ff;">'
+        '<h3 class="system-prompt-toggle" onclick="toggleSystemPrompt('
+        + str(task["id"])
+        + ', this)" style="cursor:pointer;text-decoration:underline;color:#58a6ff;">'
         '<span class="toggle-title">🤖 系统提示词</span> <span class="toggle-hint" style="font-size:0.85em;color:#8b949e;">(点击展开)</span>'
-        '</h3>'
+        "</h3>"
         '<div class="system-prompt-full" style="display:none">'
-        '<style>'
-        '.system-prompt-full p, .system-prompt-full div, .system-prompt-full span {'
-        '  margin: 0 !important; padding: 0 !important; line-height: 1.2 !important;'
-        '}'
-        '</style>'
-        '<div style="word-break:break-word;">' + _md_to_html(system_prompt_content, task.get("nest")) + '</div>'
-        '</div>'
-        '</div>'
+        "<style>"
+        ".system-prompt-full p, .system-prompt-full div, .system-prompt-full span {"
+        "  margin: 0 !important; padding: 0 !important; line-height: 1.2 !important;"
+        "}"
+        "</style>"
+        '<div style="word-break:break-word;">'
+        + _md_to_html(system_prompt_content, task.get("nest"))
+        + "</div>"
+        "</div>"
+        "</div>"
     )
 
     parts.append(_section_html("💡 提示词", prompt_html + system_prompt_link))
 
     # ── 元数据 ──
     if task.get("metadata") and task.get("metadata") != "{}":
-        parts.append(_section_html("🏷️ 元数据", f'<div class="task-text">{_h_with_links(task["metadata"], task.get("nest"))}</div>'))
+        parts.append(
+            _section_html(
+                "🏷️ 元数据",
+                f'<div class="task-text">{_h_with_links(task["metadata"], task.get("nest"))}</div>',
+            )
+        )
 
     # ── 依赖 ──
     deps = tm.get_dependencies(args.id)
@@ -1295,7 +1384,9 @@ def _cmd_show_html(args):
                 clean_dep_id = re.sub(r"\x1b\[[0-9;]*m", "", dep_id_formatted)
                 status_str = format_status(dep_task.get("status", "pending"))
                 clean_status = re.sub(r"\x1b\[[0-9;]*m", "", status_str)
-                dep_items.append(f'<li><span class="task-id">{_h(clean_dep_id)}</span> <span class="task-status-text">[{_h(clean_status)}]</span> {_h_with_links(dep_task.get("content", ""), dep_task.get("nest"))}</li>')
+                dep_items.append(
+                    f'<li><span class="task-id">{_h(clean_dep_id)}</span> <span class="task-status-text">[{_h(clean_status)}]</span> {_h_with_links(dep_task.get("content", ""), dep_task.get("nest"))}</li>'
+                )
         parts.append(_section_html("🔗 依赖", f'<ul class="md-list">{"".join(dep_items)}</ul>'))
 
     # ── 被依赖 ──
@@ -1309,7 +1400,9 @@ def _cmd_show_html(args):
                 clean_dep_id = re.sub(r"\x1b\[[0-9;]*m", "", dep_id_formatted)
                 status_str = format_status(dep_task.get("status", "pending"))
                 clean_status = re.sub(r"\x1b\[[0-9;]*m", "", status_str)
-                dep_items.append(f'<li><span class="task-id">{_h(clean_dep_id)}</span> <span class="task-status-text">[{_h(clean_status)}]</span> {_h_with_links(dep_task.get("content", ""), dep_task.get("nest"))}</li>')
+                dep_items.append(
+                    f'<li><span class="task-id">{_h(clean_dep_id)}</span> <span class="task-status-text">[{_h(clean_status)}]</span> {_h_with_links(dep_task.get("content", ""), dep_task.get("nest"))}</li>'
+                )
         parts.append(_section_html("🔗 被依赖", f'<ul class="md-list">{"".join(dep_items)}</ul>'))
 
     # ── 上下文（可点击超链接展开） ──
@@ -1318,18 +1411,22 @@ def _cmd_show_html(args):
         context_str = task.get("context", "{}")
         # 解析 context JSON 获取消息列表
         import json
+
         try:
             context_data = json.loads(context_str)
-            messages = context_data.get("messages", []) if isinstance(context_data, dict) else context_data
+            messages = (
+                context_data.get("messages", []) if isinstance(context_data, dict) else context_data
+            )
         except Exception:
             messages = []
         # 构建对话形式 HTML（markdown 高亮）
         messages_html = ""
-        role_icons = {
-            "system": "🤖", "user": "👤", "assistant": "🐣", "tool": "🔧"
-        }
+        role_icons = {"system": "🤖", "user": "👤", "assistant": "🐣", "tool": "🔧"}
         role_colors = {
-            "system": "#58a6ff", "user": "#d29922", "assistant": "#3fb950", "tool": "#bc8cff"
+            "system": "#58a6ff",
+            "user": "#d29922",
+            "assistant": "#3fb950",
+            "tool": "#bc8cff",
         }
         for i, msg in enumerate(messages):
             role = msg.get("role", "unknown")
@@ -1342,7 +1439,9 @@ def _cmd_show_html(args):
             parts_html = []
             # 1. reasoning_content（灰色，始终显示在前）
             if reasoning:
-                parts_html.append(f'<div style="color:#8b949e;font-size:0.9em;">{_md_to_html(reasoning, task.get("nest"))}</div>')
+                parts_html.append(
+                    f'<div style="color:#8b949e;font-size:0.9em;">{_md_to_html(reasoning, task.get("nest"))}</div>'
+                )
             # 2. content（正常颜色）
             if content:
                 parts_html.append(_md_to_html(content, task.get("nest")))
@@ -1355,38 +1454,43 @@ def _cmd_show_html(args):
                     fn_args = fn.get("arguments", "")
                     try:
                         import json as _json
+
                         args_parsed = _json.loads(fn_args) if isinstance(fn_args, str) else fn_args
                         args_str = _json.dumps(args_parsed, ensure_ascii=False)
                     except Exception:
                         args_str = str(fn_args)
-                    tc_items.append(f'<div style="margin:2px 0;">⚡ <strong>{fn_name}</strong> <code style="color:#bc8cff;font-size:0.85em;">{_h(args_str)}</code></div>')
+                    tc_items.append(
+                        f'<div style="margin:2px 0;">⚡ <strong>{fn_name}</strong> <code style="color:#bc8cff;font-size:0.85em;">{_h(args_str)}</code></div>'
+                    )
                 parts_html.append(f'<div style="margin-top:2px;">{"".join(tc_items)}</div>')
-            content_html = "".join(parts_html) if parts_html else '<span style="color:#8b949e">(空)</span>'
+            content_html = (
+                "".join(parts_html) if parts_html else '<span style="color:#8b949e">(空)</span>'
+            )
             # 为每条消息添加删除/截断超链接（system 消息不允许删除）
             if role != "system":
-                actions_html = f'''<span style="float:right;font-size:0.8em;">
-                    <a href="javascript:void(0)" onclick="deleteContextMessage({task['id']}, {i})" style="color:#f85149;text-decoration:underline;margin-left:8px;" title="删除本条消息及其关联消息">删除</a>
-                    <a href="javascript:void(0)" onclick="truncateContextFrom({task['id']}, {i})" style="color:#d29922;text-decoration:underline;margin-left:8px;" title="从此处截断所有后续消息（含本条）">截断</a>
-                </span>'''
+                actions_html = f"""<span style="float:right;font-size:0.8em;">
+                    <a href="javascript:void(0)" onclick="deleteContextMessage({task["id"]}, {i})" style="color:#f85149;text-decoration:underline;margin-left:8px;" title="删除本条消息及其关联消息">删除</a>
+                    <a href="javascript:void(0)" onclick="truncateContextFrom({task["id"]}, {i})" style="color:#d29922;text-decoration:underline;margin-left:8px;" title="从此处截断所有后续消息（含本条）">截断</a>
+                </span>"""
             else:
                 actions_html = ""
             messages_html += f'''<div class="context-message" data-msg-index="{i}" style="margin:8px 0;padding:6px;border-left:3px solid {color};background:rgba({color}22,0.1)">
-                <div style="color:{color};font-weight:bold;margin-bottom:4px;overflow:hidden;">{icon} {role} <span style="font-size:0.8em;color:#8b949e">[{i+1}]</span>{actions_html}</div>
+                <div style="color:{color};font-weight:bold;margin-bottom:4px;overflow:hidden;">{icon} {role} <span style="font-size:0.8em;color:#8b949e">[{i + 1}]</span>{actions_html}</div>
                 <div class="context-content">{content_html}</div>
             </div>'''
         # 可点击超链接：默认隐藏内容，标题内小字提示，点击后显示全部消息
         # 在完整上下文底部添加折叠超链接
-        collapse_html = f'''<div style="text-align:center;margin:12px 0;">
-            <span class="context-collapse" onclick="toggleContext({task['id']}, this)" style="cursor:pointer;text-decoration:underline;color:#58a6ff;">
+        collapse_html = f"""<div style="text-align:center;margin:12px 0;">
+            <span class="context-collapse" onclick="toggleContext({task["id"]}, this)" style="cursor:pointer;text-decoration:underline;color:#58a6ff;">
                 ⬆️ 折叠上下文
             </span>
-        </div>'''
-        parts.append(f'''<div class="task-section" id="context-section-{task['id']}">
-            <h3 class="context-toggle" onclick="toggleContext({task['id']}, this)" style="cursor:pointer;text-decoration:underline;color:#58a6ff;">
+        </div>"""
+        parts.append(f"""<div class="task-section" id="context-section-{task["id"]}">
+            <h3 class="context-toggle" onclick="toggleContext({task["id"]}, this)" style="cursor:pointer;text-decoration:underline;color:#58a6ff;">
                 <span class="toggle-title">📜 当前上下文</span> <span style="font-size:0.85em;color:#8b949e">({tokens // 1000}K tokens, {len(messages)} 条消息)</span> <span class="toggle-hint" style="font-size:0.75em;color:#58a6ff;">(点击展开)</span>
             </h3>
             <div class="context-full" style="display:none">{messages_html}{collapse_html}</div>
-        </div>''')
+        </div>""")
 
     # ── Info ──
     if task.get("info") and task.get("info") != "[]":
@@ -1398,9 +1502,9 @@ def _cmd_show_html(args):
             all_info_html = ""
             for i, item in enumerate(info_list, 1):
                 color = "#8b949e" if item["read"] else "#3fb950"
-                unread_link = f'<a href="javascript:void(0)" onclick="markTaskInfoItemUnread({task["id"]}, {i-1}, {str(item["read"]).lower()})" style="margin-left:1ch; color:#58a6ff; font-size:0.85em; text-decoration:underline;">{"改未读" if item["read"] else "改已读"}</a>'
-                delete_link = f'<a href="javascript:void(0)" onclick="deleteTaskInfoItem({task["id"]}, {i-1})" style="margin-left:1ch; color:#f85149; font-size:0.85em; text-decoration:underline;">删除</a>'
-                all_info_html += f'<div class="task-text task-info-item" data-info-index="{i-1}" style="color:{color}">[{i}] {_h_with_links(item["content"], task.get("nest"))}{unread_link}{delete_link}</div>\n'
+                unread_link = f'<a href="javascript:void(0)" onclick="markTaskInfoItemUnread({task["id"]}, {i - 1}, {str(item["read"]).lower()})" style="margin-left:1ch; color:#58a6ff; font-size:0.85em; text-decoration:underline;">{"改未读" if item["read"] else "改已读"}</a>'
+                delete_link = f'<a href="javascript:void(0)" onclick="deleteTaskInfoItem({task["id"]}, {i - 1})" style="margin-left:1ch; color:#f85149; font-size:0.85em; text-decoration:underline;">删除</a>'
+                all_info_html += f'<div class="task-text task-info-item" data-info-index="{i - 1}" style="color:{color}">[{i}] {_h_with_links(item["content"], task.get("nest"))}{unread_link}{delete_link}</div>\n'
             # 默认显示：最后一条已读 + 所有未读（保持原样）——使用路径超链接转换
             default_html = ""
             last_read_idx = None
@@ -1417,34 +1521,39 @@ def _cmd_show_html(args):
                     if not item["read"]:
                         default_html += f'<div class="task-text task-info-item" style="color:#3fb950">[{i}] {_h_with_links(item["content"], task.get("nest"))}</div>'
             # 注入信息标题为可点击超链接，点击后替换为全部 info 内容
-            parts.append(f'''<div class="task-section" id="info-section-{task['id']}">
-                <h3 class="task-info-toggle" onclick="toggleTaskInfo({task['id']}, this)" style="cursor:pointer; text-decoration:underline;">
-                    <span class="toggle-title">💡 注入信息</span> <span style="font-size:0.85em; color:#8b949e">({read_count}已读/{unread_count}未读)</span><a href="javascript:void(0)" onclick="event.stopPropagation(); clearTaskInfo({task['id']})" style="margin-left:4ch; font-size:0.85em; color:#f85149; text-decoration:underline;">清除</a>
+            parts.append(f"""<div class="task-section" id="info-section-{task["id"]}">
+                <h3 class="task-info-toggle" onclick="toggleTaskInfo({task["id"]}, this)" style="cursor:pointer; text-decoration:underline;">
+                    <span class="toggle-title">💡 注入信息</span> <span style="font-size:0.85em; color:#8b949e">({read_count}已读/{unread_count}未读)</span><a href="javascript:void(0)" onclick="event.stopPropagation(); clearTaskInfo({task["id"]})" style="margin-left:4ch; font-size:0.85em; color:#f85149; text-decoration:underline;">清除</a>
                 </h3>
                 <div class="task-info-default">{default_html}</div>
                 <div class="task-info-full" style="display:none">{all_info_html}</div>
-            </div>''')
+            </div>""")
 
     # ── Provider ──
     if task.get("provider"):
         provider_name = task.get("provider", "")
         try:
             from peng.config.loader import get_llm_config
+
             llm_config = get_llm_config()
             provider_icon = llm_config.get_icon(provider_name) or "🌐"
         except Exception:
             provider_icon = "🌐"
-        parts.append(_section_html(f"{provider_icon} 大模型接口", f'<div class="task-text">{_h(provider_name)}</div>'))
+        parts.append(
+            _section_html(
+                f"{provider_icon} 大模型接口", f'<div class="task-text">{_h(provider_name)}</div>'
+            )
+        )
 
     # ── 事项清单 ──
     if task.get("checklist"):
         checklist_html = _md_to_html(task["checklist"], task.get("nest"))
         parts.append(
             f'<div class="task-section">'
-            f'<h3>✅ 事项清单'
+            f"<h3>✅ 事项清单"
             f'<a href="javascript:void(0)" onclick="clearTaskChecklist({task["id"]})" '
             f'style="margin-left:4ch; font-size:0.85em; color:#f85149; text-decoration:underline;">清除</a>'
-            f'</h3>{checklist_html}</div>'
+            f"</h3>{checklist_html}</div>"
         )
 
     # ── 工作汇报 ──
@@ -1574,7 +1683,9 @@ def cmd_show(args):
         console.print()
         console.print(Text("📝 描述", style="bold yellow"))
         if len(description) > 1000:
-            console.print(Markdown(fix_markdown_linebreaks(description[:1000] + "\n\n*... (已截断)*")))
+            console.print(
+                Markdown(fix_markdown_linebreaks(description[:1000] + "\n\n*... (已截断)*"))
+            )
         else:
             console.print(Markdown(fix_markdown_linebreaks(description)))
 
@@ -1650,7 +1761,9 @@ def cmd_show(args):
                     last_read_idx = i
                     last_read_content = item["content"]
             if last_read_idx:
-                console.print(Text(f"  📖 最后已读 [{last_read_idx}]: {last_read_content}", style="dim"))
+                console.print(
+                    Text(f"  📖 最后已读 [{last_read_idx}]: {last_read_content}", style="dim")
+                )
             if unread_count > 0:
                 console.print(Text(f"  未读 {unread_count} 条：", style="bold green"))
                 for i, item in enumerate(info_list, 1):
@@ -2179,215 +2292,215 @@ def cmd_delete(args):
         return 1
 
 
+def _format_daemon_entry(entry: dict) -> str:
+    """格式化daemon条目显示: d3f9a2(PID 12345, nest=epyc)"""
+    nest = entry.get("nest")
+    if nest:
+        return f"{entry.get('id')}(PID {entry.get('pid')}, nest={nest})"
+    return f"{entry.get('id')}(PID {entry.get('pid')})"
+
+
+def _print_daemon_kill_result(result: dict, label: str = "") -> None:
+    """打印daemon批量kill结果（pid维度）"""
+    killed = result.get("killed", [])
+    already_dead = result.get("already_dead", [])
+    errors = result.get("errors", [])
+    if killed:
+        e_list = ", ".join(_format_daemon_entry(e) for e in killed)
+        print(f"  {Colors.GREEN}{label}已杀死: [{e_list}]{Colors.RESET}")
+    if already_dead:
+        e_list = ", ".join(_format_daemon_entry(e) for e in already_dead)
+        print(f"  {Colors.DIM}{label}已自行退出: [{e_list}]{Colors.RESET}")
+    if errors:
+        for err in errors:
+            print(
+                f"  {Colors.RED}{label}杀死失败: {err.get('id')} (PID {err.get('pid')}) - {err.get('error')}{Colors.RESET}"
+            )
+
+
 def cmd_kill(args):
-    """杀死指定task_id关联的所有后台进程（从data/pid.json读取）"""
-    task_id = args.id
+    """杀死daemon后台进程：按daemon id（-d，可多个）或按事务ID"""
+    daemon_ids = list(getattr(args, "daemon_id", None) or [])
+    task_id = getattr(args, "id", None)
 
-    # 先清理已退出的进程
-    cleaned = cleanup_dead_pids(task_id)
+    if not daemon_ids and task_id is None:
+        print(
+            f"{Colors.RED}❌ 请指定事务ID（task kill <ID>）或daemon id（task kill -d <id>）{Colors.RESET}",
+            file=sys.stderr,
+        )
+        return 1
 
-    # 获取当前事务信息（可选，用于显示格式化ID）
+    # 先清理已退出的daemon记录
+    cleaned = cleanup_dead_daemons()
+
+    if daemon_ids:
+        # 按 daemon id 杀死（支持多个 -d）
+        total_killed = []
+        total_already_dead = []
+        total_errors = []
+        for daemon_id in daemon_ids:
+            result = kill_daemon_by_id_sync(daemon_id)
+            total_killed.extend(result["killed"])
+            total_already_dead.extend(result["already_dead"])
+            total_errors.extend(result["errors"])
+
+        if not total_killed and not total_already_dead and not total_errors:
+            print(f"{Colors.YELLOW}⚠️ 指定的daemon均不存在或已无记录{Colors.RESET}")
+            if cleaned > 0:
+                print(f"{Colors.DIM}已清理 {cleaned} 个已退出daemon的记录{Colors.RESET}")
+            return 0
+
+        print(f"{Colors.BOLD}daemon {', '.join(daemon_ids)} 清理结果:{Colors.RESET}")
+        if cleaned > 0:
+            print(f"  {Colors.DIM}清理 {cleaned} 个已退出daemon记录{Colors.RESET}")
+        _print_daemon_kill_result(
+            {
+                "killed": total_killed,
+                "already_dead": total_already_dead,
+                "errors": total_errors,
+            }
+        )
+        total = len(total_killed) + len(total_already_dead) + len(total_errors)
+        print(
+            f"\n共 {total} 个daemon（{len(total_killed)} 杀死, {len(total_already_dead)} 已退出, {len(total_errors)} 失败）"
+        )
+        return 1 if total_errors else 0
+
+    # 按事务ID杀死该事务的所有daemon
     tm = get_task_manager()
     task = tm.get_task(task_id)
     formatted_id = format_task_id(task_id, task) if task else str(task_id)
 
-    # 执行kill
-    result = kill_task_pids(task_id)
-
+    result = kill_task_daemons_sync(task_id)
     killed = result["killed"]
     already_dead = result["already_dead"]
     errors = result["errors"]
 
     if not killed and not already_dead and not errors:
-        print(f"{Colors.YELLOW}⚠️ 事务 {formatted_id} 没有已注册的后台进程{Colors.RESET}")
+        print(f"{Colors.YELLOW}⚠️ 事务 {formatted_id} 没有已注册的后台daemon{Colors.RESET}")
         if cleaned > 0:
             print(f"{Colors.DIM}已清理 {cleaned} 个已退出进程的记录{Colors.RESET}")
         return 0
 
-    print(f"{Colors.BOLD}事务 {formatted_id} 后台进程清理结果:{Colors.RESET}")
-
+    print(f"{Colors.BOLD}事务 {formatted_id} 后台daemon清理结果:{Colors.RESET}")
     if cleaned > 0:
         print(f"  {Colors.DIM}清理 {cleaned} 个已退出进程记录{Colors.RESET}")
-
-    if killed:
-        pid_list = ", ".join(str(p) for p in killed)
-        print(f"  {Colors.GREEN}已杀死: [{pid_list}]{Colors.RESET}")
-
-    if already_dead:
-        pid_list = ", ".join(str(p) for p in already_dead)
-        print(f"  {Colors.DIM}已自行退出: [{pid_list}]{Colors.RESET}")
-
-    if errors:
-        for err in errors:
-            print(f"  {Colors.RED}杀死失败: PID {err['pid']} - {err['error']}{Colors.RESET}")
+    _print_daemon_kill_result(result)
 
     total = len(killed) + len(already_dead) + len(errors)
     print(
-        f"\n共 {total} 个进程（{len(killed)} 杀死, {len(already_dead)} 已退出, {len(errors)} 失败）"
+        f"\n共 {total} 个daemon（{len(killed)} 杀死, {len(already_dead)} 已退出, {len(errors)} 失败）"
     )
 
     return 1 if errors else 0
 
 
 def cmd_killall(args):
-    """杀死pid.json中记录的所有进程"""
-    # 先清理已退出的进程
-    cleaned = cleanup_dead_pids(None)
+    """杀死data/daemon.json中记录的所有后台daemon进程"""
+    # 先清理已退出的daemon记录
+    cleaned = cleanup_dead_daemons()
 
-    # 执行killall：遍历所有task_id，逐个杀死
-    all_data = get_all_tasks()
+    # 杀死所有daemon
+    result = kill_all_daemons_sync()
+    killed = result["killed"]
+    already_dead = result["already_dead"]
+    errors = result["errors"]
 
-    if not all_data:
-        print(f"{Colors.YELLOW}⚠️ 没有已注册的后台进程{Colors.RESET}")
+    if not killed and not already_dead and not errors:
+        print(f"{Colors.YELLOW}⚠️ 没有已注册的后台daemon{Colors.RESET}")
         if cleaned > 0:
-            print(f"{Colors.DIM}已清理 {cleaned} 个已退出进程的记录{Colors.RESET}")
+            print(f"{Colors.DIM}已清理 {cleaned} 个已退出daemon的记录{Colors.RESET}")
         return 0
 
-    total_killed = []
-    total_already_dead = []
-    total_errors = []
-
-    print(f"{Colors.BOLD}杀死所有后台进程:{Colors.RESET}")
-
+    print(f"{Colors.BOLD}杀死所有后台daemon:{Colors.RESET}")
     if cleaned > 0:
-        print(f"  {Colors.DIM}清理 {cleaned} 个已退出进程记录{Colors.RESET}")
+        print(f"  {Colors.DIM}清理 {cleaned} 个已退出daemon记录{Colors.RESET}")
+    _print_daemon_kill_result(result)
 
-    for task_id_str, pids in all_data.items():
-        task_id = int(task_id_str)
-        tm = get_task_manager()
-        task = tm.get_task(task_id)
-        formatted_id = format_task_id(task_id, task) if task else str(task_id)
-
-        result = kill_task_pids(task_id)
-        killed = result["killed"]
-        already_dead = result["already_dead"]
-        errors = result["errors"]
-
-        if killed:
-            total_killed.extend(killed)
-            pid_list = ", ".join(str(p) for p in killed)
-            print(f"  {Colors.GREEN}事务 {formatted_id} 已杀死: [{pid_list}]{Colors.RESET}")
-
-        if already_dead:
-            total_already_dead.extend(already_dead)
-            pid_list = ", ".join(str(p) for p in already_dead)
-            print(f"  {Colors.DIM}事务 {formatted_id} 已自行退出: [{pid_list}]{Colors.RESET}")
-
-        if errors:
-            total_errors.extend(errors)
-            for err in errors:
-                print(
-                    f"  {Colors.RED}事务 {formatted_id} 杀死失败: PID {err['pid']} - {err['error']}{Colors.RESET}"
-                )
-
-    total = len(total_killed) + len(total_already_dead) + len(total_errors)
+    total = len(killed) + len(already_dead) + len(errors)
     print(
-        f"\n共 {total} 个进程（{len(total_killed)} 杀死, {len(total_already_dead)} 已退出, {len(total_errors)} 失败）"
+        f"\n共 {total} 个daemon（{len(killed)} 杀死, {len(already_dead)} 已退出, {len(errors)} 失败）"
     )
 
-    return 1 if total_errors else 0
+    return 1 if errors else 0
 
 
 def cmd_daemon(args):
-    """显示所有已注册的后台进程（支持按nest过滤）"""
-    # 🔧 Task#72：确定nest过滤参数
+    """显示所有已注册的后台daemon（支持按nest过滤）"""
     nest_filter = None
-    if hasattr(args, "local") and args.local:
-        nest_filter = "local"  # "local" 是特殊值，匹配nest=None的记录
-    elif hasattr(args, "nest") and args.nest:
+    if getattr(args, "local", False):
+        nest_filter = "local"  # 特殊值：只显示本地（nest=None）的daemon
+    elif getattr(args, "nest", None):
         if args.nest.lower() == "local":
             nest_filter = "local"
         else:
             nest_filter = args.nest
 
-    all_data = get_all_tasks()
-
-    # 先清理已退出的进程
-    cleaned = cleanup_dead_pids(None)
-
+    cleaned = cleanup_dead_daemons()
     if cleaned > 0:
-        print(f"{Colors.DIM}已清理 {cleaned} 个已退出进程记录{Colors.RESET}")
+        print(f"{Colors.DIM}已清理 {cleaned} 个已退出daemon记录{Colors.RESET}")
 
-    # 重新加载清理后的数据
-    all_data = get_all_tasks()
-
+    all_data = list_daemons()
     if not all_data:
-        print(f"{Colors.YELLOW}没有已注册的后台进程{Colors.RESET}")
+        print(f"{Colors.YELLOW}没有已注册的后台daemon{Colors.RESET}")
         return 0
 
-    # 🔧 Task#72：按nest分组显示
-    tm = get_task_manager()
+    # 按nest过滤
+    filtered = {}
+    for daemon_id, entry in all_data.items():
+        entry_nest = entry.get("nest")
+        if nest_filter is None:
+            filtered[daemon_id] = entry
+        elif nest_filter == "local":
+            if entry_nest is None:
+                filtered[daemon_id] = entry
+        elif entry_nest == nest_filter:
+            filtered[daemon_id] = entry
 
-    # 过滤和分组
-    filtered_data = {}
-    for task_id_str, entries in all_data.items():
-        filtered_entries = []
-        for entry in entries:
-            entry_nest = entry.get("nest")
-            if nest_filter is None:
-                # 不过滤，显示所有
-                filtered_entries.append(entry)
-            elif nest_filter == "local":
-                # 只显示本地进程（nest为None的）
-                if entry_nest is None:
-                    filtered_entries.append(entry)
-            else:
-                # 按指定nest名称过滤
-                if entry_nest == nest_filter:
-                    filtered_entries.append(entry)
-        if filtered_entries:
-            filtered_data[task_id_str] = filtered_entries
-
-    if not filtered_data:
+    if not filtered:
         if nest_filter:
-            print(f"{Colors.YELLOW}没有匹配的已注册后台进程 (nest={nest_filter}){Colors.RESET}")
+            print(f"{Colors.YELLOW}没有匹配的后台daemon (nest={nest_filter}){Colors.RESET}")
         else:
-            print(f"{Colors.YELLOW}没有已注册的后台进程{Colors.RESET}")
+            print(f"{Colors.YELLOW}没有已注册的后台daemon{Colors.RESET}")
         return 0
 
-    print(f"\n{Colors.BOLD}已注册的后台进程{Colors.RESET}")
+    tm = get_task_manager()
+    print(f"\n{Colors.BOLD}已注册的后台daemon{Colors.RESET}")
     print("=" * 60)
 
-    # 按nest分组收集统计
+    # 按事务分组显示
+    task_groups: dict[str, list] = {}
+    for daemon_id, entry in filtered.items():
+        task_groups.setdefault(str(entry.get("task_id") or ""), []).append(entry)
+
+    for task_key in sorted(task_groups, key=lambda k: int(k) if k.isdigit() else -1):
+        entries = task_groups[task_key]
+        if task_key:
+            task = tm.get_task(int(task_key))
+            label = format_task_id(int(task_key), task) if task else f"#{task_key}"
+        else:
+            label = "(无关联事务)"
+        print(f"  事务 {label}:")
+        for entry in entries:
+            cmd_preview = (entry.get("command") or "")[:50]
+            nest_part = f", nest={entry['nest']}" if entry.get("nest") else ""
+            log_part = f"\n      日志: {entry['log_file']}" if entry.get("log_file") else ""
+            print(f"    {entry['id']}(PID {entry['pid']}{nest_part}) {cmd_preview}{log_part}")
+
+    # nest统计
     nest_stats: dict[str | None, int] = {}
-    for task_id_str, entries in filtered_data.items():
-        for entry in entries:
-            n = entry.get("nest")
-            if n not in nest_stats:
-                nest_stats[n] = 0
-            nest_stats[n] += 1
+    for entry in filtered.values():
+        n = entry.get("nest")
+        nest_stats[n] = nest_stats.get(n, 0) + 1
 
-    for task_id_str, entries in filtered_data.items():
-        task_id = int(task_id_str)
-        task = tm.get_task(task_id)
-        formatted_id = format_task_id(task_id, task) if task else str(task_id)
-
-        # 🔧 Task#72：显示每个PID的nest来源
-        pid_parts = []
-        for entry in entries:
-            pid = entry["pid"]
-            entry_nest = entry.get("nest")
-            if entry_nest:
-                pid_parts.append(f"{pid}(nest={entry_nest})")
-            else:
-                pid_parts.append(str(pid))
-        pid_list = ", ".join(pid_parts)
-        print(f"  事务 {formatted_id}: [{pid_list}]")
-
-    # 统计输出
-    total_processes = sum(len(entries) for entries in filtered_data.values())
-    nest_info = ""
-    if nest_stats:
-        parts = []
-        for n, count in sorted(nest_stats.items(), key=lambda x: (x[0] is not None, x[0] or "")):
-            label = n if n else "本地"
-            parts.append(f"{label}: {count}")
-        nest_info = f" ({', '.join(parts)})"
-
-    print(f"\n共 {len(filtered_data)} 个事务，{total_processes} 个进程{nest_info}")
-    print(f"{Colors.DIM}使用 task kill <id> 清理指定事务的后台进程{Colors.RESET}")
+    total = len(filtered)
+    parts = []
+    for n, count in sorted(nest_stats.items(), key=lambda x: (x[0] is not None, x[0] or "")):
+        stat_label = n if n else "本地"
+        parts.append(f"{stat_label}: {count}")
+    print(f"\n共 {total} 个daemon ({', '.join(parts)})")
+    print(f"{Colors.DIM}停止: task kill -d <daemon_id>，或bash/daemon工具 stop <daemon_id>{Colors.RESET}")
     return 0
-
 
 def cmd_move(args):
     """移动事务到新的父事务下或变成树根"""
@@ -2569,7 +2682,9 @@ def cmd_heartbeat(args):
         success = tm.db.update_task(args.id, heartbeat_timeout=0)
         if success:
             default_timeout = get_default_heartbeat_timeout()
-            print(f"{Colors.GREEN}✅ 事务 {formatted_id} 心跳超时已重置为默认值（{default_timeout} 秒）{Colors.RESET}")
+            print(
+                f"{Colors.GREEN}✅ 事务 {formatted_id} 心跳超时已重置为默认值（{default_timeout} 秒）{Colors.RESET}"
+            )
         else:
             print(f"{Colors.RED}❌ 无法更新事务{Colors.RESET}", file=sys.stderr)
             return 1
@@ -2597,10 +2712,14 @@ def cmd_heartbeat(args):
 
         if success:
             if timeout_seconds > 0:
-                print(f"{Colors.GREEN}✅ 事务 {formatted_id} 心跳超时已设置为 {timeout_seconds} 秒{Colors.RESET}")
+                print(
+                    f"{Colors.GREEN}✅ 事务 {formatted_id} 心跳超时已设置为 {timeout_seconds} 秒{Colors.RESET}"
+                )
             else:
                 default_timeout = get_default_heartbeat_timeout()
-                print(f"{Colors.GREEN}✅ 事务 {formatted_id} 心跳超时已重置为默认值（{default_timeout} 秒）{Colors.RESET}")
+                print(
+                    f"{Colors.GREEN}✅ 事务 {formatted_id} 心跳超时已重置为默认值（{default_timeout} 秒）{Colors.RESET}"
+                )
         else:
             print(f"{Colors.RED}❌ 无法更新事务{Colors.RESET}", file=sys.stderr)
             return 1
@@ -3004,9 +3123,7 @@ def cmd_output(args):
         print(f"{Colors.BOLD}显示范围: {begin_line + 1}-{end_line}{Colors.RESET}")
 
     # 检测显示范围内是否含回滚链接，若有则提示回滚命令用法
-    _has_rollback = any(
-        _ROLLBACK_ID_URI_RE.search(lines[i]) for i in range(begin_line, end_line)
-    )
+    _has_rollback = any(_ROLLBACK_ID_URI_RE.search(lines[i]) for i in range(begin_line, end_line))
     if _has_rollback:
         print(
             f"{Colors.YELLOW}💡 回滚命令: task rollback {task_id} R<ID>"
@@ -3020,7 +3137,7 @@ def cmd_output(args):
     # 显示表头（根据 verbose 参数决定）
     if args.verbose:
         print("=" * 100)
-        print(f"{'行号':<12}  {'时间戳':<20}  {'输出源':<8} {'事务':<8}  内容")
+        print(f"{'行号':<12}  {'时间戳':<20}  {'输出源':<10} {'行号':<8}  内容")
         print("-" * 100)
 
     # 显示内容（带行号）；含回滚超链接的行在行尾追加 [R<seq>] task rollback <task_id> R<seq>，
@@ -3104,11 +3221,11 @@ def _format_rollback_meta_summary(meta: dict) -> str:
         for f in added[:10]:
             lines.append(f"  {Colors.RED}+ 删除 {f}{Colors.RESET}")
         if len(added) > 10:
-            lines.append(f"  {Colors.RED}... 共 {len(added)} 个新增文件（回滚时删除）{Colors.RESET}")
+            lines.append(
+                f"  {Colors.RED}... 共 {len(added)} 个新增文件（回滚时删除）{Colors.RESET}"
+            )
     if not changed and not added:
-        lines.append(
-            f"  {Colors.YELLOW}⚠️ 快照时无变更清单（回滚时动态检测实际变更）{Colors.RESET}"
-        )
+        lines.append(f"  {Colors.YELLOW}⚠️ 快照时无变更清单（回滚时动态检测实际变更）{Colors.RESET}")
     return "\n".join(lines)
 
 
@@ -3160,12 +3277,17 @@ def cmd_rollback(args):
                 f"  {Colors.MAGENTA}[R{seq}]{Colors.RESET} "
                 f"R{seq:<8} {label} [{timestamp}] ({scope_str})"
             )
-        print(f"\n回滚命令: task rollback {args.id} R<ID>（如 task rollback {args.id} R{metas[-1].get('_seq', 1)}）")
+        print(
+            f"\n回滚命令: task rollback {args.id} R<ID>（如 task rollback {args.id} R{metas[-1].get('_seq', 1)}）"
+        )
         return 0
 
     # 解析回滚ID
     if not args.rollback_id:
-        print(f"{Colors.RED}❌ 缺少回滚ID。先运行 task rollback {args.id} --list 查看{Colors.RESET}", file=sys.stderr)
+        print(
+            f"{Colors.RED}❌ 缺少回滚ID。先运行 task rollback {args.id} --list 查看{Colors.RESET}",
+            file=sys.stderr,
+        )
         return 1
     rid = _resolve_rollback_id_ref(args.rollback_id, args.id)
     if not rid:
@@ -3215,7 +3337,9 @@ def cmd_rollback(args):
 
             asyncio.run(tm.pause_task(args.id, reason=f"CLI rollback {rid}"))
             was_running = True
-            print(f"{Colors.YELLOW}⏸️ 事务 {formatted_id} 已暂停（回滚后可用 resume 继续）{Colors.RESET}")
+            print(
+                f"{Colors.YELLOW}⏸️ 事务 {formatted_id} 已暂停（回滚后可用 resume 继续）{Colors.RESET}"
+            )
         except Exception as e:
             print(f"{Colors.YELLOW}⚠️ 暂停事务失败（继续回滚）: {e}{Colors.RESET}")
 
@@ -3242,7 +3366,9 @@ def cmd_rollback(args):
                 if resume_ok:
                     print(f"{Colors.GREEN}▶️ 事务 {formatted_id} 已自动恢复运行{Colors.RESET}")
             except Exception as e:
-                print(f"{Colors.YELLOW}⚠️ 恢复事务失败（可用 task resume {args.id} 手动恢复）: {e}{Colors.RESET}")
+                print(
+                    f"{Colors.YELLOW}⚠️ 恢复事务失败（可用 task resume {args.id} 手动恢复）: {e}{Colors.RESET}"
+                )
         return 0
 
     # 写回滚记录到 output（含撤销链接和继续链接），与 WebUI 行为一致
@@ -3360,7 +3486,14 @@ def main():
                 pass
             order = _default_order
 
-        return cmd_trees(ListArgs())
+        rc = cmd_trees(ListArgs())
+        # 无参数（len(sys.argv)==1，区别于显式 --all/-a 扩展查询）时，
+        # 在输出末尾打印 provider 用量/费用页脚（见 peng/cli/_usage_footer.py）
+        if len(sys.argv) == 1:
+            from peng.cli._usage_footer import print_provider_usage_footer
+
+            print_provider_usage_footer()
+        return rc
 
     parser = argparse.ArgumentParser(
         description=f"{AGENT_NAME}的事务管理工具",
@@ -3442,7 +3575,12 @@ def main():
     # show 命令
     show_parser = subparsers.add_parser("show", help="显示事务详情")
     show_parser.add_argument("id", type=int, help="事务ID")
-    show_parser.add_argument("--format", choices=["ansi", "html"], default="ansi", help="输出格式（ansi=终端默认，html=语义化HTML用于弹窗）")
+    show_parser.add_argument(
+        "--format",
+        choices=["ansi", "html"],
+        default="ansi",
+        help="输出格式（ansi=终端默认，html=语义化HTML用于弹窗）",
+    )
     show_parser.set_defaults(func=cmd_show)
 
     # tree 命令
@@ -3529,17 +3667,24 @@ def main():
 
     # kill 命令
     kill_parser = subparsers.add_parser(
-        "kill", help="杀死指定事务的所有后台进程（从data/pid.json读取）"
+        "kill", help="杀死后台daemon进程（按事务ID或 -d <daemon_id>，从data/daemon.json读取）"
     )
-    kill_parser.add_argument("id", type=int, help="事务ID")
+    kill_parser.add_argument("id", type=int, nargs="?", default=None, help="事务ID（与 -d 二选一）")
+    kill_parser.add_argument(
+        "--daemon-id",
+        "-d",
+        action="append",
+        default=None,
+        help="daemon id（daemon工具返回的id，可多次指定杀死多个）",
+    )
     kill_parser.set_defaults(func=cmd_kill)
 
     # killall 命令
-    killall_parser = subparsers.add_parser("killall", help="杀死pid.json中记录的所有后台进程")
+    killall_parser = subparsers.add_parser("killall", help="杀死daemon.json中记录的所有后台daemon进程")
     killall_parser.set_defaults(func=cmd_killall)
 
     # daemon 命令
-    daemon_parser = subparsers.add_parser("daemon", help="显示所有已注册的后台进程")
+    daemon_parser = subparsers.add_parser("daemon", help="显示所有已注册的后台daemon")
     daemon_parser.add_argument(
         "--nest", type=str, default=None, help="按nest过滤（local=本地，其他=远程nest名称）"
     )
@@ -3576,7 +3721,9 @@ def main():
     timer_parser.set_defaults(func=cmd_timer)
 
     # heartbeat 命令
-    heartbeat_parser = subparsers.add_parser("heartbeat", help="事务心跳超时操作（查看和修改心跳超时时间）")
+    heartbeat_parser = subparsers.add_parser(
+        "heartbeat", help="事务心跳超时操作（查看和修改心跳超时时间）"
+    )
     heartbeat_parser.add_argument("id", type=int, help="事务ID")
     heartbeat_parser.add_argument(
         "seconds", nargs="?", type=int, help="心跳超时时间（秒），0表示使用默认值"
@@ -3724,12 +3871,8 @@ def main():
         default=None,
         help="回滚ID（即 output 行尾 [R<ID>] 中的数字），如 12 或 R12",
     )
-    rollback_parser.add_argument(
-        "--list", "-l", action="store_true", help="列出全部可用回滚ID"
-    )
-    rollback_parser.add_argument(
-        "-y", "--yes", action="store_true", help="跳过确认直接回滚"
-    )
+    rollback_parser.add_argument("--list", "-l", action="store_true", help="列出全部可用回滚ID")
+    rollback_parser.add_argument("-y", "--yes", action="store_true", help="跳过确认直接回滚")
     rollback_parser.set_defaults(func=cmd_rollback)
 
     args = parser.parse_args()

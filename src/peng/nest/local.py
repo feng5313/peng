@@ -702,11 +702,31 @@ class LocalExecutor:
             stdout_text = _decode_output(stdout)
             stderr_text = _decode_output(stderr)
 
+            # 🔧 事务#1737: 输出总量硬上限——防 cat 大文件等巨量输出
+            # 撑爆WebSocket响应帧（>50MB触发1009断连死循环）
+            # 超限时保留 stdout 头部和 stderr 头部，并加省略标记
+            _MAX_BASH_OUTPUT = 8 * 1024 * 1024  # 8MB
+            _output_truncated = False
+            if len(stdout_text) + len(stderr_text) > _MAX_BASH_OUTPUT:
+                _keep = _MAX_BASH_OUTPUT // 2
+                if len(stdout_text) > _keep:
+                    stdout_text = (
+                        stdout_text[:_keep] + "\n...[stdout过大，已截断]...\n"
+                    )
+                    _output_truncated = True
+                if len(stderr_text) > _keep:
+                    stderr_text = (
+                        stderr_text[:_keep] + "\n...[stderr过大，已截断]...\n"
+                    )
+                    _output_truncated = True
+
             result = {
                 "stdout": stdout_text,
                 "stderr": stderr_text,
                 "exit_code": proc.returncode,
             }
+            if _output_truncated:
+                result["output_truncated"] = True
 
             return NestResponse.make_result(params.get("_request_id", ""), result)
 
@@ -908,10 +928,20 @@ class LocalExecutor:
 
         start = offset - 1
         raw = []
+        total_chars = 0
+        truncated = False
         for i, line in enumerate(all_lines):
             if i < start:
                 continue
             if len(raw) >= limit:
+                break
+            # 🔧 事务#1737: 单行与总量上限——防超大单行文件(如base64/压缩数据)
+            # 撑爆WebSocket响应帧（>50MB触发1009断连死循环）
+            if len(line) > 2000:
+                line = line[:2000] + f"...(截断,原长度{len(line)})"
+            total_chars += len(line)
+            if total_chars > 4 * 1024 * 1024:
+                truncated = True
                 break
             raw.append(line.rstrip("\n\r"))
 
@@ -927,12 +957,25 @@ class LocalExecutor:
                 "total_lines": len(all_lines),
                 "start": offset,
                 "end": offset + len(result_lines) - 1,
+                "truncated": truncated,
             },
         )
 
     def _read_binary(self, path: Path, params: dict) -> NestResponse:
         """读取二进制文件（图片/PDF）"""
+        # 🔧 事务#1737: 单响应硬上限。超大文件整体base64会让响应帧超过
+        # bridge 的 max_size(50MB)，触发 code=1009 断连，并陷入
+        # "重连→重发→再超限"死循环，拖垮整个 nest（epyc 不可用事故根因）
+        _MAX_BINARY_READ_BYTES = 20 * 1024 * 1024  # 20MB
         try:
+            file_size = path.stat().st_size
+            if file_size > _MAX_BINARY_READ_BYTES:
+                return NestResponse.make_error(
+                    params.get("_request_id", ""),
+                    f"文件过大无法整体读取: {path} "
+                    f"({file_size / 1048576:.1f}MB > 20MB)。"
+                    f"请用 read_chunks 分块读取，或压缩/裁剪后再试",
+                )
             with open(path, "rb") as f:
                 file_bytes = f.read()
 

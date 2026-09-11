@@ -137,7 +137,7 @@ def create_tasks_table(conn):
             timeout INTEGER DEFAULT 0,
             timeout_started_at TEXT,
             heartbeat_at TEXT,
-            heartbeat_timeout INTEGER DEFAULT 180,
+            heartbeat_timeout INTEGER DEFAULT NULL,  -- NULL表示使用 config monitor.default_heartbeat_timeout
             expertise TEXT,
             analysis_report TEXT,
             subtask_config TEXT,

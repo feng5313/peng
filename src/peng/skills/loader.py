@@ -130,79 +130,136 @@ class SkillLoader(metaclass=MetaSingleton):
         return self._skills
 
     def load(self, name: str) -> Skill | None:
-        """
-        加载指定Skill
-
-        Args:
-            name: Skill名称
-
-        Returns:
-            Skill实例，失败返回None
-        """
-        from peng.config import load_config
-
-        config = load_config()
-        skill_md_name = config.paths.skill_md_name
-
+        """加载指定Skill（在已注册的 _directories 中查找）"""
         for directory in self._directories:
             skill_dir = directory / name
-            skill_file = skill_dir / skill_md_name
-
-            if skill_file.exists():
-                files = self.list_skill_files()
-                files_str = f"\n相关脚本/文件路径：\n{'\n'.join(files['scripts'] + files['references']) }\n"
-                content = skill_file.read_text(encoding="utf-8") + files_str
-                metadata = self._parse_frontmatter(content, name)
-
-                # 尝试加载handler
-                handler = self._load_handler(skill_dir)
-
-                return Skill(
-                    metadata=metadata,
-                    content=content,
-                    path=skill_dir,
-                    handler=handler,
-                )
-
+            if (skill_dir / self._skill_md_name()).exists():
+                return self._build_skill_from_dir(skill_dir, name)
         return None
 
-    def list_skill_files(self) -> dict:
-        """
-        列出 skill 目录下的 scripts 和 references 子目录的文件绝对路径
+    def _skill_md_name(self) -> str:
+        """获取 SKILL.md 文件名（从配置读取，默认 SKILL.md）"""
+        from peng.config import load_config
+        return load_config().paths.skill_md_name
+
+    def _build_skill_from_dir(self, skill_dir: Path, name: str) -> Skill | None:
+        """从指定 skill 目录构建 Skill（读 SKILL.md、frontmatter、handler、scripts/references）"""
+        skill_file = skill_dir / self._skill_md_name()
+        if not skill_file.exists():
+            return None
+        files = self.list_skill_files(skill_dir)
+        files_str = (
+            f"\n相关脚本/文件路径：\n{'\n'.join(files['scripts'] + files['references'])}\n"
+            if (files["scripts"] or files["references"]) else ""
+        )
+        content = skill_file.read_text(encoding="utf-8") + files_str
+        metadata = self._parse_frontmatter(content, name)
+        handler = self._load_handler(skill_dir)  # 失败返回None，不阻断
+        return Skill(metadata=metadata, content=content, path=skill_dir, handler=handler)
+
+
+    def list_skill_files(self, skill_dir: Path | None = None) -> dict:
+        """列出指定 skill 目录下 scripts/references 子目录的文件绝对路径。
+
+        Args:
+            skill_dir: skill 目录；None时回退到 loader.py 所在包目录（兼容旧调用）。
 
         Returns:
-            dict: 包含 scripts 和 references 文件路径的字典
+            dict: {"scripts": [...], "references": [...], "scripts_import_path": ...}
+
+        修复：旧实现忽略实际 skill_dir，硬编码为 loader.py 位置，导致所有 skill 脚本路径错误。
         """
         import os
-        skill_dir = os.path.dirname(os.path.dirname(__file__))  # peng/src/peng/tools
-        scripts_dir = os.path.join(skill_dir, "scripts")
-        references_dir = os.path.join(skill_dir, "references")
-        
+
+        if skill_dir is None:
+            # 回退旧行为：loader.py 所在包上级目录（peng/src/peng/tools）
+            skill_dir = Path(os.path.dirname(os.path.dirname(__file__)))
+
+        scripts_dir = os.path.join(str(skill_dir), "scripts")
+        references_dir = os.path.join(str(skill_dir), "references")
+
         result = {
             "scripts": [],
             "references": [],
-            "scripts_import_path": scripts_dir
+            "scripts_import_path": scripts_dir,
         }
-        
-        # 确保目录存在
-        if not os.path.exists(scripts_dir):
-            return result
-        
-        # 列出 scripts 子目录文件
+
+        # 列出 scripts 子目录文件（目录不存在则跳过）
         if os.path.isdir(scripts_dir):
             for item in os.listdir(scripts_dir):
                 item_path = os.path.join(scripts_dir, item)
                 if os.path.isfile(item_path):
                     result["scripts"].append(os.path.abspath(item_path))
-        
-        # 列出 references 子目录文件
+
+        # 列出 references 子目录文件（目录不存在则跳过）
         if os.path.isdir(references_dir):
             for item in os.listdir(references_dir):
                 item_path = os.path.join(references_dir, item)
                 if os.path.isfile(item_path):
                     result["references"].append(os.path.abspath(item_path))
-        
+
         return result
+
+    def discover_in(self, base_dir: Path | str) -> list[str]:
+        """仅扫描指定 base_dir 下的 skills（不触碰 self._directories），返回名称列表。
+
+        Args:
+            base_dir: skills 根目录（其下每个含 SKILL.md 的子目录为一个 skill）
+
+        Returns:
+            发现的 skill 名称列表；base_dir不存在或无skill时返回空列表。扫描异常记录日志并返回空列表。
+        """
+        base = Path(base_dir).expanduser().resolve() if base_dir else None
+        if not base or not base.is_dir():
+            return []
+
+        skill_md_name = self._skill_md_name()
+        discovered = []
+        try:
+            for entry in base.iterdir():
+                if entry.is_dir() and (entry / skill_md_name).exists():
+                    discovered.append(entry.name)
+        except Exception as e:
+            logger.warning(f"discover_in() - {base} 扫描失败(忽略): {e}")
+            return []
+
+        return discovered
+
+    def collect_external_skills(self, base_dirs: list[Path | str]) -> dict[str, Skill]:
+        """从外部 skills 源（工作nest/工作目录的 skills/）收集 Skill 映射（纯函数，不修改 self._skills/_directories）。
+
+        SkillLoader 是进程级 MetaSingleton，被同进程多个 Agent 共享；task级技能必须用
+        per-agent overlay（独立 dict）承载并作为参数传入 get_discovery_prompt/get，
+        绝不能写入共享的 _skills/_directories，否则会把某任务工作目录的技能泄漏给同进程其他 Agent。
+
+        Args:
+            base_dirs: skills 根目录列表（每个目录下每个含 SKILL.md 的子目录为一个 skill）
+
+        Returns:
+            {skill_name: Skill}：收集到的技能映射（同名后者覆盖前者）。单个源加载失败静默跳过。调用方负责捕获整体异常。
+        """
+        collected: dict[str, Skill] = {}
+
+        for base in base_dirs:
+            base_path = Path(base).expanduser().resolve() if base else None
+            if not base_path or not base_path.is_dir():
+                continue
+
+            for name in self.discover_in(base_path):
+                try:
+                    skill = self._build_skill_from_dir(base_path / name, name)
+                except Exception as e:
+                    logger.warning(f"collect_external_skills() - {base_path / name} 加载失败(忽略): {e}")
+                    continue
+
+                if skill is None:
+                    continue
+
+                collected[name] = skill
+
+        return collected
+
+
 
     def _parse_frontmatter(self, content: str, default_name: str) -> SkillMetadata:
         """
@@ -307,16 +364,18 @@ class SkillLoader(metaclass=MetaSingleton):
 
         return None
 
-    def get(self, name: str) -> Skill | None:
-        """
-        获取已加载的Skill
+    def get(self, name: str, overlay: dict[str, "Skill"] | None = None) -> Skill | None:
+        """获取已加载的Skill（overlay 优先于全局 _skills）
 
         Args:
             name: Skill名称
+            overlay: per-agent 的 task级技能映射（工作nest/工作目录技能）。命中时优先返回。
 
         Returns:
-            Skill实例，不存在返回None
+            Skill实例，不存在返回None。overlay 与 _skills 均无则返回 None。
         """
+        if overlay and name in overlay:
+            return overlay[name]
         return self._skills.get(name)
 
     def list_skills(self) -> list[str]:
@@ -328,22 +387,29 @@ class SkillLoader(metaclass=MetaSingleton):
         """
         return list(self._skills.keys())
 
-    def get_discovery_prompt(self) -> str:
-        """
-        生成 Discovery 阶段的提示词（只有 descriptions，~100 tokens）
+    def get_discovery_prompt(self, overlay: dict[str, "Skill"] | None = None) -> str:
+        """生成 Discovery 阶段的提示词（只有 descriptions，~100 tokens）
 
         符合 Agent Skills 标准的 Progressive Disclosure:
         - 只注入 skill 名称和描述列表
         - LLM 根据描述判断需要哪个 skill
         - 通过 skill 工具按需加载完整内容
 
+        Args:
+            overlay: per-agent 的 task级技能映射（工作nest/工作目录技能）。同名时覆盖全局技能（更具体上下文优先）。不修改共享 _skills。
+
         Returns:
-            skills 发现提示词
+            skills 发现提示词（无技能时返回空字符串）
         """
-        if not self._skills:
+        # 合并：全局 _skills 为基础，overlay（task级）同名覆盖（更具体上下文优先）；不修改共享状态。
+        merged = dict(self._skills)
+        if overlay:
+            merged.update(overlay)
+
+        if not merged:
             return ""
 
-        enabled_skills = [s for s in self._skills.values() if s.metadata.enabled]
+        enabled_skills = [s for s in merged.values() if s.metadata.enabled]
         if not enabled_skills:
             return ""
 
@@ -357,6 +423,7 @@ class SkillLoader(metaclass=MetaSingleton):
             lines.append(f"- **{skill.metadata.name}**: {desc_short}")
 
         return "\n".join(lines)
+
 
     def get_skill_content(self, name: str) -> str | None:
         """

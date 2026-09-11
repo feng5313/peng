@@ -44,6 +44,8 @@ class SkillTool(Tool):
 当你需要了解某个技能的详细使用方法、API、示例时调用此工具。
 技能名称可以从"可用技能"列表中获取。
 
+技能来源：全局 config 配置的 skills 目录，以及当前事务所在 nest/工作目录下的 skills 子目录（同名时工作目录技能优先）。
+
 使用场景：
 1. 用户提到需要使用某个特定功能（如 pexpect、ansi 处理）
 2. 你需要了解如何正确使用某个技能
@@ -70,6 +72,8 @@ class SkillTool(Tool):
         """
         加载指定 skill 的完整内容
 
+        解析优先级：per-agent task级技能 overlay（工作nest/工作目录技能，同名覆盖全局）> 全局 SkillLoader。
+
         Args:
             name: Skill 名称
 
@@ -79,7 +83,12 @@ class SkillTool(Tool):
         if not _skill_loader:
             return "错误：Skill 系统未初始化"
 
-        skill = _skill_loader.get(name)
+        # 🔧 事务#1827：优先从 per-agent overlay（工作nest/工作目录技能）解析，同名覆盖全局
+        overlay = self.get_context("skill_overlay") or {}
+        skill = overlay.get(name) if isinstance(overlay, dict) else None
+        if skill is None:
+            skill = _skill_loader.get(name)
+
         if not skill:
             available = ", ".join(_skill_loader.list_skills())
             return f"错误：未找到 skill '{name}'。可用技能：{available}"

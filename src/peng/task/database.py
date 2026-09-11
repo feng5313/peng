@@ -374,7 +374,7 @@ class TaskDatabase(metaclass=MetaSingleton):
 
             -- 心跳
             heartbeat_at TEXT,
-            heartbeat_timeout INTEGER DEFAULT 180,
+            heartbeat_timeout INTEGER DEFAULT NULL,  -- NULL表示使用 config monitor.default_heartbeat_timeout
 
             -- 专家指派 JSON（需求 §5.4.4）
             expertise TEXT,
@@ -683,6 +683,14 @@ class TaskDatabase(metaclass=MetaSingleton):
         small_model_int = 1 if small_model else 0
         is_complex_int = 1 if is_complex else 0
         timer_int = int(timer) if timer is not None else 0
+        # 心跳超时：未指定（None）或<=0 时使用配置默认值（monitor.default_heartbeat_timeout）
+        heartbeat_timeout = kwargs.get("heartbeat_timeout")
+        if heartbeat_timeout is None or int(heartbeat_timeout) <= 0:
+            from peng.config.loader import get_default_heartbeat_timeout
+
+            heartbeat_timeout = get_default_heartbeat_timeout()
+        else:
+            heartbeat_timeout = int(heartbeat_timeout)
         message_id = int(message_id) if message_id else None
         parent_task_id = int(parent_task_id) if parent_task_id else None
         root_id = int(root_id) if root_id else None
@@ -719,6 +727,7 @@ class TaskDatabase(metaclass=MetaSingleton):
             "info": kwargs.get("info") or "",
             "creator": kwargs.get("creator") or "",
             "timer": timer_int,
+            "heartbeat_timeout": heartbeat_timeout,
             "nest": kwargs.get("nest"),
             "id": task_id_specified,
         }
@@ -899,6 +908,7 @@ class TaskDatabase(metaclass=MetaSingleton):
                 "info",
                 "creator",
                 "timer",
+                "heartbeat_timeout",
                 "nest",
                 "checklist",
                 "report",
@@ -933,6 +943,8 @@ class TaskDatabase(metaclass=MetaSingleton):
                 fields["info"],
                 fields["creator"],
                 fields["timer"],
+                # None 时插入 NULL（语义=使用配置默认值，心跳监控端 or default 兜底）
+                fields.get("heartbeat_timeout"),
                 fields["nest"],
                 "",
                 "",

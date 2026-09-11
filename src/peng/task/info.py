@@ -96,6 +96,32 @@ def mark_info_as_read(info_list_with_status: list[dict]) -> None:
         item["read"] = True
 
 
+def is_urgent_content(content: str | None) -> bool:
+    """
+    检测内容是否为紧急指示（以感叹号开头）
+
+    以感叹号（半角 ! 或全角 ！）开头的新回复消息/未读info视为紧急指示：
+    - tool_engine 思考流中立刻打断思考（_has_urgent_interrupts）
+    - bash 工具运行中立刻终止命令进程（tools/bash.py _interrupt_monitor）
+    - 下一轮迭代边界立刻注入处理（_get_unread_reply/_get_task_info）
+
+    被以下模块共享使用（master指示：不要写两份！）：
+    - src/peng/llm/tool_engine.py 的 _has_urgent_interrupts
+    - src/peng/tools/bash.py 的 _interrupt_monitor
+
+    Args:
+        content: 消息/info 内容
+
+    Returns:
+        True 表示以感叹号开头（紧急，需打断立刻处理）
+    """
+    if not content:
+        return False
+    # 处理存储层的字面 \n 转义与首部空白后，取第一个有效字符判断
+    first_char = content.replace("\\n", "\n").lstrip()[:1]
+    return first_char in ("!", "！")
+
+
 def serialize_info_list(info_list_with_status: list[dict]) -> str:
     """
     将带状态的 info 列表序列化为 JSON 字符串

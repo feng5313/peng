@@ -48,6 +48,7 @@ class ReportHook(BaseHook):
         """
         try:
             task = metadata.get("task")
+            progress = task.get("progress", 0) or 0
             history = metadata.get("history")
 
             # === tools:report after-hook ===
@@ -94,6 +95,7 @@ class ReportHook(BaseHook):
                         and "name" in msg
                         and msg["name"] == "report"
                         and "content" in msg
+                        and progress == 100
                     ):
                         # 已汇报，检查是否有未读info
                         unread_items = self._get_unread_info(task_id)
@@ -111,7 +113,7 @@ class ReportHook(BaseHook):
                         return "continue", None  # 已汇报，可以正常结束
                 # 未在最近3条消息中找到report调用
                 # 检查是否之前已成功report过，且满足跳过条件
-                if self._can_skip_report(messages, task):
+                if progress == 100 and self._can_skip_report(messages, task):
                     logger.info(
                         f"[report] 事务#{task_id} 已成功report过且满足跳过条件，不再强制report"
                     )

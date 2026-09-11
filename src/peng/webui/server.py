@@ -139,6 +139,7 @@ async def _lifespan(app: FastAPI):
     async def throughput_broadcast_task():
         """定期读取跨进程共享的吞吐率数据并广播到前端"""
         from peng.llm.throughput_tracker import get_throughput_tracker
+        from peng.llm.prefill_tracker import get_prefill_tracker
         from peng.webui.websocket import manager
         from peng.nest.bridge import NestBridgeManager
 
@@ -158,13 +159,18 @@ async def _lifespan(app: FastAPI):
                 nest_manager.update_all_traffic_rates()
                 nest_traffic = nest_manager.get_traffic_snapshots()
                 
-                has_data = throughputs or nest_traffic
+                # 🔧 事务#1864：采集prefill阶段状态（本地大模型长上下文prefill进度）
+                prefill_status = get_prefill_tracker().get_snapshot()
+                
+                has_data = throughputs or nest_traffic or prefill_status
                 if has_data and len(manager.active_connections) > 0:
                     broadcast_data = {
                         "type": "throughput_update",
                         "throughputs": throughputs,
                         "frame_rates": frame_rates,
                         "nest_traffic": nest_traffic,
+                        # {task_id: {"percent": int, "elapsed": float, "provider": str}}
+                        "prefill_status": prefill_status,
                     }
                     await manager.broadcast(broadcast_data)
                 # 每30秒清理一次过期文件（约10次循环）
@@ -172,6 +178,7 @@ async def _lifespan(app: FastAPI):
                 if cleanup_counter >= 10:
                     cleanup_counter = 0
                     tracker.cleanup()
+                    get_prefill_tracker().cleanup()
                     logger.debug("[ThroughputBroadcast] 已执行过期文件清理")
             except Exception as e:
                 logger.debug(f"吞吐率广播异常（可忽略）: {e}")

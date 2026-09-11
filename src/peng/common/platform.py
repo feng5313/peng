@@ -244,11 +244,31 @@ def _kill_process_posix(pid: int, force: bool, kill_tree: bool, caller: str, rea
         return False
 
 
+def _protected_daemon_pids() -> set[int]:
+    """已注册的本地daemon进程PID集合（kill_tree时排除）
+
+    🔒 daemon进程不跟随task进程结束，只能自行结束或stop/kill结束
+    （stop内置命令 / task kill -d / task killall / task kill <task_id>）。
+    延迟导入避免platform ↔ daemon_registry循环依赖。
+    """
+    try:
+        from peng.common.daemon_registry import list_daemons, normalize_nest
+
+        return {
+            int(e.get("pid") or 0)
+            for e in list_daemons().values()
+            if normalize_nest(e.get("nest")) is None
+        }
+    except Exception:
+        return set()
+
+
 def _kill_process_tree_posix(pid: int, force: bool, caller: str, reason: str) -> None:
     """
     杀死整个进程树（POSIX）
 
     递归查找并杀死所有子进程，然后杀死主进程。
+    🔒 排除已注册的本地daemon进程（daemon生命周期独立，不跟随task进程结束）。
 
     Args:
         pid: 进程 ID
@@ -280,6 +300,18 @@ def _kill_process_tree_posix(pid: int, force: bool, caller: str, reason: str) ->
 
     # 递归获取所有子进程
     child_pids = _get_child_processes(pid)
+
+    # 🔒 排除已注册的本地daemon进程（daemon生命周期独立，不跟随task进程结束）
+    protected = _protected_daemon_pids()
+    if protected:
+        filtered = [p for p in child_pids if p not in protected]
+        if len(filtered) != len(child_pids):
+            skipped = [p for p in child_pids if p in protected]
+            logger.info(
+                f"[POSIX] 进程树杀死时跳过已注册daemon进程: {skipped} "
+                f"- caller={caller}, reason={reason}"
+            )
+        child_pids = filtered
 
     if child_pids:
         logger.info(

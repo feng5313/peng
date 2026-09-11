@@ -21,9 +21,87 @@ def output_manager(tmp_path):
     manager._buffers = {}
     manager._last_source = {}
     manager._consecutive_empty = {}
+    # 🔧 Fix #1751：补齐 Task#1725 行号计数器相关属性（原fixture缺失导致
+    # _write_lines → _ensure_line_no_ready AttributeError，8个测试存量失败）
+    manager._next_line_no = {}
+    manager._line_no_file_size = {}
+    manager._line_no_format_ok = set()
     manager._output_dir = tmp_path
     manager._ensure_output_dir()
     return manager
+
+
+class TestLineNoAlignment:
+    """🔧 Fix #1751：写前对齐文件尾 —— 多进程行号计数器漂移修复"""
+
+    def test_fresh_file_line_no_from_1(self, output_manager, tmp_path):
+        """新文件行号从1开始连续递增"""
+        output_manager.write_output(1, "task", "line1\nline2\nline3\n")
+        out = tmp_path / "task-1.out"
+        lines = out.read_text(encoding="utf-8").strip().split("\n")
+        nos = [int(l.split("\t")[2]) for l in lines]
+        assert nos == [1, 2, 3]
+
+    def test_align_to_external_append(self, output_manager, tmp_path):
+        """外部进程追加了新行 → 本进程写前行号对齐到文件尾"""
+        out = tmp_path / "task-1.out"
+        # 模拟另一进程写了3行（行号1-3）
+        with open(out, "a", encoding="utf-8") as f:
+            for i in range(1, 4):
+                f.write(f"2026-09-02T00:00:00\ttask\t{i}\text{i}\n")
+        # 本进程写入（无内存计数器 → 首次初始化走尾部对齐）
+        output_manager.write_output(1, "task", "mine1\nmine2\n")
+        lines = out.read_text(encoding="utf-8").strip().split("\n")
+        nos = [int(l.split("\t")[2]) for l in lines]
+        # 新行行号应从4开始（对齐文件尾行号3+1）
+        assert nos == [1, 2, 3, 4, 5]
+
+    def test_detect_external_append_between_writes(self, output_manager, tmp_path):
+        """本进程两次写入之间外部进程追加了行 → 第二次写前按物理行数重新对齐"""
+        out = tmp_path / "task-1.out"
+        output_manager.write_output(1, "task", "mine1\n")  # 行号1
+        # 外部进程追加行号100（模拟漂移的另一进程）
+        with open(out, "a", encoding="utf-8") as f:
+            f.write("2026-09-02T00:00:00\tsystem\t100\texternal\n")
+        output_manager.write_output(1, "task", "mine2\n")  # 对齐物理行数2 → 行号3
+        lines = out.read_text(encoding="utf-8").strip().split("\n")
+        nos = [int(l.split("\t")[2]) for l in lines]
+        assert nos == [1, 100, 3]
+
+    def test_pure_old_format_gradual_migration(self, output_manager, tmp_path):
+        """纯旧格式文件（第3字段=task_id恒定）→ 行号按物理行数+1续写（渐进迁移）"""
+        out = tmp_path / "task-1.out"
+        with open(out, "a", encoding="utf-8") as f:
+            for i in range(3):
+                f.write("2026-07-28T10:00:00\ttask\t77\told line\n")  # task_id=77恒定
+        output_manager.write_output(1, "task", "new line\n")
+        lines = out.read_text(encoding="utf-8").strip().split("\n")
+        assert len(lines) == 4
+        # 新行行号=物理行号4（不是78）
+        assert int(lines[3].split("\t")[2]) == 4
+
+    def test_jump_lines_file_align_to_physical(self, output_manager, tmp_path):
+        """尾部含跳变行（多进程漂移交错）→ 对齐物理行数（不跟随错误行号）"""
+        out = tmp_path / "task-1.out"
+        with open(out, "a", encoding="utf-8") as f:
+            # 模拟：正常行10、跳变行5000、正常行12（交错漂移）
+            f.write("2026-09-02T00:00:00\ttask\t10\ta\n")
+            f.write("2026-09-02T00:00:01\tsystem\t5000\tb\n")
+            f.write("2026-09-02T00:00:02\ttask\t12\tc\n")
+        output_manager.write_output(1, "task", "mine\n")
+        lines = out.read_text(encoding="utf-8").strip().split("\n")
+        # 物理行数3 → 新行行号4（对齐物理行数，而非尾部错误行号12+1）
+        assert int(lines[-1].split("\t")[2]) == 4
+
+    def test_file_truncated_counter_reset(self, output_manager, tmp_path):
+        """文件被外部清空 → 计数器重置从1开始"""
+        out = tmp_path / "task-1.out"
+        output_manager.write_output(1, "task", "line1\nline2\n")  # 行号1-2
+        # 外部清空
+        out.write_text("", encoding="utf-8")
+        output_manager.write_output(1, "task", "fresh\n")
+        lines = out.read_text(encoding="utf-8").strip().split("\n")
+        assert int(lines[0].split("\t")[2]) == 1
 
 
 class TestSourceChangeDetection:

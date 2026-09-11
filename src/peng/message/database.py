@@ -1573,6 +1573,40 @@ class MessageDatabase(metaclass=MetaSingleton):
             logger.error(f"获取回复数失败: {e}")
             return 0
 
+    def get_processing_replies(
+        self, msg_id: int, receiver: str | None = None
+    ) -> list[dict[str, Any]]:
+        """
+        获取回复指定消息的、processing状态的子消息（含完整内容）
+
+        用于bash工具中断监控（tools/bash.py _interrupt_monitor）：
+        检测感叹号开头的紧急回复消息，立刻终止正在运行的命令进程。
+        与 tool_engine._get_processing_messages 的语义一致
+        （get_message_tree 树中 processing 状态的消息），
+        但只查直接回复（轻量SQL，适合监控高频轮询）。
+
+        Args:
+            msg_id: 被回复的消息ID（根消息）
+            receiver: 可选，按接收者过滤（通常传当前agent名）
+
+        Returns:
+            消息字典列表（含 id/sender/receiver/content/timestamp）
+        """
+        try:
+            sql = (
+                "SELECT id, sender, receiver, content, timestamp FROM messages "
+                "WHERE reply_to = %s AND status = 'processing'"
+            )
+            params: list[Any] = [msg_id]
+            if receiver:
+                sql += " AND receiver = %s"
+                params.append(receiver)
+            sql += " ORDER BY id ASC"
+            return self._execute_query_all(sql, tuple(params))
+        except Exception as e:
+            logger.error(f"查询processing回复消息失败 msg_id={msg_id}: {e}")
+            return []
+
     def get_by_receiver_and_status(
         self, receiver: str, status: str, limit: int = 1
     ) -> list[dict[str, Any]]:

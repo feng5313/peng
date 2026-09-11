@@ -239,7 +239,24 @@ def _format_message_id(msg_id: int, task_manager=None, color=None) -> str:
                 if task:
                     status = task.get("status", "pending")
                     status_str = format_task_status(status)
-                    msg_id_str = f"#{msg_id} {Colors.CYAN}事务#{task_id} {status_str}"
+                    # 🔧 事务#1864：running事务处于prefill阶段时显示进度百分比
+                    # （本地大模型长上下文prefill耗时较长，让用户知道在正常填充）
+                    prefill_suffix = ""
+                    if status == "running":
+                        try:
+                            from peng.llm.prefill_tracker import get_prefill_tracker
+
+                            ps = get_prefill_tracker().read_status(task_id)
+                            if ps:
+                                prefill_suffix = (
+                                    f" {Colors.YELLOW}⏳prefill {ps.get('percent', 0)}%"
+                                    f"({int(ps.get('elapsed', 0))}s){Colors.CYAN}"
+                                )
+                        except Exception:
+                            pass
+                    msg_id_str = (
+                        f"#{msg_id} {Colors.CYAN}事务#{task_id} {status_str}{prefill_suffix}"
+                    )
                     return f"{color}{msg_id_str}{Colors.RESET}"
                 else:
                     msg_id_str = f"#{msg_id} {Colors.CYAN}事务#{task_id}"
@@ -2404,6 +2421,11 @@ def parse_legacy_args(argv):
 
 def main(argv: list[str] | None = None) -> int:
     """msg 命令主入口"""
+    # console_scripts 入口（.venv/bin/msg）无参数时：与 bin/msg 无参数行为一致，
+    # 标记无参数模式（输出末尾打印 provider 用量/费用页脚，见 peng/cli/_usage_footer.py）
+    if argv is None and len(sys.argv) <= 1:
+        os.environ["PENG_CLI_NOARGS"] = "1"
+
     # 远程模式检测：优先本地服务，无本地服务时连接默认 nest 的 host
     # 这确保无论从 bin/msg 还是 .venv/bin/msg（console_scripts）都能正确路由
     _check_args = list(argv if argv is not None else sys.argv[1:])
@@ -2444,9 +2466,23 @@ def main(argv: list[str] | None = None) -> int:
     if command == "send":
         return cmd_send(args)
     elif command == "list":
-        return cmd_list(args)
+        rc = cmd_list(args)
+        # console_scripts 入口（.venv/bin/msg）无参数时经 parse_legacy_args 走 list 命令，
+        # 与 bin/msg 无参数（trees）同为无参数模式，同样打印 provider 用量/费用页脚
+        if os.environ.get("PENG_CLI_NOARGS") == "1":
+            from peng.cli._usage_footer import print_provider_usage_footer
+
+            print_provider_usage_footer()
+        return rc
     elif command == "trees":
-        return cmd_trees(args)
+        rc = cmd_trees(args)
+        # 无参数模式（PENG_CLI_NOARGS=1，bin/msg 入口或 console_scripts 兜底设置，
+        # 远程模式经 cli_command env 转发）在输出末尾打印 provider 用量/费用页脚
+        if os.environ.get("PENG_CLI_NOARGS") == "1":
+            from peng.cli._usage_footer import print_provider_usage_footer
+
+            print_provider_usage_footer()
+        return rc
     elif command == "show":
         return cmd_show(args)
     elif command == "content":

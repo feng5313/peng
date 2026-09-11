@@ -38,6 +38,7 @@ from peng.common.colors import ANSI_COLORS, colorize, get_colors
 from peng.config import get_agent_name, get_master_name, load_config
 from peng.hooks.manager import HookManager
 from peng.llm.client import GLMClient, LLMError, StreamStallError
+from peng.task.info import is_urgent_content
 from peng.task.output_manager import get_output_manager
 from peng.tools.base import DualOutput, Tool, ToolError
 from peng.tools.registry import ToolRegistry
@@ -616,6 +617,17 @@ class MessageHistory:
 
     # _inject_multimodal_files 注入时附加的系统提示前缀（清除附件时同步替换，避免误导）
     _INJECT_NOTICE_PREFIX = "[系统提示：上方/下方附加的多模态文件"
+
+    def has_pending_attachments(self) -> bool:
+        """history中是否存在尚未发送的多模态附件part（图片/视频/音频/PDF等）
+
+        用于 provider 选择与请求构建：存在待发送附件时应选择支持vision的
+        provider，并在 to_api_format 中保留附件part（vision=True），否则
+        vision provider也看不到图片。
+        """
+        from peng.llm.multimodal import has_attachment_part
+
+        return any(has_attachment_part(m.get("content")) for m in self._messages)
 
     def strip_sent_attachments(self) -> int:
         """清除history中已发送的多模态附件part（只发送一次机制）
@@ -1250,13 +1262,14 @@ class ToolExecutionEngine:
                 token = buf[i:j].lower()
                 i = j
 
-                # 纯数字token视为"其他内容"打断重复链（#1688修复，替代#1653二轮的skip）：
-                # 数学/代码文本中数字常量会隔在同名变量之间（如#1688实测误判
-                # "√drive) + 6000×drive³? drive=0.033"中drive连续3次、中间夹6000），
-                # 跳过不重置→误判复读→正常思考被丢弃。数字token重置计数后：
-                # 数字常量自然重复（"2/(0.58*ext)*(2/2.2)"中"2"多次）不会累积
-                # （重置后count重新从1开始），真正的字母/中文复读仍可检出。
-                if token.isdigit():
+                # 含数字的字母数字混合token（如c0、十六进制字面量、格式化占位符
+                # 片段"4f"等）视为"其他内容"打断重复链（#1739修复，与#1688纯数字
+                # token策略一致）：代码/格式串中这类token天然高频重复（如C的fprintf
+                # 格式串里浮点占位符片段连续出现），跳过不重置→误判复读→正常代码
+                # 输出被丢弃。自然语言的退化复读（the/the/the…、of/of/of…）是纯
+                # 字母词连续重复，不受影响；混合标识符的"复读"（c0 c0 c0）在代码
+                # 输出中几乎总是合法内容（如函数实参表），放弃检出以根除误报。
+                if any(ch.isdigit() for ch in token):
                     last = ""
                     count = 0
                     continue
@@ -1293,20 +1306,27 @@ class ToolExecutionEngine:
                 i += 1
 
         # --- 阶段2：中文短词组重复检测（2-4字模式重复N次） ---
-        # 检测如"好的好的好的好的好的好的"这类短词组复读模式
+        # 检测如"好的好的好的好的好的好的"这类短词组复读模式。
+        # #1739修复：必须基于跨chunk累积缓冲检测，不能用本轮临时buf——
+        # 小chunk流式（如2字符/chunk）时每轮buf最多约3个汉字，凑不齐
+        # threshold次词组重复所需长度（如6次×2字=12字）→ 永远漏检。
         if not detected and threshold >= 4:
             import re as _re
 
-            # 只检查buf尾部足够长的区域（threshold*4个CJK字符 + 余量）
-            tail_len = min(len(buf), threshold * 6)
-            tail = buf[-tail_len:] if len(buf) > tail_len else buf
+            # 跨chunk原始尾部缓冲：threshold次×4字 + 分隔/标点余量
+            keep_len = threshold * 4 + 16
+            raw_tail = (state.get("raw_tail", "") + text)[-keep_len:]
 
             # 匹配：同一2-4字CJK序列连续出现threshold次（无分隔或仅标点分隔）
             pattern = _re.compile(
                 r"([\u4e00-\u9fff\u3400-\u4dbf]{2,4})\1{" + str(threshold - 1) + r"}"
             )
-            if pattern.search(tail):
+            if pattern.search(raw_tail):
                 detected = True
+            raw_tail_cleared = False
+        else:
+            raw_tail = ""
+            raw_tail_cleared = True
 
         # --- 更新状态 ---
         if detected:
@@ -1315,6 +1335,8 @@ class ToolExecutionEngine:
             state["last"] = last
             state["count"] = count
             state["buf"] = pending_tail  # ""=无pending，非空=等待下轮补全英文单词
+            if not raw_tail_cleared:
+                state["raw_tail"] = raw_tail
 
         return detected
 
@@ -1337,7 +1359,8 @@ class ToolExecutionEngine:
            中文，≤8个）跳过后，要求buf[pos-L:pos]==unit，统计连续重复次数；
            注：unit允许自带尾部分隔符（如"now — "），反向匹配时unit外的分隔符
            跳过后窗口自动对齐（unit两侧分隔符自适应）；
-        4. 重复次数≥threshold 且 unit含字母或中文（排除纯符号/纯数字误报）→ 检出。
+        4. 重复次数≥threshold 且 unit满足资格（#1739收紧：首字符为字母/CJK，
+           且含≥3连续ASCII字母或含CJK，排除代码格式串片段误报）→ 检出。
 
         性能：仅对buf尾部操作，每次chunk最多 maxLen × threshold 次比较，
         maxlen=256时约256×10=2560次短字符串比较，微秒级。
@@ -1373,8 +1396,32 @@ class ToolExecutionEngine:
 
         for unit_len in range(2, max_unit_len + 1):
             unit = buf[n - unit_len :]
-            # unit必须含字母或中文（排除纯符号/纯数字/纯空白）
+            # unit资格（#1739修复收紧）：
+            # 1. 含字母或中文（排除纯符号/纯数字/纯空白）；
+            # 2. 首字符必须是字母或CJK——代码文本中合法的高频重复片段
+            #    （如fprintf格式串里被逗号分隔的浮点占位符序列切片）几乎都以
+            #    标点/数字开头，以词首锚定可根除误报；
+            # 3. 含≥3个连续ASCII字母或含CJK——真正的自然语言/中文短语复读
+            #    （如英文实词短语、中文词组）必然满足，孤立的短字母组合
+            #    （十六进制对、单字母参数等）不再触发。
             if not any(c.isalpha() for c in unit):
+                continue
+            first = unit[0]
+            if not (first.isalpha() and first.isascii()) and not ToolExecutionEngine._is_cjk_char(
+                first
+            ):
+                continue
+            has_word_core = False
+            letter_run = 0
+            for c in unit:
+                if c.isalpha() and c.isascii():
+                    letter_run += 1
+                    if letter_run >= 3:
+                        has_word_core = True
+                        break
+                else:
+                    letter_run = 0
+            if not has_word_core and not any(ToolExecutionEngine._is_cjk_char(c) for c in unit):
                 continue
             # 反向贪心验证：从末尾向前数连续重复
             repeats = 1
@@ -1751,7 +1798,7 @@ class ToolExecutionEngine:
             logger.warning(f"⚡ [ToolEngine] 事务#{task_id}已连续{loop_n}次死循环，{fail_msg}")
             get_output_manager().write_output(
                 task_id=task_id,
-                content=f"\n{ANSI_COLORS.get('bright_red')}{fail_msg}{ANSI_COLORS.get('reset')}\n",
+                content=f"{ANSI_COLORS.get('bright_red')}{fail_msg}{ANSI_COLORS.get('reset')}\n",
                 source="system",
             )
             self._save_history(history)
@@ -1799,7 +1846,7 @@ class ToolExecutionEngine:
         self._save_history(history)
         get_output_manager().write_output(
             task_id=task_id,
-            content=f"\n{ANSI_COLORS.get('bright_red')}{hint}{ANSI_COLORS.get('reset')}\n",
+            content=f"{ANSI_COLORS.get('bright_red')}{hint}{ANSI_COLORS.get('reset')}\n",
             source="system",
         )
         self._iteration_strings = [current]
@@ -1824,6 +1871,188 @@ class ToolExecutionEngine:
         # 将所有连续数字替换为 #（token计数、重试次数、HTTP状态码、时间戳等可变部分）
         sig = re.sub(r"\d+", "#", sig)
         return sig.strip()
+
+    # 内容审核逐级清除的下限保护：history消息数（不含system）裁剪到该值仍被
+    # 拦截则放弃重试并结束事务，避免死循环空耗
+    _CONTENT_FILTER_MIN_MESSAGES = 6
+
+    # 兜底转码的绝对安全图片MIME集合（🔧 事务#1834）。比入口白名单
+    # PROVIDER_SAFE_IMAGE_MIMES 更严格：webp/gif 也有 provider 不支持，
+    # 兜底救援时统一转码 JPEG（所有vision provider支持度最高且体积最小）
+    _REENCODE_SAFE_IMAGE_MIMES = frozenset({"image/jpeg", "image/png"})
+
+    def _reencode_history_images(self, history) -> int:
+        """将history中非绝对安全格式的图片附件转码为JPEG（就地修改）。
+
+        🔧 事务#1834：内容解析失败(HTTP 400图片输入格式/解析错误)的兜底
+        救援层——history中可能存有provider不支持的图片格式（如修复前入库
+        的BMP附件、provider连webp也不支持等），级1直接清除附件会永久丢失
+        视觉信息，转码为provider通用JPEG后重试可完整保留。
+
+        处理范围：content为list的消息中 image_url/input_image part 的
+        data:image/* base64 URL（image_url嵌套/平铺两种格式均兼容）。
+        转码失败的附件（数据损坏等）跳过，留待级1清除策略处理。
+
+        Returns:
+            成功转码的附件数（0=无可转码附件）
+        """
+        import base64 as _b64
+        import io as _io
+
+        reencoded = 0
+        for msg in getattr(history, "_messages", []):
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if (
+                    not isinstance(part, dict)
+                    or part.get("type") not in ("image_url", "input_image")
+                ):
+                    continue
+                # 提取 url：image_url嵌套dict/平铺str/part顶层 三种格式
+                holder = part.get("image_url")
+                if isinstance(holder, dict):
+                    url = holder.get("url")
+                elif isinstance(holder, str):
+                    url = holder
+                else:
+                    url = part.get("url")
+                if not isinstance(url, str) or not url.startswith("data:image/"):
+                    continue
+                header, _sep, b64_payload = url.partition(";base64,")
+                mime = header.removeprefix("data:").split(";", 1)[0]
+                if mime in self._REENCODE_SAFE_IMAGE_MIMES or not b64_payload:
+                    continue
+                try:
+                    from PIL import Image
+
+                    img = Image.open(_io.BytesIO(_b64.b64decode(b64_payload)))
+                    img.load()
+                    # JPEG不支持alpha/CMYK：RGBA/LA/P白底合成，CMYK转RGB
+                    if img.mode in ("RGBA", "LA", "P"):
+                        img = img.convert("RGBA")
+                        bg = Image.new("RGB", img.size, (255, 255, 255))
+                        bg.paste(img, mask=img.split()[-1])
+                        img = bg
+                    elif img.mode not in ("RGB", "L"):
+                        img = img.convert("RGB")
+                    buf = _io.BytesIO()
+                    img.save(buf, format="JPEG", quality=90)
+                    new_url = (
+                        "data:image/jpeg;base64,"
+                        f"{_b64.b64encode(buf.getvalue()).decode('utf-8')}"
+                    )
+                    if isinstance(holder, dict):
+                        holder["url"] = new_url
+                    elif isinstance(holder, str):
+                        part["image_url"] = new_url
+                    else:
+                        part["url"] = new_url
+                    reencoded += 1
+                except Exception as e:
+                    logger.warning(
+                        f"[ToolEngine] 图片附件转码救援失败(留待级1清除): "
+                        f"mime={mime}: {e}"
+                    )
+        return reencoded
+
+    def _content_filter_next_action(self, history) -> str:
+        """内容审核拦截(HTTP 400敏感内容)的逐级升级清除策略。
+
+        背景：上下文中存在触发provider内容审核的内容时，重试相同内容必然
+        再次失败。触发源可能在任意消息中——最常见是多模态图片附件，而附件
+        可能位于user消息也可能位于tool结果消息（如read工具读图）；只删
+        user消息文本无法消除触发源，会导致无限重试死循环。
+
+        策略：每失败一轮调用本方法执行下一级清除动作（无效动作自动跳级），
+        逐级扩大清除范围直至审核通过：
+          级0: 🔧 事务#1834 内容解析失败类错误且首次进入（deletions==0）时，
+               先尝试转码救援：将history中非安全格式图片附件转码JPEG后重试，
+               完整保留视觉信息（级1清除附件会永久丢失视觉，导致模型反复
+               read反复失败的死循环）。救援不递增级别编号，转码后仍失败则
+               无可转附件（返回0）自然落入级1。
+          级1: 清除history中所有消息的多模态附件part（复用只发送一次机制
+               的strip_sent_attachments，覆盖user/tool消息）
+          级2: 删除最后一条user消息（可能是触发审核的文本输入）
+          级3+: 裁剪最后一个完整轮次（从最后一个user消息到尾部），逐步
+               逼近并裁掉更早的可疑内容；轮次整体裁剪天然保持
+               assistant(tool_calls)与tool结果的配对完整
+        下限保护：消息数裁剪到 _CONTENT_FILTER_MIN_MESSAGES 仍被拦截时，
+        说明可疑内容是用户原始任务本身，放弃重试。
+
+        Args:
+            history: MessageHistory 对象（就地修改）
+
+        Returns:
+            执行的清除动作描述（用于系统消息输出）
+
+        Raises:
+            RuntimeError: 所有级别用尽且消息数已到下限仍被拦截
+        """
+        messages = getattr(history, "_messages", [])
+        stage = self._content_filter_deletions
+
+        # 🔧 事务#1834：内容解析失败类错误（图片输入格式/解析错误）优先
+        # 转码救援（仅首次，deletions==0）：history中存有provider不支持
+        # 的图片格式（如修复前入库的BMP，事务#1822）时，转码为通用JPEG
+        # 后重试可完整保留视觉信息。转码后再失败则无可转附件（返回0），
+        # 自然落入下方级1清除逻辑，级别序列保持不变。
+        if (
+            self._content_filter_deletions == 0
+            and "内容解析失败" in (getattr(self, "_content_filter_kind", "") or "")
+        ):
+            reencoded = self._reencode_history_images(history)
+            if reencoded > 0:
+                return f"转码 {reencoded} 个图片附件为JPEG（provider通用格式）"
+
+        while True:
+            if stage == 0:
+                # 级1：清除多模态附件（审核拦截最常见触发源，含tool消息中的附件）
+                stage += 1
+                removed = history.strip_sent_attachments()
+                if removed > 0:
+                    self._content_filter_deletions = stage
+                    return f"清除多模态附件 {removed} 个（图片/音视频/PDF）"
+                continue  # 无附件可清，自动跳级
+            if stage == 1:
+                # 级2：删除最后一条user消息
+                stage += 1
+                for i in range(len(messages) - 1, -1, -1):
+                    if messages[i].get("role") == "user":
+                        deleted_msg = messages.pop(i)
+                        self._content_filter_deletions = stage
+                        content = deleted_msg.get("content", "")
+                        desc = (
+                            f"{len(content)}字符" if isinstance(content, str) else "多模态content"
+                        )
+                        return f"删除最后一条user消息({desc})"
+                continue  # 无user消息可删，自动跳级
+            # 级3+：裁剪最后一个完整轮次（从最后一个user消息到尾部），
+            # 每次删除一个轮次逐步逼近更早的可疑内容；user开启的轮次整体
+            # 裁剪天然保持assistant(tool_calls)与tool结果的配对完整
+            if len(messages) <= self._CONTENT_FILTER_MIN_MESSAGES:
+                raise RuntimeError(
+                    f"内容审核拦截持续存在：已逐级清除多模态附件/user消息/"
+                    f"{max(0, stage - 1)}个尾部轮次，上下文已裁剪至下限"
+                    f"({len(messages)}条)仍被provider拦截(400)，疑似用户原始"
+                    f"任务内容本身触发审核，停止重试。请人工检查事务上下文。"
+                )
+            stage += 1
+            last_user_idx = -1
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+            if last_user_idx == -1:
+                # 无user消息（全为assistant/tool）：清空全部，下次调用触发下限raise
+                removed_count = len(messages)
+                del messages[:]
+            else:
+                removed_count = len(messages) - last_user_idx
+                del messages[last_user_idx:]
+            self._content_filter_deletions = stage
+            return f"裁剪上下文尾部 {removed_count} 条消息"
 
     def _should_report_system_error(self, error_content: str) -> bool:
         """检查系统报错是否应该被报告（去重检测）
@@ -1856,41 +2085,28 @@ class ToolExecutionEngine:
 
     def _has_pending_interrupts(self) -> bool:
         """
-        检测事务是否有待处理的中断信号：
-        1. 新的未读回复消息
-        2. 未读的info指示
-        3. 未处理的控制信号（cancel/pause/resume/restart）
+        检测事务是否有待处理的**控制信号**中断：
+        - 未处理的控制信号（cancel/pause/resume/restart）
+
+        注意：新回复消息和未读info**不在此处检测**（用户明确要求：回复消息/info
+        不要打断思考）。它们由每轮迭代开始时的 _get_unread_reply/_get_task_info
+        自然注入处理——当前思考流和工具调用循环正常完成后，下一轮迭代边界
+        才处理新消息/info，不中断、不丢弃当前迭代已产生的思考内容。
+
+        例外：以感叹号开头的新回复消息/未读info是紧急指示，由
+        _has_urgent_interrupts 独立检测并打断思考立刻处理（事务#1860）。
+
+        控制信号（pause/cancel等）是系统级控制操作，必须立即响应，
+        因此仍在流式循环中检测（thinking每chunk + 每32chunk各一次）。
 
         Returns:
-            True 表示有中断信号，应该停止当前思考跳过本次迭代
+            True 表示有控制信号中断，应该停止当前思考跳过本次迭代
         """
         task_id = self._task_id
-        message_id = self._message_id
         if not task_id:
             return False
 
-        # 1. 检查新的未读回复消息（仅根事务）
-        if not self.task_manager.get_parent_id(task_id):
-            try:
-                processing_messages = self._get_processing_messages(message_id)
-                if processing_messages:
-                    logger.info(
-                        f"⚡ [ToolEngine] 事务#{task_id}检测到新回复消息，停止思考跳过本次迭代"
-                    )
-                    return True
-            except Exception as e:
-                logger.debug(f"[ToolEngine] 检查新回复消息失败: {e}")
-
-        # 2. 检查未读info
-        try:
-            unread_items = self.task_manager.db.get_task_info(task_id, mode="unread")
-            if unread_items:
-                logger.info(f"⚡ [ToolEngine] 事务#{task_id}检测到未读info，停止思考跳过本次迭代")
-                return True
-        except Exception as e:
-            logger.debug(f"[ToolEngine] 检查未读info失败: {e}")
-
-        # 3. 检查未处理的控制信号
+        # 检查未处理的控制信号
         try:
             controls = self.task_manager.db.get_unprocessed_task_controls()
             if controls:
@@ -1906,6 +2122,70 @@ class ToolExecutionEngine:
             logger.debug(f"[ToolEngine] 检查控制信号失败: {e}")
 
         return False
+
+    def _has_urgent_interrupts(self) -> str | None:
+        """检测是否有以感叹号开头的**紧急**新回复消息/新info（事务#1860）
+
+        以感叹号（半角 ! 或全角 ！）开头的新回复消息/未读info视为紧急指示，
+        优先级等同控制信号，必须立刻响应：
+        - 打断当前思考流（调用方设置 should_skip_iteration，与控制信号同路径）
+        - 打断正在运行的bash工具调用进程（tools/bash.py _interrupt_monitor）
+        - 下一轮迭代边界 _get_unread_reply/_get_task_info 立刻注入处理
+
+        普通消息/info不打断思考，仍由迭代边界自然注入（见 _has_pending_interrupts）。
+
+        消费点唯一性：本方法只做**预览**（不消费），标记已读仍由迭代边界的
+        _get_unread_reply/_get_task_info 负责，保证打断后消息必然被处理。
+        bash侧监控同样只预览（processing状态/未读info），与消费语义一致。
+
+        Returns:
+            紧急中断原因描述（None表示无紧急中断）
+        """
+        task_id = self._task_id
+        if not task_id:
+            return None
+
+        # 节流：思考流每个thinking chunk都会调用，DB查询限频1秒；
+        # 缓存仅在节流窗口内复用（检测到中断时立刻复位，避免消费后过期缓存）
+        now = time.monotonic()
+        if now - self._last_urgent_check_ts < 1.0:
+            return self._last_urgent_interrupt_reason
+        self._last_urgent_check_ts = now
+
+        reason = None
+
+        # 1. 检查未读info（预览，不消费）
+        try:
+            info_items = self.task_manager.db.get_task_info(task_id, mode="unread")
+            for item in info_items:
+                content = (item.get("content") or "").replace("\\n", "\n")
+                if is_urgent_content(content):
+                    reason = f"收到感叹号开头的紧急info：{content.strip()[:100]}"
+                    break
+        except Exception as e:
+            logger.debug(f"[ToolEngine] 检查紧急info失败: {e}")
+
+        # 2. 检查未读回复消息（仅根事务负责，与 _get_unread_reply 一致；预览不消费）
+        if not reason and not self.task_manager.get_parent_id(task_id):
+            try:
+                for reply in self._get_processing_messages(self._message_id):
+                    if is_urgent_content(reply.content):
+                        reason = (
+                            f"收到感叹号开头的紧急消息#{reply.id} "
+                            f"[{reply.timestamp}] {reply.sender}：{(reply.content or '').strip()[:100]}"
+                        )
+                        break
+            except Exception as e:
+                logger.debug(f"[ToolEngine] 检查紧急回复消息失败: {e}")
+
+        if reason:
+            logger.info(f"⚡ [ToolEngine] 事务#{task_id}检测到紧急中断：{reason}")
+            # 复位节流：中断将触发跳迭代，消费由迭代边界完成，
+            # 复位避免1秒窗口内的过期缓存导致重复跳迭代
+            self._last_urgent_check_ts = 0.0
+
+        self._last_urgent_interrupt_reason = reason
+        return reason
 
     def _get_processing_messages(self, current_message_id: int | None) -> list[dict[str, Any]]:
         """
@@ -2015,7 +2295,7 @@ class ToolExecutionEngine:
             self_info = (
                 f"⚠️ 冲突警告：检测到以下运行中的事务与本事务使用相同的 nest({my_nest}) 和 workdir({my_workdir})："
                 f"事务{conflict_list}。"
-                f"请特别注意避免编辑同一文件，避免使用git reset/checkout/revert等危险操作，多用git diff核对变更，切勿覆盖对方有效代码！"
+                f"请特别注意避免编辑同一文件，避免使用git reset/checkout/revert等危险操作，多用git diff核对变更，切勿覆盖对方有效代码！必要时用task工具info子命令沟通！"
             )
             self._workdir_conflict_warnings.append(f"\n{self_info}\n")
 
@@ -2024,7 +2304,7 @@ class ToolExecutionEngine:
                 tid = t["id"]
                 other_info = (
                     f"⚠️ 冲突警告：检测到新启动的事务#{my_task_id} 与本事务使用相同的 nest({my_nest}) 和 workdir({my_workdir})。"
-                    f"请特别注意避免编辑同一文件，避免使用git reset/checkout/revert等危险操作，多用git diff核对变更，切勿覆盖对方有效代码！"
+                    f"请特别注意避免编辑同一文件，避免使用git reset/checkout/revert等危险操作，多用git diff核对变更，切勿覆盖对方有效代码！必要时用task工具info子命令沟通！"
                 )
                 try:
                     self.task_manager.db.add_task_info(
@@ -2035,104 +2315,6 @@ class ToolExecutionEngine:
 
         except Exception as e:
             logger.warning(f"[ToolEngine] 事务#{self._task_id} 检测workdir冲突失败: {e}")
-
-    # 云端LLM API域名后缀（这些provider无/flush_cache端点，且flush概念不适用）
-    _CLOUD_API_DOMAINS = (
-        "open.bigmodel.cn",
-        "api.deepseek.com",
-        "api.openai.com",
-        "openrouter.ai",
-        "dashscope.aliyuncs.com",
-        "api.moonshot.cn",
-        "api.siliconflow.cn",
-    )
-    # 进程级flush防抖：{base_url: 上次flush时间戳}。
-    # 空响应→事务结束→(timer)重启新进程，引擎实例级计数/防抖会失效，
-    # 必须进程级防抖才能覆盖"重启风暴"场景（如事务#2每5分钟空转重启）。
-    _FLUSH_DEBOUNCE: dict[str, float] = {}
-    _FLUSH_DEBOUNCE_SECONDS = 1800.0  # 同一base_url 30分钟内最多flush一次
-
-    async def _flush_local_llm_cache(self, task_id: int | None) -> None:
-        """空响应时清除本地sglang/vLLM类推理服务的KV缓存（方案C自愈机制）。
-
-        根因（2026-08-18 事务#1573分析）：sglang MambaRadixCache的MAMBA_KV_FALLBACK路径，
-        当prefix的mamba state被tombstone/驱逐后，复用full-attention KV但mamba层从0重放，
-        混合注意力状态不一致 → 模型对特定前缀确定性输出垃圾（标签碎片/复读工具定义）→ peng端
-        表现为空响应（且timer重启后新进程仍命中同一损坏前缀，形成空转循环）。
-        POST /flush_cache 清除含损坏前缀的radix缓存即可恢复。
-
-        触发权衡：空响应本身代价（整轮事务白跑+重启开销）远大于flush代价（其他并发
-        事务下一轮多付一次prefill），故首次空响应即触发；进程级按base_url 30分钟防抖，
-        避免多事务/重启风暴下反复flush拖垮整体缓存命中率。
-        安全边界：仅对私有部署（base_url host非云端API域名）发请求；
-        flush失败仅记录告警，绝不影响主流程。
-        """
-        try:
-            prov_cfg = getattr(self.llm, "provider_config", None) or {}
-            base_url = (prov_cfg.get("base_url") or "").strip().rstrip("/")
-            provider = getattr(self.llm, "provider", None) or "unknown"
-            if not base_url:
-                logger.debug(
-                    f"[ToolEngine] 事务#{task_id} 空响应flush跳过: provider={provider} 无base_url"
-                )
-                return
-            # 域名白名单校验：云端API不支持flush且不应触碰
-            host = httpx.URL(base_url).host or ""
-            if any(host == d or host.endswith("." + d) for d in self._CLOUD_API_DOMAINS):
-                logger.debug(
-                    f"[ToolEngine] 事务#{task_id} 空响应flush跳过: provider={provider} 为云端API({host})"
-                )
-                return
-            # 进程级防抖：同一base_url 30分钟内只flush一次
-            now = time.time()
-            last = self._FLUSH_DEBOUNCE.get(base_url, 0.0)
-            if now - last < self._FLUSH_DEBOUNCE_SECONDS:
-                logger.debug(
-                    f"[ToolEngine] 事务#{task_id} 空响应flush防抖跳过: {base_url} "
-                    f"距上次flush仅{now - last:.0f}s < {self._FLUSH_DEBOUNCE_SECONDS:.0f}s"
-                )
-                return
-            self._FLUSH_DEBOUNCE[base_url] = now
-            # sglang/vLLM的flush_cache在服务根路径（POST /flush_cache），而OpenAI兼容
-            # base_url通常带版本前缀（如 http://wsl:30000/v1），需剥离 /v1 等后缀再拼接
-            root_url = base_url
-            for suffix in ("/v1", "/v1/chat"):
-                if root_url.lower().endswith(suffix):
-                    root_url = root_url[: -len(suffix)]
-                    break
-            flush_url = f"{root_url}/flush_cache"
-            logger.warning(
-                f"⚠️ [ToolEngine] 事务#{task_id} 空响应，尝试清除本地推理服务缓存: "
-                f"POST {flush_url} (provider={provider}, host={host})"
-            )
-            timeout = httpx.Timeout(connect=3.0, read=10.0, write=3.0, pool=3.0)
-            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-                resp = await client.post(flush_url)
-                body = (resp.text or "")[:100]
-            if resp.status_code == 200:
-                logger.info(f"✅ [ToolEngine] 事务#{task_id} 推理服务缓存清除成功: {body}")
-                get_output_manager().write_output(
-                    task_id=task_id,
-                    content=(
-                        f"\n{ANSI_COLORS.get('bright_yellow')}"
-                        f"⚠️ 空响应已触发推理服务缓存清除(flush_cache)，"
-                        f"下一轮LLM调用将以冷缓存重新prefill。"
-                        f"{ANSI_COLORS.get('reset')}\n"
-                    ),
-                    source="system",
-                )
-            elif resp.status_code == 400:
-                # sglang语义：有pending/running请求时拒绝flush——无需处理，
-                # 损坏场景（空响应）必然无本事务在跑的请求，400极可能是其他事务正在推理
-                logger.info(
-                    f"[ToolEngine] 事务#{task_id} flush_cache被服务端拒绝(有运行中请求，跳过): {body}"
-                )
-            else:
-                logger.warning(
-                    f"[ToolEngine] 事务#{task_id} flush_cache返回 HTTP {resp.status_code}: {body}"
-                )
-        except Exception as e:
-            logger.warning(f"[ToolEngine] 事务#{task_id} 空响应flush_cache失败(忽略): {e}")
 
     def _get_task_full_context(self, history):
         text = ""
@@ -2179,7 +2361,7 @@ class ToolExecutionEngine:
                     get_output_manager().write_output(
                         task_id=task_id,
                         source="task",
-                        content=f"\n📜 {ANSI_COLORS.get('gray')} 待处理消息#{reply.id} [{reply.timestamp}] {sender} ：{content}{ANSI_COLORS.get('reset')}\n",
+                        content=f"📜 {ANSI_COLORS.get('gray')} 待处理消息#{reply.id} [{reply.timestamp}] {sender} ：{content}{ANSI_COLORS.get('reset')}\n",
                     )
                 # 标记为已读
                 for reply in self._processing_messages:
@@ -2223,7 +2405,7 @@ class ToolExecutionEngine:
                 get_output_manager().write_output(
                     task_id=self._task_id,
                     source="task",
-                    content=f"\n{ANSI_COLORS.get('bright_red')}{warning.strip()}{ANSI_COLORS.get('reset')}\n",
+                    content=f"{ANSI_COLORS.get('bright_red')}{warning.strip()}{ANSI_COLORS.get('reset')}\n",
                 )
             self._workdir_conflict_warnings.clear()
 
@@ -2280,7 +2462,7 @@ class ToolExecutionEngine:
         get_output_manager().write_output(
             task_id=self._task_id,
             source="task",
-            content=f"\n🏷️  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {ANSI_COLORS.get('bold')}{ANSI_COLORS.get('bright_blue')}{get_master_name()} ：{ANSI_COLORS.get('bright_green')}{info_text}{ANSI_COLORS.get('reset')}\n",
+            content=f"🏷️  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {ANSI_COLORS.get('bold')}{ANSI_COLORS.get('bright_blue')}{get_master_name()} ：{ANSI_COLORS.get('bright_green')}{info_text}{ANSI_COLORS.get('reset')}\n",
         )
 
     def _get_nest_platform(self, nest_name: str) -> str:
@@ -2352,6 +2534,30 @@ class ToolExecutionEngine:
                 logger.debug(f"[ToolEngine] 预判provider失败(忽略): {e}")
         vision = (provider_config or {}).get("vision", "disabled")
         return str(vision).lower() in ("true", "yes", "on", "enabled", "only")
+
+    def _has_vision_provider_available(self) -> bool:
+        """配置中是否存在启用的、可承担普通LLM任务的vision provider
+
+        read等工具返回多模态附件时，若当前provider不支持vision但存在可用的
+        vision provider，仍将附件注入history（由chat_stream的prefer_vision
+        选择逻辑切换到vision provider发送）；若完全没有vision provider则
+        丢弃附件避免history堆积大体积base64。
+        """
+        try:
+            cfg = load_config().llm
+            from peng.config.loader import is_provider_vision_runtime_disabled
+
+            for _name, p in cfg.providers.items():
+                if (
+                    getattr(p, "enable", False)
+                    and p.is_vision_enabled()
+                    and not p.is_vision_only()
+                    and not is_provider_vision_runtime_disabled(_name)
+                ):
+                    return True
+        except Exception as e:
+            logger.debug(f"[ToolEngine] 检查vision provider可用性失败(忽略): {e}")
+        return False
 
     async def _inject_multimodal_files(self, history: MessageHistory) -> None:
         """多模态注入：将本轮新增 user 消息中引用的多模态文件转为 content part
@@ -2432,7 +2638,7 @@ class ToolExecutionEngine:
                 get_output_manager().write_output(
                     task_id=self._task_id,
                     source="task",
-                    content=f"\n🖼️ [多模态] 已注入 {loaded} 个多模态文件到上下文\n",
+                    content=f"🖼️ [多模态] 已注入 {loaded} 个多模态文件到上下文\n",
                 )
             elif notes:
                 # 全部失败：保留文本并追加提示（模型可自行用read工具处理）
@@ -2542,7 +2748,7 @@ class ToolExecutionEngine:
             if display:
                 get_output_manager().write_output(
                     task_id=task_id,
-                    content=f"\n{ANSI_COLORS.get('bright_cyan', '')}{display}{ANSI_COLORS.get('reset', '')}\n",
+                    content=f"{ANSI_COLORS.get('bright_cyan', '')}{display}{ANSI_COLORS.get('reset', '')}\n",
                     source="system",
                 )
         except Exception as e:
@@ -2601,6 +2807,7 @@ class ToolExecutionEngine:
         Args:
             history: 消息历史对象（用于 add_user 通知模型）
         """
+        return  # 暂时禁用
         if not self._task_id:
             return
         try:
@@ -2778,6 +2985,10 @@ class ToolExecutionEngine:
         self._force_thinking_disabled: bool = False
         # 内容审核连续删除user消息计数（防止无限删除）
         self._content_filter_deletions: int = 0
+        # 内容类错误类型描述（"内容审核拦截"/"内容解析失败..."），用于系统消息文案
+        self._content_filter_kind: str = ""
+        # 🔧 事务#1819：全provider失败等待重试的连续轮次计数（熔断用）
+        self._all_failed_rounds: int = 0
         # 有tool_call的迭代计数（用于PUA注入间隔判断）
         self._tool_call_iter_count: int = 0
         # nest+workdir 冲突警告列表：_check_workdir_conflicts 检测并保存，
@@ -2786,6 +2997,11 @@ class ToolExecutionEngine:
         # 跟踪上次注入的 nest/workdir，避免每次迭代重复注入
         self._last_injected_nest: str | None = None
         self._last_injected_workdir: str | None = None
+        # 紧急中断（感叹号开头的消息/info）检测节流缓存（事务#1860）：
+        # _has_urgent_interrupts 思考流每chunk调用，DB查询限频1秒；
+        # 迭代边界消费消息/info后重置，避免过期缓存导致重复跳迭代
+        self._last_urgent_check_ts: float = 0.0
+        self._last_urgent_interrupt_reason: str | None = None
         # 多模态注入游标：记录已扫描过的 history 消息索引（run_stream 重入时重置）
         self._mm_scan_cursor: int = 0
         # thinking回顾扫描游标：重置为当前输出文件行数，跳过历史迭代内容，
@@ -2796,6 +3012,20 @@ class ToolExecutionEngine:
         if len(self._history._messages) == 0:
             # 如果history为空（fresh start），获取消息上下文和事务内容
             self._get_task_full_context(self._history)
+        # 首轮迭代前预热：新进程尚未连接过provider，client临时变量（compact_threshold等）
+        # 仍是__init__填入的全局默认值。按当前有效provider实时解析并更新，
+        # 确保首轮compact检查与即将连接的provider一致
+        # （事务#1699：flash配置512K被全局320K抢占，重启后首轮即误判上下文紧张无限重启）
+        if self.llm.provider is None:
+            try:
+                # 传入事务content：解析@<provider>标记（含@<provider>!锁定语法），
+                # 使预热选中的provider与chat_stream一致（事务#1793：预热按priority
+                # 自动选择会污染self.provider，导致chat_stream锁定语法失效）
+                warmup_task = self.task_manager.get_task(task_id)
+                warmup_content = warmup_task.get("content") if warmup_task else None
+                self.llm.refresh_provider_vars(content=warmup_content)
+            except Exception as e:
+                logger.debug(f"[ToolEngine] provider临时变量预热失败(忽略): {e}")
         history_list = []  # 增量异常检测用
         while True:
             self._task = self.task_manager.get_task(task_id)
@@ -2811,6 +3041,10 @@ class ToolExecutionEngine:
             self._get_unread_reply(history)
             # 所有事务都可以获取临时指示
             self._get_task_info(history)
+            # 迭代边界已消费新消息/info，重置紧急中断检测节流缓存（事务#1860）：
+            # 强制下一轮思考流重新查询，避免1秒窗口内的过期缓存重复跳迭代
+            self._last_urgent_check_ts = 0.0
+            self._last_urgent_interrupt_reason = None
             # 多模态注入：@file=<path>/webui附件 引用的文件转为多模态 content part
             # （仅 vision provider 生效；在 _save_history 之前保证持久化保留附件）
             await self._inject_multimodal_files(history)
@@ -2865,7 +3099,11 @@ class ToolExecutionEngine:
                         should_complete = True
 
             # 1. 流式调用 LLM（vision provider 保留多模态 content part）
-            _vision_provider = self._is_multimodal_provider()
+            # 存在待发送附件时强制vision=True（请求携带附件part，chat_stream
+            # 检测到后会切换到vision provider），否则vision provider也看不到图片
+            _vision_provider = self._is_multimodal_provider() or (
+                history.has_pending_attachments() and self._has_vision_provider_available()
+            )
             current_messages = history.to_api_format(
                 thinking_type=self.llm.thinking_type, vision=_vision_provider
             )
@@ -2880,7 +3118,7 @@ class ToolExecutionEngine:
                         logger.error(warn_msg)
                         get_output_manager().write_output(
                             task_id=task_id,
-                            content=f"\n{ANSI_COLORS.get('bright_red')}{warn_msg}{ANSI_COLORS.get('reset')}\n",
+                            content=f"{ANSI_COLORS.get('bright_red')}{warn_msg}{ANSI_COLORS.get('reset')}\n",
                             source="system",
                         )
             thinking = ""
@@ -2934,7 +3172,11 @@ class ToolExecutionEngine:
                     if retry > 0:
                         current_messages = history.to_api_format(
                             thinking_type=self.llm.thinking_type,
-                            vision=self._is_multimodal_provider(),
+                            vision=self._is_multimodal_provider()
+                            or (
+                                history.has_pending_attachments()
+                                and self._has_vision_provider_available()
+                            ),
                         )
 
                     # 思考过载检测：强制关闭思考模式时传入 disabled
@@ -3093,12 +3335,23 @@ class ToolExecutionEngine:
                                                 pass  # 无效正则跳过
                                         if degenerate_loop_detected:
                                             break
-                            # thinking阶段：每个chunk都检测info/控制信号中断，及时响应
-                            if self._has_pending_interrupts():
+                            # thinking阶段：每个chunk检测控制信号中断（仅pause/cancel等控制信号），
+                            # 以及感叹号开头的紧急新回复消息/info（打断思考立刻处理，事务#1860）。
+                            # 普通新回复消息/info不打断思考，由迭代边界自然处理
+                            _interrupt = self._has_pending_interrupts()
+                            _urgent_reason = (
+                                None if _interrupt else self._has_urgent_interrupts()
+                            )
+                            if _interrupt or _urgent_reason:
                                 self.exit_on_unexpected_status()
-                                logger.info(
-                                    f"⚡ [ToolEngine] 事务#{task_id}thinking阶段检测到中断信号(info/控制)，停止思考保存进度"
-                                )
+                                if _interrupt:
+                                    logger.info(
+                                        f"⚡ [ToolEngine] 事务#{task_id}thinking阶段检测到控制信号，停止思考保存进度"
+                                    )
+                                else:
+                                    logger.info(
+                                        f"⚡ [ToolEngine] 事务#{task_id}thinking阶段检测到紧急中断，停止思考立刻处理：{_urgent_reason}"
+                                    )
                                 should_skip_iteration = True
                             if should_skip_iteration:
                                 break
@@ -3193,15 +3446,27 @@ class ToolExecutionEngine:
                         self.task_manager.update_heartbeat(task_id)
                         self.exit_on_unexpected_status()
 
-                        # 5. 中断检测：每隔32个chunk检查一次是否有新消息/info/控制信号
-                        # 避免频繁查询数据库，同时在thinking阶段能及时响应
-                        if chunk_count % 32 == 0 and self._has_pending_interrupts():
-                            self.exit_on_unexpected_status()
-                            logger.info(
-                                f"⚡ [ToolEngine] 事务#{task_id}检测到中断信号，停止思考跳过本次迭代"
+                        # 5. 中断检测：每隔32个chunk检查一次控制信号（仅pause/cancel等），
+                        # 以及感叹号开头的紧急新回复消息/info（打断思考立刻处理，事务#1860）。
+                        # 普通新回复消息/info不打断思考（用户明确要求），由每轮迭代开始的
+                        # _get_unread_reply/_get_task_info 在迭代边界自然注入处理
+                        if chunk_count % 32 == 0:
+                            _interrupt = self._has_pending_interrupts()
+                            _urgent_reason = (
+                                None if _interrupt else self._has_urgent_interrupts()
                             )
-                            should_skip_iteration = True
-                            break
+                            if _interrupt or _urgent_reason:
+                                self.exit_on_unexpected_status()
+                                if _interrupt:
+                                    logger.info(
+                                        f"⚡ [ToolEngine] 事务#{task_id}检测到中断信号，停止思考跳过本次迭代"
+                                    )
+                                else:
+                                    logger.info(
+                                        f"⚡ [ToolEngine] 事务#{task_id}检测到紧急中断，停止思考立刻处理：{_urgent_reason}"
+                                    )
+                                should_skip_iteration = True
+                                break
                     llm_finish = True
                 except asyncio.CancelledError as e:
                     text = f"⚠️  事务#{task_id} [ToolEngine]检测到中断，立刻结束大模型处理{e}。\n"
@@ -3342,8 +3607,9 @@ class ToolExecutionEngine:
                             )
                     else:
                         is_rate_limited = False
-                        # 检测400内容审核/敏感内容错误：特殊处理
-                        # 这类错误不应冷却或切换provider，而是重试1次后删除user输入继续
+                        # 检测400内容类错误：特殊处理
+                        # 这类错误不应冷却或切换provider，而是接入逐级清除策略
+                        # （多模态附件→user消息→尾部轮次）后重试，见 is_content_filtered
                         _content_filter_keywords = [
                             "不安全或敏感内容",
                             "敏感内容",
@@ -3354,13 +3620,59 @@ class ToolExecutionEngine:
                             "安全审核",
                             "违规内容",
                         ]
-                        if status_code == 400 and any(
+                        # 🔧 事务#1819：内容解析类错误 —— 上下文中的图片/附件损坏
+                        # 或provider不支持该内容类型时，换provider必然同样失败
+                        # （事务#1818：损坏BMP导致3个provider全部400，无限轮换
+                        # 重试2.5小时）。正确做法：接入逐级清除策略（级1清附件）。
+                        _content_parse_error_keywords = [
+                            "could not decode image",
+                            "loading image",
+                            "imagedata",
+                            "image data",
+                            "image_url",
+                            "invalid image",
+                            "image parse",
+                            "failed to load image",
+                            "无法解析图片",
+                            "图片格式",
+                            "图片解析",
+                            "图片输入格式",
+                            "base64",
+                            "b64_",
+                            "content.type",
+                        ]
+                        _matched_filter = status_code == 400 and any(
                             kw.lower() in err_msg.lower() for kw in _content_filter_keywords
-                        ):
+                        )
+                        _matched_parse = status_code == 400 and any(
+                            kw.lower() in err_msg.lower() for kw in _content_parse_error_keywords
+                        )
+                        if _matched_filter or _matched_parse:
                             is_content_filtered = True
+                            # 记录内容错误类型，用于外层清除重试时的系统消息文案
+                            self._content_filter_kind = (
+                                "内容审核拦截" if _matched_filter else "内容解析失败(疑似损坏附件/内容类型不支持)"
+                            )
+                            # 🔧 事务#1819：content.type参数非法 = provider后端实际
+                            # 不支持多模态（如配置vision=true但vLLM/sglang未启用视觉，
+                            # 事务#1818中的s-qwen3.8）。运行期禁用其vision能力，
+                            # 防止后续再选中它发送附件（自适应配置错误）。
+                            # 注意：图片解码失败类错误不代表provider能力问题，不禁用。
+                            if "content.type" in err_msg.lower():
+                                try:
+                                    from peng.config.loader import disable_provider_vision
+
+                                    disable_provider_vision(self.llm.provider or "", ttl_seconds=600)
+                                    logger.warning(
+                                        f"[ToolEngine] 已运行期禁用 {self.llm.provider} 的vision能力"
+                                        f"(10分钟)：后端不支持多模态content"
+                                    )
+                                except Exception as _dv_err:
+                                    logger.debug(f"[ToolEngine] 运行期禁用vision失败(忽略): {_dv_err}")
                             logger.warning(
-                                f"{icon} {self.llm.provider} 事务#{task_id}大模型API内容审核拦截(400)。"
-                                f"不冷却不切换，重试1次后删除user输入。详情: {err_msg[:200]}\n"
+                                f"{icon} {self.llm.provider} 事务#{task_id}大模型API"
+                                f"{self._content_filter_kind}(400)。不冷却不切换，"
+                                f"接入逐级清除策略后重试。详情: {err_msg[:200]}\n"
                             )
                         else:
                             is_content_filtered = False
@@ -3389,7 +3701,7 @@ class ToolExecutionEngine:
                             f"已重试{retry}次仍失败(HTTP {status_code})，跳出重试循环。"
                             f"最后错误: {detail}"
                         )
-                        _sys_err = f"\n❌  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]{ANSI_COLORS.get('bright_red')}大模型API调用失败({detail})，已重试{retry}次，跳出重试循环。{ANSI_COLORS.get('reset')}\n"
+                        _sys_err = f"❌  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]{ANSI_COLORS.get('bright_red')}大模型API调用失败({detail})，已重试{retry}次，跳出重试循环。{ANSI_COLORS.get('reset')}\n"
                         if self._should_report_system_error(_sys_err):
                             get_output_manager().write_output(
                                 task_id=task_id,
@@ -3460,6 +3772,9 @@ class ToolExecutionEngine:
                 self.llm.error = ""
                 # LLM调用成功，重置内容审核删除计数
                 self._content_filter_deletions = 0
+                self._content_filter_kind = ""
+                # LLM调用成功，重置全provider失败熔断计数（事务#1819）
+                self._all_failed_rounds = 0
 
             # 如果重试循环因错误耗尽而break退出（llm_finish仍为False），
             # 说明所有provider都不可用（如全部被限流/冷却中）。
@@ -3482,50 +3797,96 @@ class ToolExecutionEngine:
                     await asyncio.sleep(5)
                     continue  # 回到外层 while True 循环，重试同一provider（未被标记失败）
                 if is_content_filtered:
-                    # 400内容审核：重试1次已失败，删除最后一条user消息后继续重试
-                    # 安全限制：最多连续删除2次user消息，防止无限循环
-                    if self._content_filter_deletions < 2:
-                        self._content_filter_deletions += 1
-                        messages = getattr(history, "_messages", [])
-                        for i in range(len(messages) - 1, -1, -1):
-                            if messages[i].get("role") == "user":
-                                deleted_msg = messages.pop(i)
-                                logger.warning(
-                                    f"🛡️ [ToolEngine] 事务#{task_id} 内容审核拦截，"
-                                    f"删除最后一条user消息({len(deleted_msg.get('content', ''))}字符)后继续重试。"
-                                    f"删除次数: {self._content_filter_deletions}/2"
-                                )
-                                break
-                        self._save_history(history)
-                        _sys_err = (
-                            f"\n{ANSI_COLORS.get('bright_yellow')}"
-                            f"🛡️ 内容审核拦截，已删除最近的用户输入并重试"
-                            f"(第{self._content_filter_deletions}次)..."
-                            f"{ANSI_COLORS.get('reset')}\n"
-                        )
+                    # 400内容类错误（内容审核拦截/内容解析失败）：上下文中存在
+                    # 触发错误的内容，重试相同内容必然再次失败。采用逐级升级
+                    # 清除策略（多模态附件→user消息→尾部轮次），每失败一轮
+                    # 扩大清除范围，直至通过。
+                    _cf_kind = getattr(self, "_content_filter_kind", "") or "内容类错误"
+                    try:
+                        _cf_action = self._content_filter_next_action(history)
+                    except RuntimeError as _cf_err:
+                        # 逐级清除已到下限仍被拦截：结束重试防死循环，
+                        # 异常向上传播由executor置事务为failed并记录明确原因
+                        logger.error(f"🛡️ [ToolEngine] 事务#{task_id} {_cf_err}")
                         get_output_manager().write_output(
                             task_id=task_id,
-                            content=_sys_err,
+                            content=(
+                                f"{ANSI_COLORS.get('bright_red')}"
+                                f"🛡️  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+                                f"{_cf_kind}清除策略已用尽，停止重试。{_cf_err}"
+                                f"{ANSI_COLORS.get('reset')}\n"
+                            ),
                             source="system",
                         )
-                        continue  # 回到外层 while True 循环，重试（已删除user消息）
-                    else:
-                        logger.error(
-                            f"🛡️ [ToolEngine] 事务#{task_id} 内容审核拦截，"
-                            f"已连续删除{self._content_filter_deletions}次user消息仍失败，放弃。"
+                        raise
+                    # 清除操作改变了history（清附件/删消息），重置增量检测基线，
+                    # 避免合法清除操作误报"上下文增量异常"
+                    history_list.clear()
+                    self._save_history(history)
+                    logger.warning(
+                        f"🛡️ [ToolEngine] 事务#{task_id} {_cf_kind}，"
+                        f"{_cf_action}后继续重试(级别{self._content_filter_deletions})。"
+                    )
+                    _sys_err = (
+                        f"{ANSI_COLORS.get('bright_yellow')}"
+                        f"🛡️ {_cf_kind}，已{_cf_action}并重试"
+                        f"(级别{self._content_filter_deletions})..."
+                        f"{ANSI_COLORS.get('reset')}\n"
+                    )
+                    get_output_manager().write_output(
+                        task_id=task_id,
+                        content=_sys_err,
+                        source="system",
+                    )
+                    continue  # 回到外层 while True 循环，重试（已执行清除动作）
+                # 🔧 事务#1819：熔断保护 —— 连续多轮"所有provider均失败"说明
+                # 是确定性错误（如损坏上下文内容/密钥全部失效），等待重试无法
+                # 自愈（事务#1818曾因此无限轮换重试2.5小时）。超过上限时置
+                # 事务为paused并报告，交由人工介入。
+                self._all_failed_rounds += 1
+                if self._all_failed_rounds >= 5:
+                    _breaker_msg = (
+                        f"⛔  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+                        f"{ANSI_COLORS.get('bright_red')}"
+                        f"熔断保护触发：连续{self._all_failed_rounds}轮所有大模型provider"
+                        f"请求均失败（最后错误: {self.llm.error or 'unknown'}）。"
+                        f"已暂停事务，请检查上下文内容/网络/provider配置后手动恢复。"
+                        f"{ANSI_COLORS.get('reset')}\n"
+                    )
+                    logger.error(f"⛔ [ToolEngine] 事务#{task_id} {_breaker_msg}")
+                    get_output_manager().write_output(
+                        task_id=task_id,
+                        content=_breaker_msg,
+                        source="system",
+                    )
+                    try:
+                        self.task_manager.db.update_task(
+                            task_id,
+                            status="paused",
+                            error=f"熔断保护：连续{self._all_failed_rounds}轮所有provider失败"
+                            f"（{self.llm.error or 'unknown'}）",
                         )
-                        # 落入下方provider冷却等待逻辑
+                    except Exception as _pa_err:
+                        logger.error(
+                            f"[ToolEngine] 事务#{task_id} 熔断置paused失败: {_pa_err}"
+                        )
+                    await asyncio.sleep(2)  # 给输出写入留时间
+                    # exit_on_unexpected_status 检测到非running状态会结束进程
+                    self.exit_on_unexpected_status()
+                    return  # 双保险：万一exit检测失效也不继续空转
                 # 根据provider冷却时间动态计算等待时间
                 wait_time = self.llm.config.get_min_cooldown_remaining()
                 # 取冷却剩余时间+5秒余量，至少30秒，最多300秒
                 wait_time = max(30, min(int(wait_time) + 5, 300))
                 logger.warning(
-                    f"⚠️ [ToolEngine] 事务#{task_id} 所有provider重试均失败，"
-                    f"等待{wait_time}秒后重试..."
+                    f"⚠️ [ToolEngine] 事务#{task_id} 所有provider重试均失败"
+                    f"(连续第{self._all_failed_rounds}轮)，等待{wait_time}秒后重试..."
                 )
                 _sys_err = (
-                    f"\n⏳  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]{ANSI_COLORS.get('bright_yellow')}"
+                    f"⏳  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+                    f"{ANSI_COLORS.get('bright_yellow')}"
                     f"所有大模型provider均不可用，等待{wait_time}秒后重试..."
+                    f"(连续第{self._all_failed_rounds}轮，累计5轮将熔断暂停)"
                     f"{ANSI_COLORS.get('reset')}\n"
                 )
                 if self._should_report_system_error(_sys_err):
@@ -3608,7 +3969,7 @@ class ToolExecutionEngine:
 
                     get_output_manager().write_output(
                         task_id=task_id,
-                        content=f"\n{ANSI_COLORS.get('bright_red')}{intervention}{ANSI_COLORS.get('reset')}\n",
+                        content=f"{ANSI_COLORS.get('bright_red')}{intervention}{ANSI_COLORS.get('reset')}\n",
                         source="system",
                     )
 
@@ -3662,7 +4023,7 @@ class ToolExecutionEngine:
                     intervention = self._prompts.degenerate_loop_intervention
                     get_output_manager().write_output(
                         task_id=task_id,
-                        content=f"\n{ANSI_COLORS.get('bright_red')}{intervention}{ANSI_COLORS.get('reset')}\n",
+                        content=f"{ANSI_COLORS.get('bright_red')}{intervention}{ANSI_COLORS.get('reset')}\n",
                         source="system",
                     )
                 elif content_loop_detected:
@@ -3674,14 +4035,14 @@ class ToolExecutionEngine:
                     intervention = self._prompts.content_dead_loop_intervention
                     get_output_manager().write_output(
                         task_id=task_id,
-                        content=f"\n{ANSI_COLORS.get('bright_red')}{intervention}{ANSI_COLORS.get('reset')}\n",
+                        content=f"{ANSI_COLORS.get('bright_red')}{intervention}{ANSI_COLORS.get('reset')}\n",
                         source="system",
                     )
                 elif wait_hit_count >= self.llm.config.overthinking_threshold:
                     intervention = self._prompts.overthinking_warning
                     get_output_manager().write_output(
                         task_id=task_id,
-                        content=f"\n{ANSI_COLORS.get('bright_yellow')}{intervention}{ANSI_COLORS.get('reset')}\n",
+                        content=f"{ANSI_COLORS.get('bright_yellow')}{intervention}{ANSI_COLORS.get('reset')}\n",
                         source="system",
                     )
                 elif thinking_duplicate_count >= self.llm.config.thinking_dead_loop_threshold:
@@ -3830,7 +4191,7 @@ class ToolExecutionEngine:
                     )
                     get_output_manager().write_output(
                         task_id=task_id,
-                        content=f"\n{ANSI_COLORS.get('bright_yellow')}⚠️ 工具调用参数为空，重试中...{ANSI_COLORS.get('reset')}\n",
+                        content=f"{ANSI_COLORS.get('bright_yellow')}⚠️ 工具调用参数为空，重试中...{ANSI_COLORS.get('reset')}\n",
                         source="system",
                     )
                     self._iteration += 1
@@ -3978,13 +4339,18 @@ class ToolExecutionEngine:
                 )
 
                 # 更新历史：添加工具结果
-                # 多模态附件（read工具返回的图片/PDF等）：vision provider时
-                # 将附件作为 content part 列表传给 LLM（防止模型只看到
-                # "图片 读取成功"摘要而凭空编造图片内容）；
-                # 非vision provider时附件丢弃（保留纯文本摘要）
+                # 多模态附件（read工具返回的图片/PDF等）：当前provider支持vision
+                # 或存在可用的vision provider时，将附件作为 content part 列表注入
+                # history（防止模型只看到"图片 读取成功"摘要而凭空编造图片内容）；
+                # 后续chat_stream检测到请求携带附件part会自动切换到vision provider
+                # 发送（发送成功后strip_sent_attachments清除，只发送一次）。
+                # 完全没有vision provider时附件丢弃（保留纯文本摘要，避免history
+                # 堆积大体积base64）
                 tool_call_id = tc.id if hasattr(tc, "id") else str(id(tc))
                 history_content: str | list = summary_content
-                if result_attachments and self._is_multimodal_provider():
+                if result_attachments and (
+                    self._is_multimodal_provider() or self._has_vision_provider_available()
+                ):
                     parts: list[dict] = [{"type": "text", "text": str(summary_content)}]
                     for att in result_attachments:
                         if isinstance(att, dict) and att.get("url"):
@@ -4133,15 +4499,6 @@ class ToolExecutionEngine:
 
                 self._consecutive_empty += 1
 
-                # sglang缓存损坏自愈（方案C）：MambaRadixCache的MAMBA_KV_FALLBACK路径在mamba state被
-                # tombstone/驱逐后复用full-attention KV但mamba层重放，混合注意力状态不一致导致模型对
-                # 特定前缀确定性输出垃圾（表现为空响应，且timer重启后新进程仍命中同一损坏前缀形成空转
-                # 循环）。flush_cache清除含损坏前缀的radix缓存即可恢复。
-                # 触发：首次空响应即触发（flush代价远小于整轮空转+重启）；
-                # 防抖在 _flush_local_llm_cache 内按base_url进程级30分钟一次（覆盖重启风暴）；
-                # 仅私有部署生效（云端API域名跳过）；flush失败仅告警不影响原空响应处理流程。
-                asyncio.create_task(self._flush_local_llm_cache(task_id))
-
                 if self._consecutive_empty <= 2:
                     # tokens未超限但空响应：可能是一时问题，直接重试（不结束事务）
                     warn_msg = (
@@ -4151,7 +4508,7 @@ class ToolExecutionEngine:
                     logger.warning(warn_msg)
                     get_output_manager().write_output(
                         task_id=task_id,
-                        content=f"\n{ANSI_COLORS.get('bright_yellow')}{warn_msg}{ANSI_COLORS.get('reset')}\n",
+                        content=f"{ANSI_COLORS.get('bright_yellow')}{warn_msg}{ANSI_COLORS.get('reset')}\n",
                         source="system",
                     )
                     should_complete = False
@@ -4173,7 +4530,7 @@ class ToolExecutionEngine:
                         f"（{self._consecutive_empty}/5）"
                     )
                     logger.warning(warn_msg)
-                    _sys_err = f"\n{ANSI_COLORS.get('bright_yellow')}{warn_msg}{ANSI_COLORS.get('reset')}\n"
+                    _sys_err = f"{ANSI_COLORS.get('bright_yellow')}{warn_msg}{ANSI_COLORS.get('reset')}\n"
                     if self._should_report_system_error(_sys_err):
                         get_output_manager().write_output(
                             task_id=task_id,
@@ -4190,7 +4547,7 @@ class ToolExecutionEngine:
                     logger.warning(warn_msg)
                     get_output_manager().write_output(
                         task_id=task_id,
-                        content=f"\n{ANSI_COLORS.get('bright_yellow')}{warn_msg}{ANSI_COLORS.get('reset')}\n",
+                        content=f"{ANSI_COLORS.get('bright_yellow')}{warn_msg}{ANSI_COLORS.get('reset')}\n",
                         source="system",
                     )
                     self.task_manager.db.insert_task_control(task_id, "restart")
@@ -4500,6 +4857,14 @@ class ToolExecutionEngine:
             # write/edit/line_edit：文件内容人类易读+语法高亮显示
             if tool_name in ("write", "edit", "line_edit"):
                 try:
+                    # purpose 显示：📌 目的: xxx（缺失时容错不显示）
+                    raw_purpose = arguments.get("purpose")
+                    purpose_text = (
+                        f"📌 目的: {raw_purpose.strip()} "
+                        if isinstance(raw_purpose, str) and raw_purpose.strip()
+                        else ""
+                    )
+
                     from peng.common.code_display import (
                         format_edit_display,
                         format_line_edit_display,
@@ -4510,9 +4875,7 @@ class ToolExecutionEngine:
                     if tool_name == "write":
                         content = arguments.get("content", "")
                         if file_path and isinstance(content, str):
-                            return (
-                                f"{tool_type} {format_write_display(file_path, content)}"
-                            )
+                            return f"{tool_type} {purpose_text}{format_write_display(file_path, content)}"
                     elif tool_name == "edit":
                         old_string = arguments.get("oldString", "")
                         new_string = arguments.get("newString", "")
@@ -4522,13 +4885,13 @@ class ToolExecutionEngine:
                             and isinstance(new_string, str)
                         ):
                             return (
-                                f"{tool_type} "
+                                f"{tool_type} {purpose_text}"
                                 f"{format_edit_display(file_path, old_string, new_string)}"
                             )
                     else:  # line_edit
                         if file_path:
                             return (
-                                f"{tool_type} "
+                                f"{tool_type} {purpose_text}"
                                 f"{format_line_edit_display(file_path, arguments)}"
                             )
                 except Exception as e:
@@ -4540,11 +4903,7 @@ class ToolExecutionEngine:
                 try:
                     from peng.common.code_display import format_markdown_display
 
-                    content = (
-                        arguments.get("summary")
-                        or arguments.get("checklist_content")
-                        or ""
-                    )
+                    content = arguments.get("summary") or arguments.get("checklist_content") or ""
                     if isinstance(content, str) and content.strip():
                         return f"{tool_type} {format_markdown_display(content)}"
                 except Exception as e:
@@ -4561,11 +4920,18 @@ class ToolExecutionEngine:
             return f"{tool_type} {str(arguments)}"
 
     def _format_tool_result_info(self, tool_name: str, arguments: dict) -> str:
-        """格式化工具调用结果信息（对冗长参数的工具只显示工具类型+文件路径）"""
+        """格式化工具调用结果信息
+
+        🔧 事务#1819：结果行只显示关键参数摘要，不再全量回显参数JSON ——
+        调用参数已在 tool_call 行完整显示过（agent.py ToolCallEvent），
+        tool_result 行再回显一遍造成每次调用参数出现两遍，是事务#1818
+        输出冗余混乱的主要来源之一。此处仅提取定位性关键参数（路径/
+        模式/查询词/命令摘要）帮助快速识别是哪次调用。
+        """
 
         tool_type = self._TOOL_TYPE_NAMES.get(tool_name, f"🛠️ {tool_name}")
 
-        # 参数冗长的工具：只显示工具类型+文件路径
+        # 参数冗长的工具：只显示工具类型（+文件路径）
         if tool_name in self._TOOL_RESULT_NO_ARGS:
             if tool_name in self._TOOL_RESULT_HAS_PATH:
                 file_path = arguments.get("filePath", "")
@@ -4573,13 +4939,25 @@ class ToolExecutionEngine:
                     return f"{tool_type} {file_path}"
             return tool_type
 
-        # 其他工具：显示完整参数
-        try:
-            args_json = json.dumps(arguments, ensure_ascii=False, indent=2)
-            args_json = args_json.replace("\n", "\\n").replace("  ", " ")
-            return f"{tool_type} {args_json}"
-        except Exception:
-            return f"{tool_type} {str(arguments)}"
+        # 🔧 事务#1819：其余工具提取定位性关键参数摘要（截断防长内容）
+        _KEY_PARAMS = ("filePath", "path", "pattern", "query", "url", "args")
+        parts = []
+        for key in _KEY_PARAMS:
+            val = arguments.get(key)
+            if isinstance(val, str) and val.strip():
+                v = val.strip().replace("\n", " ")
+                if len(v) > 80:
+                    v = v[:80] + "…"
+                parts.append(v)
+                break  # 只取第一个命中的关键参数，保持结果行简短
+        if tool_name in ("bash", "cmd"):
+            cmd = arguments.get("command", "")
+            if isinstance(cmd, str) and cmd.strip():
+                c = " ".join(cmd.split())
+                parts.insert(0, c[:80] + ("…" if len(c) > 80 else ""))
+        if parts:
+            return f"{tool_type} {parts[0]}"
+        return tool_type
 
     def task_stopped(self):
         task_id = self._task_id

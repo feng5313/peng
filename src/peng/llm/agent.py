@@ -161,6 +161,8 @@ class PengAgent:
         # Skills 加载器
         self._skill_loader: SkillLoader | None = None
         self._skills: dict[str, Any] = {}
+        # 🔧 事务#1827：per-agent task级技能 overlay（工作nest/工作目录技能，不修改共享单例）
+        self._task_skills_overlay: dict = {}
         if hasattr(self.config, "skills"):
             skills_config = self.config.skills
             if skills_config.enabled:
@@ -236,7 +238,7 @@ class PengAgent:
             return self._skill_loader.list_skills()
         return []
 
-    def _get_skills_discovery_prompt(self) -> str:
+    def _get_skills_discovery_prompt(self, overlay: dict | None = None) -> str:
         """
         获取 Skills Discovery 提示词（只有描述列表）
 
@@ -245,13 +247,62 @@ class PengAgent:
         2. Activation - LLM 调用 skill 工具时加载完整内容
         3. Execution - 已加载的 skill 在后续对话中可用
 
+        Args:
+            overlay: per-agent task级技能映射（工作nest/工作目录技能），同名覆盖全局技能。
+
         Returns:
             skills 发现提示词（如果没有 skills 则返回空字符串）
         """
         if not self._skill_loader:
             return ""
 
-        return self._skill_loader.get_discovery_prompt()
+        return self._skill_loader.get_discovery_prompt(overlay)
+
+    async def _build_task_skills_overlay(self, task) -> dict:
+        """构建任务所在 nest/工作目录的 task级技能 overlay（per-agent，不修改共享 SkillLoader 单例）（事务#1827）
+
+        local nest：直接本地读取 <workdir>/skills/，经 collect_external_skills 收集；
+        远程 nest：经 nest 协议远程读取（list_remote_skill_dirs + read_remote_skill_md，带缓存）。
+        返回 {name: Skill} 映射作为 per-agent overlay：discovery 与 skill 工具按此覆盖同名全局技能（更具体上下文优先）。
+        SkillLoader 是进程级 MetaSingleton 被同进程多 Agent 共享，绝不能写入其 _skills/_directories，否则泄漏。
+        任何失败静默返回空 dict，不阻塞事务（与 AGENTS.md 加载 #1672 语义一致）。
+        """
+        if not self._skill_loader or not task:
+            return {}
+
+        workdir = task.get("workdir")
+        if not workdir:
+            return {}
+
+        nest_name = task.get("nest") or "local"
+
+        try:
+            if nest_name == "local":
+                skills_base = Path(workdir) / "skills"
+                overlay = self._skill_loader.collect_external_skills([skills_base])
+                if overlay:
+                    logger.info(f"[Agent] 已收集 local nest 工作目录技能 {list(overlay.keys())} (来源: {skills_base})")
+                return overlay
+
+            from peng.llm.client import list_remote_skill_dirs, read_remote_skill_md
+            from peng.skills.loader import Skill
+
+            names = await list_remote_skill_dirs(nest_name, workdir)
+            overlay = {}
+            for name in names:
+                content = await read_remote_skill_md(nest_name, workdir, name)
+                if not content:
+                    continue
+                metadata = self._skill_loader._parse_frontmatter(content, name)
+                skill = Skill(metadata=metadata, content=content, path=Path(workdir) / "skills" / name)
+                overlay[name] = skill
+            if overlay:
+                logger.info(f"[Agent] 已收集远程nest {nest_name} 工作目录技能 {list(overlay.keys())}")
+            return overlay
+
+        except Exception as e:
+            logger.warning(f"[Agent] 收集任务技能失败(忽略): {e}")
+            return {}
 
     @property
     def is_auto_mode(self) -> bool:
@@ -372,8 +423,12 @@ class PengAgent:
         else:
             task_prompt = prompt
 
+        # 🔧 事务#1827：构建任务所在 nest/工作目录的 task级技能 overlay（per-agent，不修改共享单例），
+        # 使 discovery 提示词包含工作目录技能（task级优先于全局config技能）
+        self._task_skills_overlay = await self._build_task_skills_overlay(task)
+
         # 注入 skills discovery 提示词（只有描述列表，节省 token）
-        skills_prompt = self._get_skills_discovery_prompt()
+        skills_prompt = self._get_skills_discovery_prompt(self._task_skills_overlay)
         self.history.add_system(skills_prompt)
         if task_prompt:
             self.history.add_system(task_prompt)
@@ -435,6 +490,8 @@ class PengAgent:
             config=self.config,
             tool_engine=self._engine,
             task_manager=self.task_manager,
+            # 🔧 事务#1827：per-agent task级技能 overlay，供 skill 工具解析工作nest/工作目录技能（同名覆盖全局）
+            skill_overlay=self._task_skills_overlay,
         )
 
         # === 钩子系统 v3.0: Before LLM 调用 (flow: prompt) ===
@@ -484,7 +541,9 @@ class PengAgent:
                     f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]🔧 工具调用:",
                     tool_call_color,
                 )
-                content = f"\n{prompt} {tool_info}\n"
+                # 🔧 事务#1819：去掉开头\n（输出文件中会产生空格占位空行，
+                # 是事务#1818输出空行泛滥的来源之一）
+                content = f"{prompt} {tool_info}\n"
                 yield Chunk(content=content, source="tool_call")
 
                 if on_action:
@@ -514,7 +573,9 @@ class PengAgent:
                 # 注：工具级"回滚至快照"链接已废弃——每轮迭代开始的统一备份链接
                 # （含完整diff预览确认框）已覆盖此功能，避免链接冗余。
 
-                content = f"\n{prompt}\n {display}\n\n"
+                # 🔧 事务#1819：去掉开头\n与结尾多余\n（输出文件中会产生
+                # 空格占位空行，是事务#1818输出空行泛滥的来源之一）
+                content = f"{prompt}\n {display}\n"
                 source = "bash" if tc.name in ("bash", "cmd") else "tool_result"
                 yield Chunk(content=content, source=source)
 
@@ -525,7 +586,7 @@ class PengAgent:
                         on_action(
                             AgentAction(
                                 type="response",
-                                content=f"\n[Token 使用: {status.usage_percent:.1f}%]",
+                                content=f"[Token 使用: {status.usage_percent:.1f}%]",
                             )
                         )
 

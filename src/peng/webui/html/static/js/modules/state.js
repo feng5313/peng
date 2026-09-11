@@ -151,6 +151,10 @@ const state = {
   providerFrameRates: {},   // {provider: animation_duration (seconds)}
   // 🔧 Nest 网络流量数据（从 WebSocket throughput_update 消息更新）
   nestTraffic: [],  // [{display_key, display_name, platform, linux_id, total_rate, ...}]
+  // 🔧 事务#1864：prefill阶段状态（从 WebSocket throughput_update 消息更新）
+  // {task_id: {percent: 0-99, elapsed: 秒, provider: str, est_tokens: int}}
+  // 本地大模型长上下文prefill期间该事务显示进度徽章
+  prefillStatus: {},
   // 🔧 Task #92：用户是否在xterm中向上滚动查看历史（非底部）
   // 当为true时，appendOutput 不直接写入xterm，保持显示内容稳定
   userScrolledUp: false,

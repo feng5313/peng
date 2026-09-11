@@ -119,6 +119,12 @@ class HeartbeatMonitor:
         self.msg_db = MessageDatabase()
         self.task_db = TaskDatabase()
 
+        # 🔧 事务#1819：连续心跳超时计数 {task_id: count}
+        # 进程存活但心跳超时时：第1次仅警告不恢复（进程可能在长LLM调用/
+        # 等待provider重试中，强杀重启只会重载同一上下文放大混乱——事务
+        # #1818曾因此每5分钟被强杀重启一次）；连续第2次超时才强制恢复。
+        self._heartbeat_timeout_counts: dict[int, int] = {}
+
     def _get_messages_connection(self):
         """获取消息数据库连接"""
         return self.msg_db._get_connection()
@@ -721,17 +727,60 @@ class HeartbeatMonitor:
             else:
                 is_timeout = False
 
-            if os_pid and os_pid > 0:
-                if not self._check_os_process_exists(os_pid):
-                    reason = f"操作系统进程pid {os_pid}已失效 "
-                    reason += self._get_service_restart_hint()
-                    resume_ids.append(task_id)
-                    task_reasons[task_id] = reason
+            # 进程存活状态（后续分支按存活状态区分处理策略）
+            process_alive = bool(os_pid and os_pid > 0 and self._check_os_process_exists(os_pid))
 
-            if is_timeout:
-                reason = f"心跳超时 {heartbeat_timeout} 秒，可能原因[工具调用或bash命令卡死(应该后台运行并监控)/大模型单步输出过长（应分步输出减少单步时长，例如单次写入小于500行）等]"
+            if os_pid and os_pid > 0 and not process_alive:
+                # 进程已死亡：立即恢复（原有行为）
+                reason = f"操作系统进程pid {os_pid}已失效 "
+                reason += self._get_service_restart_hint()
                 resume_ids.append(task_id)
                 task_reasons[task_id] = reason
+                self._heartbeat_timeout_counts.pop(task_id, None)
+
+            if is_timeout:
+                if process_alive:
+                    # 🔧 事务#1819：进程存活但心跳超时 —— 区分处理：
+                    # 第1次仅警告（进程可能在长LLM调用/等待provider重试中，
+                    # 强杀重启会重载同一上下文放大输出混乱）；连续第2次超时
+                    # 才强制恢复（真卡死场景）。
+                    count = self._heartbeat_timeout_counts.get(task_id, 0) + 1
+                    self._heartbeat_timeout_counts[task_id] = count
+                    if count < 2:
+                        try:
+                            from peng.task.output_manager import get_output_manager
+
+                            get_output_manager().write_output(
+                                task_id=task_id,
+                                source="system",
+                                content=(
+                                    f"⚠️  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+                                    f"事务#{task_id} 进程#{os_pid}存活但心跳超时{heartbeat_timeout}秒"
+                                    f"(连续第{count}次)：可能在长时间大模型调用/工具执行中，"
+                                    f"暂不强制恢复；连续第2次超时将强制恢复。\n"
+                                ),
+                            )
+                        except Exception:
+                            pass  # 警告写入失败不影响主流程
+                        continue
+                    reason = (
+                        f"进程#{os_pid}存活但连续{count}次心跳超时(每次{heartbeat_timeout}秒)，"
+                        f"判定为真卡死，可能原因[工具调用或bash命令卡死(应该后台运行并监控)/"
+                        f"大模型单步输出过长（应分步输出减少单步时长，例如单次写入小于500行）等]"
+                    )
+                    self._heartbeat_timeout_counts.pop(task_id, None)
+                    resume_ids.append(task_id)
+                    task_reasons[task_id] = reason
+                elif not (os_pid and os_pid > 0):
+                    # 无pid记录且心跳超时的异常事务：保留原有超时恢复行为
+                    # （pid>0且进程死亡的已在上方分支立即恢复，不重复加入）
+                    reason = f"心跳超时 {heartbeat_timeout} 秒，可能原因[工具调用或bash命令卡死(应该后台运行并监控)/大模型单步输出过长（应分步输出减少单步时长，例如单次写入小于500行）等]"
+                    self._heartbeat_timeout_counts.pop(task_id, None)
+                    resume_ids.append(task_id)
+                    task_reasons[task_id] = reason
+            else:
+                # 心跳正常：清零连续超时计数
+                self._heartbeat_timeout_counts.pop(task_id, None)
 
         return resume_ids, task_reasons
 

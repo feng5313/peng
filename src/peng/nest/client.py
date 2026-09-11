@@ -25,9 +25,13 @@ _RETRYABLE_PATTERNS = re.compile(r"关闭|正在关闭|未连接|WebSocket已关
 _MAX_RETRIES = 3
 _RETRY_DELAY_BASE = 1.0  # 基础重试延迟（秒），实际递增：1s, 2s, 3s
 
-# 🔧 持续重试配置：nest 不可用时无限重试，避免丢失大模型 token
+# 🔧 持续重试配置：nest 不可用时重试，避免丢失大模型 token
+# 🔧 事务#1737: 不再无限重试！确定性失败（如响应超过帧上限触发1009断连）
+# 会陷入"重连→重发→再超限"死循环，必须设硬上限让调用方感知失败
 _RETRY_MAX_DELAY = 30  # 单次重试最大延迟
 _RETRY_HEARTBEAT_INTERVAL = 25  # 每 25 秒写一次 output 心跳，防止任务超时
+_RETRY_MAX_ATTEMPTS = 20  # 最大重试次数（20次 × 最长30s退避 ≈ 上限约10分钟）
+_RETRY_MAX_TOTAL_SECONDS = 600  # 重试总时长上限（秒）
 
 # 全局默认 nest 名称
 _default_nest_name: str | None = None
@@ -286,7 +290,18 @@ async def _forward_with_retry(
             # 业务错误（如"文件未找到"、"old_string 匹配失败"）立即抛出，不重试
             if not _is_retryable_error(e):
                 raise
-        
+
+        elapsed = time.monotonic() - start_time
+
+        # 🔧 事务#1737: 重试必须有上限——确定性失败（如响应超过WebSocket帧上限
+        # 触发 code=1009 断连）会导致"重连→重发→再超限"无限死循环，
+        # 把整个nest打挂且调用方永久卡死。达到上限后抛错让调用方感知失败。
+        if attempt >= _RETRY_MAX_ATTEMPTS or elapsed >= _RETRY_MAX_TOTAL_SECONDS:
+            raise NestError(
+                f"nest 请求重试 {attempt} 次后放弃(已用 {elapsed:.0f}s, "
+                f"上限 {_RETRY_MAX_ATTEMPTS} 次/{_RETRY_MAX_TOTAL_SECONDS}s): {error}"
+            )
+
         # 计算下一次重试延迟（指数退避：1, 2, 4, 8, 16, 30, 30, ...）
         delay = min(2 ** (attempt - 1), _RETRY_MAX_DELAY)
         elapsed = time.monotonic() - start_time

@@ -779,6 +779,29 @@ html, body {
     opacity: 1;
 }
 
+/* 🔧 事务#1864：prefill进度徽章（running事务长上下文prefill时显示） */
+.task-prefill-badge {
+    display: inline-block;
+    font-size: 0.7857rem;
+    font-weight: 600;
+    color: #d4a017;
+    background: rgba(212, 160, 23, 0.12);
+    border: 1px solid rgba(212, 160, 23, 0.35);
+    border-radius: 8px;
+    padding: 0 6px;
+    margin-left: 2px;
+    vertical-align: middle;
+    white-space: nowrap;
+    cursor: help;
+    animation: prefillPulse 2s ease-in-out infinite;
+}
+
+@keyframes prefillPulse {
+    0%, 100% { opacity: 0.75; }
+    50% { opacity: 1; }
+}
+
+
 .task-chain.collapsed .task-chain-content {
     display: none;
 }

@@ -600,7 +600,7 @@ class TaskManager(metaclass=MetaSingleton):
                 get_output_manager().write_output(
                     task_id=task_id,
                     source="system",
-                    content=f"\n{ANSI_COLORS.get('bright_yellow')}{info}{ANSI_COLORS.get('reset')}\n",
+                    content=f"{ANSI_COLORS.get('bright_yellow')}{info}{ANSI_COLORS.get('reset')}\n",
                 )
         return success
 
