@@ -18,6 +18,8 @@ import os
 import asyncio
 import hashlib
 import logging
+import posixpath
+import re
 import time
 import traceback
 
@@ -2226,6 +2228,37 @@ class ToolExecutionEngine:
             logger.warning(f"检查事务#{self._task_id}的待定消息失败: {e}\n{traceback.format_exc()}")
             return []
 
+    # Windows 盘符路径模式（D:/... 或 D:\...）：平台未知时据此判定大小写折叠
+    _WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+
+    @staticmethod
+    def _workdir_compare_key(workdir: str, platform: str = "") -> str:
+        """将 workdir 规范化为可比较键（用于 nest+workdir 冲突检测）
+
+        处理同一目录的多种字符串写法（事务#1920：#1873 的 'D:\\work\\fcc'
+        与 #1919 的 'D:/work/fcc' 严格相等比较漏检）：
+        - 斜杠方向统一（Windows 反斜杠 ↔ 正斜杠）
+        - normpath：合并重复斜杠、解析 . / ..、去尾部斜杠
+        - 大小写折叠：Windows/macOS 文件系统不区分大小写；Linux 区分不折叠；
+          platform 未知时按盘符路径（^[A-Za-z]:）判定 Windows 风格折叠
+
+        Args:
+            workdir: 事务的 workdir 原始字符串
+            platform: nest 平台（"Windows"/"Linux"/"Darwin"等，空为未知）
+
+        Returns:
+            规范化后的比较键字符串
+        """
+        w = (workdir or "").strip().replace("\\", "/")
+        w = posixpath.normpath(w)
+        plat = (platform or "").strip().lower()
+        case_insensitive = (
+            plat.startswith("win") or plat.startswith("darwin") or plat.startswith("mac")
+        )
+        if case_insensitive or ToolExecutionEngine._WIN_DRIVE_RE.match(w):
+            w = w.casefold()
+        return w
+
     def _check_workdir_conflicts(self):
         """检测并通知 nest+workdir 冲突的运行中事务
 
@@ -2236,7 +2269,9 @@ class ToolExecutionEngine:
         中已验证安全的 history.add_user 点注入（不打断当前thinking/操作，
         由迭代自然处理）。
 
-        冲突判定：nest 非空 且 workdir 非空，且两者都完全相同。
+        冲突判定：nest 非空 且 workdir 非空，nest 大小写不敏感相同，
+        且 workdir 规范化后相同（_workdir_compare_key：斜杠方向/尾斜杠/
+        . / .. / 大小写按 nest 平台折叠，事务#1920）。
         排除子事务（有 parent_task_id 的），因为子事务的文件操作受父事务调度，
         与外部根事务的冲突检测意义不大，反而会造成噪音。
         """
@@ -2261,6 +2296,13 @@ class ToolExecutionEngine:
             # 获取所有运行中事务
             running_tasks = self.task_manager.db.get_running_tasks()
 
+            # 本事务的比较键：nest 大小写不敏感（防配置写法差异漏检），
+            # workdir 按 nest 平台规范化（斜杠方向/尾斜杠/./../大小写，
+            # 事务#1920：同一目录 'D:\\work\\fcc' vs 'D:/work/fcc' 漏检修复）
+            my_platform = self._get_nest_platform(my_nest)
+            my_nest_key = my_nest.casefold()
+            my_workdir_key = self._workdir_compare_key(my_workdir, my_platform)
+
             # 过滤出 nest 和 workdir 都相同的冲突事务（排除自身和子事务）
             conflict_tasks = []
             for t in running_tasks:
@@ -2274,7 +2316,13 @@ class ToolExecutionEngine:
                     continue
                 t_nest = (t.get("nest") or "").strip()
                 t_workdir = (t.get("workdir") or "").strip()
-                if t_nest == my_nest and t_workdir == my_workdir:
+                if not t_nest or not t_workdir:
+                    continue
+                # nest 相同（大小写不敏感）才比较 workdir（同一 nest 平台语义一致）
+                if t_nest.casefold() != my_nest_key:
+                    continue
+                # workdir 规范化键比较（同一目录不同写法视为冲突）
+                if self._workdir_compare_key(t_workdir, my_platform) == my_workdir_key:
                     conflict_tasks.append(t)
 
             if not conflict_tasks:
@@ -2987,7 +3035,7 @@ class ToolExecutionEngine:
         self._content_filter_deletions: int = 0
         # 内容类错误类型描述（"内容审核拦截"/"内容解析失败..."），用于系统消息文案
         self._content_filter_kind: str = ""
-        # 🔧 事务#1819：全provider失败等待重试的连续轮次计数（熔断用）
+        # 全provider失败等待重试的连续轮次计数（仅用于警告提示，不暂停事务）
         self._all_failed_rounds: int = 0
         # 有tool_call的迭代计数（用于PUA注入间隔判断）
         self._tool_call_iter_count: int = 0
@@ -3773,7 +3821,7 @@ class ToolExecutionEngine:
                 # LLM调用成功，重置内容审核删除计数
                 self._content_filter_deletions = 0
                 self._content_filter_kind = ""
-                # LLM调用成功，重置全provider失败熔断计数（事务#1819）
+                # LLM调用成功，重置全provider失败连续轮次计数
                 self._all_failed_rounds = 0
 
             # 如果重试循环因错误耗尽而break退出（llm_finish仍为False），
@@ -3839,18 +3887,17 @@ class ToolExecutionEngine:
                         source="system",
                     )
                     continue  # 回到外层 while True 循环，重试（已执行清除动作）
-                # 🔧 事务#1819：熔断保护 —— 连续多轮"所有provider均失败"说明
-                # 是确定性错误（如损坏上下文内容/密钥全部失效），等待重试无法
-                # 自愈（事务#1818曾因此无限轮换重试2.5小时）。超过上限时置
-                # 事务为paused并报告，交由人工介入。
+                # 全provider连续失败轮次计数：达到阈值仅输出醒目警告，
+                # 不暂停事务（事务继续等待重试直至provider恢复）
                 self._all_failed_rounds += 1
-                if self._all_failed_rounds >= 5:
+                if self._all_failed_rounds == 5:
                     _breaker_msg = (
                         f"⛔  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
                         f"{ANSI_COLORS.get('bright_red')}"
-                        f"熔断保护触发：连续{self._all_failed_rounds}轮所有大模型provider"
+                        f"警告：已连续{self._all_failed_rounds}轮所有大模型provider"
                         f"请求均失败（最后错误: {self.llm.error or 'unknown'}）。"
-                        f"已暂停事务，请检查上下文内容/网络/provider配置后手动恢复。"
+                        f"事务保持运行，将持续等待并重试，请检查上下文内容/"
+                        f"网络/provider配置。"
                         f"{ANSI_COLORS.get('reset')}\n"
                     )
                     logger.error(f"⛔ [ToolEngine] 事务#{task_id} {_breaker_msg}")
@@ -3859,21 +3906,6 @@ class ToolExecutionEngine:
                         content=_breaker_msg,
                         source="system",
                     )
-                    try:
-                        self.task_manager.db.update_task(
-                            task_id,
-                            status="paused",
-                            error=f"熔断保护：连续{self._all_failed_rounds}轮所有provider失败"
-                            f"（{self.llm.error or 'unknown'}）",
-                        )
-                    except Exception as _pa_err:
-                        logger.error(
-                            f"[ToolEngine] 事务#{task_id} 熔断置paused失败: {_pa_err}"
-                        )
-                    await asyncio.sleep(2)  # 给输出写入留时间
-                    # exit_on_unexpected_status 检测到非running状态会结束进程
-                    self.exit_on_unexpected_status()
-                    return  # 双保险：万一exit检测失效也不继续空转
                 # 根据provider冷却时间动态计算等待时间
                 wait_time = self.llm.config.get_min_cooldown_remaining()
                 # 取冷却剩余时间+5秒余量，至少30秒，最多300秒
@@ -3886,7 +3918,7 @@ class ToolExecutionEngine:
                     f"⏳  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
                     f"{ANSI_COLORS.get('bright_yellow')}"
                     f"所有大模型provider均不可用，等待{wait_time}秒后重试..."
-                    f"(连续第{self._all_failed_rounds}轮，累计5轮将熔断暂停)"
+                    f"(连续第{self._all_failed_rounds}轮)"
                     f"{ANSI_COLORS.get('reset')}\n"
                 )
                 if self._should_report_system_error(_sys_err):

@@ -2339,30 +2339,37 @@ input[type="checkbox"]:checked::after {
     padding: 12px 16px;
     border-radius: 6px;
     background-color: var(--bg-secondary);
+    color: var(--text-primary);
     border: 1px solid var(--border-color);
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
     animation: slideIn 0.3s ease;
     max-width: 300px;
 }
 
+/* 不透明底色与语义色混合（老浏览器不支持 color-mix 时自动回退基类的 var(--bg-secondary) 不透明底色），
+   inset 左侧彩色条增强类型辨识且不影响盒子布局 */
 .toast.success {
     border-color: var(--success-color);
-    background-color: rgba(74, 222, 128, 0.1);
+    background-color: color-mix(in srgb, var(--success-color) 14%, var(--bg-secondary));
+    box-shadow: inset 4px 0 0 var(--success-color), 0 4px 12px rgba(0, 0, 0, 0.3);
 }
 
 .toast.error {
     border-color: var(--error-color);
-    background-color: rgba(248, 113, 113, 0.1);
+    background-color: color-mix(in srgb, var(--error-color) 14%, var(--bg-secondary));
+    box-shadow: inset 4px 0 0 var(--error-color), 0 4px 12px rgba(0, 0, 0, 0.3);
 }
 
 .toast.warning {
     border-color: var(--warning-color);
-    background-color: rgba(251, 191, 36, 0.1);
+    background-color: color-mix(in srgb, var(--warning-color) 14%, var(--bg-secondary));
+    box-shadow: inset 4px 0 0 var(--warning-color), 0 4px 12px rgba(0, 0, 0, 0.3);
 }
 
 .toast.info {
     border-color: var(--link-color);
-    background-color: rgba(96, 165, 250, 0.1);
+    background-color: color-mix(in srgb, var(--link-color) 14%, var(--bg-secondary));
+    box-shadow: inset 4px 0 0 var(--link-color), 0 4px 12px rgba(0, 0, 0, 0.3);
 }
 
 @keyframes slideIn {
@@ -4622,6 +4629,11 @@ body.emoji-text-mode .monaco-editor .lines-content .view-line span {
 
 .sidebar-title-row{display:flex;align-items:center;gap:2px}
 .sidebar-title-row h2{margin:0;margin-right:6px}
+
+/* ==================== 撤销/重做按钮（Task#1893） ==================== */
+.op-undo-btn{font-size:14px;line-height:1;opacity:.65}
+.op-undo-btn:hover{opacity:1}
+.op-undo-btn:disabled{opacity:.2;cursor:default;background:transparent;border-color:transparent}
 
 /* ==================== 布局选择器 ==================== */
 

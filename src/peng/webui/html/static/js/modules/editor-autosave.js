@@ -609,6 +609,19 @@ async function saveEditorContent() {
 
       const result = await response.json();
 
+      // 🔧 Task#1893：记录编辑撤销/重做历史（old_value 由后端 PUT field 返回；
+      // 内容未变化时不记录，避免无效历史）
+      if (typeof result.old_value === 'string' && result.old_value !== saveArgs) {
+        const targetType = editType === 'task' ? 'task' : 'message';
+        pushOpHistory(targetType, {
+          kind: 'edit',
+          targetId,
+          label: `编辑${targetType === 'task' ? '事务' : '消息'}#${targetId}`,
+          undo: { content: result.old_value },
+          redo: { content: saveArgs },
+        });
+      }
+
       // 显示保存成功提示 & 异步通知相关事务（不阻塞保存流程）
       if (editType === 'task') {
         showSimpleToast(`✅ 已保存事务#${targetId}`, 'success');

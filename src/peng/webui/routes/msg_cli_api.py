@@ -269,8 +269,11 @@ async def get_message_field(msg_id: int, field_name: str) -> dict[str, Any]:
 @router.put("/{msg_id}/field/{field_name}")
 async def set_message_field(msg_id: int, field_name: str, request: FieldUpdateRequest) -> dict[str, Any]:
     """设置消息字段"""
-    _get_msg_or_404(msg_id)
+    msg = _get_msg_or_404(msg_id)
     db = _get_message_db()
+
+    # 🔧 Task#1893：记录更新前的旧值（供前端撤销/重做）
+    old_value = msg.get(field_name)
 
     value = request.value
     if request.file:
@@ -292,7 +295,10 @@ async def set_message_field(msg_id: int, field_name: str, request: FieldUpdateRe
     if not success:
         raise HTTPException(status_code=500, detail="无法更新消息")
 
-    result: dict[str, Any] = {"success": True, "msg_id": msg_id, "field": field_name, "value": value}
+    result: dict[str, Any] = {
+        "success": True, "msg_id": msg_id, "field": field_name, "value": value,
+        "old_value": old_value,  # 🔧 Task#1893：撤销/重做支持
+    }
 
     # 如果是 content 字段且为根消息（reply_to IS NULL），同步更新关联的根事务 content
     if field_name == "content" and value:

@@ -269,6 +269,11 @@ async def delete_message(msg_id: int) -> dict[str, Any]:
     try:
         # 🔧 Task#1346：将同步DB操作放到线程池，避免阻塞uvicorn事件循环
         def _do_delete():
+            # 🔧 Task#1893：删除前备份快照（供撤销删除恢复，失败不阻塞删除）
+            from .undelete import backup_for_delete
+
+            backup_file = backup_for_delete("message", msg_id)
+
             # Step 1: 收集 task_ids（用于后续WebSocket广播，删除前收集）
             all_task_ids = []
             if task_manager:
@@ -292,6 +297,7 @@ async def delete_message(msg_id: int) -> dict[str, Any]:
             return {
                 "all_task_ids": all_task_ids,
                 "deleted_tasks": deleted_tasks,
+                "backup_file": backup_file,
             }
 
         result = await asyncio.to_thread(_do_delete)
@@ -303,7 +309,11 @@ async def delete_message(msg_id: int) -> dict[str, Any]:
         # 通知前端事务已被删除，触发事务面板刷新
         for tid in result["all_task_ids"]:
             await broadcast_task_update(tid, "deleted", source="webui")
-        return {"success": True, "message": "消息已删除", "deleted_tasks": result["deleted_tasks"]}
+        return {
+            "success": True, "message": "消息已删除",
+            "deleted_tasks": result["deleted_tasks"],
+            "backup_file": result.get("backup_file"),  # 🔧 Task#1893：撤销删除凭据
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -328,6 +338,11 @@ async def delete_message_recursive(msg_id: int) -> dict[str, Any]:
             if not msg:
                 return None
 
+            # 🔧 Task#1893：删除前备份快照（供撤销删除恢复，失败不阻塞删除）
+            from .undelete import backup_for_delete
+
+            backup_file = backup_for_delete("message", msg_id)
+
             reply_to = msg.get("reply_to")
             chain_head_id = msg.get("chain_head_id")
 
@@ -345,6 +360,7 @@ async def delete_message_recursive(msg_id: int) -> dict[str, Any]:
                 "deleted_task_ids": [],  # DB层 delete_task_recursive 已广播
                 "reply_to": reply_to,
                 "chain_head_id": chain_head_id,
+                "backup_file": backup_file,
             }
 
         result = await asyncio.to_thread(_do_delete_recursive)
@@ -370,7 +386,11 @@ async def delete_message_recursive(msg_id: int) -> dict[str, Any]:
         if result["deleted_tasks_count"] > 0:
             for tid in result["deleted_task_ids"]:
                 await broadcast_task_update(tid, "deleted", source="webui")
-        return {"success": True, "message": f"已删除 {result['deleted_count']} 条消息", "deleted_count": result["deleted_count"]}
+        return {
+            "success": True, "message": f"已删除 {result['deleted_count']} 条消息",
+            "deleted_count": result["deleted_count"],
+            "backup_file": result.get("backup_file"),  # 🔧 Task#1893：撤销删除凭据
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -488,7 +508,16 @@ async def move_message(msg_id: int, request: MessageMoveRequest):
 
         from ..websocket import broadcast_message_update
         await broadcast_message_update(msg_id, "moved", {"target_id": request.target_id}, source="webui")
-        return {"success": True, "message": result.get("message")}
+        return {
+            "success": True,
+            "message": result.get("message"),
+            # 🔧 Task#1893：撤销/重做支持——透传移动前状态（swapped=True 表示
+            # 目标为子孙时执行了内容交换，撤销需按 swap_old_contents 恢复）
+            "swapped": result.get("swapped", False),
+            "previous_reply_to": result.get("previous_reply_to"),
+            "swap_ids": result.get("swap_ids"),
+            "swap_old_contents": result.get("swap_old_contents"),
+        }
     except HTTPException:
         raise
     except Exception as e:

@@ -51,18 +51,18 @@ logger = logging.getLogger(__name__)
 # ============ 核心参数 ============
 
 # 心跳更新间隔（秒）：远小于默认心跳超时300s，确保prefill期间心跳持续刷新
-PREFILL_HEARTBEAT_INTERVAL = 5.0
+PREFILL_HEARTBEAT_INTERVAL = 10.0
 
 # 输出文件进度行写入间隔（秒）：CLI watch可见的进度提示（低频避免刷屏）
-PREFILL_OUTPUT_INTERVAL = 15.0
+PREFILL_OUTPUT_INTERVAL = 60.0
 
 # prefill提示最小耗时（秒）：prefill超过该时长才对外提示（写状态文件+输出
 # 进度行）。短prefill（云端API通常数秒内返回首chunk）无需打扰，避免每次
 # 请求都出现"已等待0秒"提示刷屏（事务#1866）
-PREFILL_OUTPUT_MIN_ELAPSED = 10.0
+PREFILL_OUTPUT_MIN_ELAPSED = 30.0
 
 # "填满 compact_threshold 上下文所需参考 prefill 秒数"（本地大模型经验值）
-REF_PREFILL_SECONDS = 120.0
+REF_PREFILL_SECONDS = 180.0
 
 # 数据过期时间（秒）- 文件超过此时间无更新视为残留（进程崩溃清理用）
 DATA_EXPIRY = 600.0

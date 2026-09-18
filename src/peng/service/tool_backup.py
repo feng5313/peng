@@ -24,10 +24,12 @@
 from __future__ import annotations
 
 import base64
+import glob
 import json
 import logging
 import ntpath
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -345,7 +347,12 @@ _EXCLUDE_DIRS = {".peng", ".git", "__pycache__", "node_modules", ".venv", "data"
 # add -A 失去全量删除检测能力（实测验证），语义变为"只更新匹配文件"。
 
 # 强制排除的目录名（匹配任意层级，仅匹配目录名本身）
-_FORCE_EXCLUDE_DIR_NAMES = {"build", ".peng", ".cache", "__pycache__", "node_modules"}
+# 🔧 .git：嵌套 git 仓库元数据永不备份（对象库/引用，备份它们=灾难性膨胀）
+# 🔧 vcpkg_installed/venv/.venv：依赖安装目录（GB 级产物，同 build 语义）
+_FORCE_EXCLUDE_DIR_NAMES = {
+    "build", ".peng", ".cache", "__pycache__", "node_modules",
+    ".git", "vcpkg_installed", "venv", ".venv",
+}
 
 # 强制排除的目录名前缀（如 build_x86、build_llvm）
 _FORCE_EXCLUDE_DIR_PREFIXES = ("build_",)
@@ -898,6 +905,158 @@ class ToolBackupManager:
 
     # ==================== 快照创建（工具调用前） ====================
 
+    # 非git workdir 探测缓存（workdir → 判定为非git的时间戳；TTL 内跳过远程探测
+    # 避免每次快照白一次HTTP——巨型目录场景每2分钟迭代快照会持续产生探测开销）
+    _NON_GIT_WD_CACHE: dict[str, float] = {}
+    _NON_GIT_WD_TTL = 600.0
+
+    @staticmethod
+    def _snapshot_git_dispatch(
+        workdir: str, task_id: int, tool_name: str, tool_args: dict[str, Any],
+        commit_msg: str, timestamp: str, nest_name: str | None,
+    ) -> dict[str, Any] | None:
+        """git 快照分派（远程探测结果缓存；None=非git或失败→external 备份路径）"""
+        if nest_name and nest_name != "local":
+            ts = ToolBackupManager._NON_GIT_WD_CACHE.get(workdir, 0)
+            if time.time() - ts < ToolBackupManager._NON_GIT_WD_TTL:
+                return None
+            meta = ToolBackupManager._snapshot_git(
+                workdir, task_id, tool_name, tool_args, commit_msg, timestamp, nest_name
+            )
+            if meta is None:
+                ToolBackupManager._NON_GIT_WD_CACHE[workdir] = time.time()
+            else:
+                ToolBackupManager._NON_GIT_WD_CACHE.pop(workdir, None)
+            return meta
+        if _is_git_repo_local(workdir, nest_name):
+            return ToolBackupManager._snapshot_git(
+                workdir, task_id, tool_name, tool_args, commit_msg, timestamp, nest_name
+            )
+        return None
+
+    @staticmethod
+    def _is_inside_git_repo(
+        file_path: str, workdir: str, nest_name: str | None = None
+    ) -> bool:
+        """文件是否位于 git 仓库内（向上遍历父目录找 .git；🔧 第九轮）
+
+        初始设计：backups 只备份"工作目录外或非git管理的文件"——workdir 内
+        位于嵌套 git 仓库（如 D:\\work 下的 fcc/.git）的文件由其仓库管理，
+        不进 backups（task#1873 备份了 git 管理的 fcc/src/particle 事故）。
+        workdir 外文件不判定（照旧备份）。
+
+        Returns:
+            True=在 git 仓库内（跳过备份）；False=非 git 管理
+        """
+        wd_norm = os.path.normpath(workdir).replace("\\", "/").rstrip("/").lower()
+        fp_norm = os.path.normpath(file_path).replace("\\", "/").lower()
+        if not fp_norm.startswith(wd_norm + "/"):
+            return False  # workdir 外：不判定，照旧备份
+        if not nest_name or nest_name == "local":
+            # 🔧 Linux 服务端无法 stat Windows 盘符路径（dirname 会把整条路径当
+            # 单文件名、向上爬误入 peng 自身 .git）——无 nest 信息时保守不过滤
+            if ToolBackupManager._win_style(file_path) and os.name != "nt":
+                return False
+            p = os.path.dirname(os.path.normpath(file_path))
+            root = os.path.abspath(os.sep)
+            while True:
+                if os.path.isdir(os.path.join(p, ".git")):
+                    return True
+                if os.path.dirname(p) == p:
+                    return False
+                p = os.path.dirname(p)
+        # 远程：单脚本批量判定（此处单文件向上找，调用方已按批聚合场景少用）
+        py = (
+            "import os, json\n"
+            f"p = os.path.dirname({file_path!r})\n"
+            "hit = False\n"
+            "while True:\n"
+            "    if os.path.isdir(os.path.join(p, '.git')):\n"
+            "        hit = True\n"
+            "        break\n"
+            "    np_ = os.path.dirname(p)\n"
+            "    if np_ == p:\n"
+            "        break\n"
+            "    p = np_\n"
+            "print(json.dumps(hit))\n"
+        )
+        r = _run_python_remote(py, timeout=15, nest_name=nest_name)
+        if r.returncode != 0:
+            return False
+        try:
+            return bool(json.loads(r.stdout.strip().split("\n")[-1]))
+        except (json.JSONDecodeError, IndexError):
+            return False
+
+    # 系统目录路径段（备份跳过：Windows 系统文件无备份价值且污染备份仓库；
+    # 大小写不敏感，匹配路径中段。不含 /tmp/ /temp/——Linux /tmp 是常用
+    # 工作路径，误伤面大）
+    _SKIP_PATH_SEGMENTS = (
+        "/windows/", "/program files/", "/program files (x86)/", "/appdata/local/temp/",
+    )
+
+    @staticmethod
+    def _is_system_or_temp_path(file_path: str) -> bool:
+        p = os.path.normpath(str(file_path)).replace("\\", "/").lower()
+        return any(seg in f"/{p}/" for seg in ToolBackupManager._SKIP_PATH_SEGMENTS)
+
+    @staticmethod
+    def _filter_git_managed(
+        file_paths: list[str], workdir: str, nest_name: str | None = None
+    ) -> list[str]:
+        """过滤掉 workdir 内 git 仓库管理的文件（远程批量单次HTTP判定）"""
+        wd_norm = os.path.normpath(workdir).replace("\\", "/").rstrip("/").lower()
+        internal = [
+            fp for fp in file_paths
+            if os.path.normpath(fp).replace("\\", "/").lower().startswith(wd_norm + "/")
+        ]
+        external = [fp for fp in file_paths if fp not in internal]
+        if not internal:
+            return file_paths
+        if not nest_name or nest_name == "local":
+            managed = {fp for fp in internal if ToolBackupManager._is_inside_git_repo(fp, workdir)}
+        else:
+            py = (
+                "import os, json\n"
+                f"files = {internal!r}\n"
+                "out = []\n"
+                "for fp in files:\n"
+                "    p = os.path.dirname(fp)\n"
+                "    hit = False\n"
+                "    while True:\n"
+                "        if os.path.isdir(os.path.join(p, '.git')):\n"
+                "            hit = True\n"
+                "            break\n"
+                "        np_ = os.path.dirname(p)\n"
+                "        if np_ == p:\n"
+                "            break\n"
+                "        p = np_\n"
+                "    if hit:\n"
+                "        out.append(fp)\n"
+                "print(json.dumps(out))\n"
+            )
+            r = _run_python_remote(py, timeout=20, nest_name=nest_name)
+            managed = set()
+            if r.returncode == 0:
+                try:
+                    managed = set(json.loads(r.stdout.strip().split("\n")[-1]))
+                except (json.JSONDecodeError, IndexError):
+                    managed = set()
+        return [fp for fp in file_paths if fp not in managed]
+
+    @staticmethod
+    def _filter_unbackupable(
+        file_paths: list[str], workdir: str, nest_name: str | None = None
+    ) -> list[str]:
+        """过滤不可备份对象：workdir 内 git 仓库管理的文件 + 系统目录/临时路径
+
+        初始设计：backups 只备份"工作目录外或非git管理的文件"，且排除临时/
+        系统文件（Temp/Program Files/Windows——task#1886 的 cmd 曾把
+        vcvarsall.bat、fcc_log.txt 等备份进仓库）。
+        """
+        kept = ToolBackupManager._filter_git_managed(file_paths, workdir, nest_name)
+        return [fp for fp in kept if not ToolBackupManager._is_system_or_temp_path(fp)]
+
     @staticmethod
     def create_snapshot(
         task_id: int,
@@ -920,46 +1079,73 @@ class ToolBackupManager:
         commit_msg = f"backup before {tool_name}: {args_summary}\n\nTask#{task_id} @ {timestamp}"
 
         try:
-            # 提取工具涉及的文件路径，区分 workdir 内/外（排除目录不进外部备份）
-            all_paths = ToolBackupManager._extract_file_paths(tool_name, tool_args, workdir)
-            external_files: list[str] = []
+            # 提取工具涉及的文件路径，区分 workdir 内/外（排除目录不进备份）
+            # 🔧 bash/cmd 命令解析动词参数+重定向目标+通配符展开（远程经 nest）
+            all_paths = ToolBackupManager._extract_file_paths(
+                tool_name, tool_args, workdir, nest_name
+            )
+            external_files: list[str] = []  # workdir 外
+            internal_files: list[str] = []  # workdir 内（非git场景也进备份仓库）
             for fp in all_paths:
                 fp_abs = fp if _is_abs_cross_platform(fp) else os.path.join(workdir, fp)
                 fp_norm = os.path.normpath(fp_abs)
                 if _is_abs_path_excluded(fp_norm):
                     continue  # build/、build_*/等排除目录：不备份
                 wd_norm = os.path.normpath(workdir)
-                if not fp_norm.startswith(wd_norm):
+                if fp_norm.startswith(wd_norm):
+                    internal_files.append(fp_norm)
+                else:
                     external_files.append(fp_norm)
 
-            # 🔧 远程nest：先尝试git路径（合并HTTP请求），失败时回退到非git
-            if nest_name and nest_name != "local":
-                meta = ToolBackupManager._snapshot_git(
-                    workdir, task_id, tool_name, tool_args, commit_msg, timestamp, nest_name
-                )
-                if meta is None:
-                    # git快照失败（可能不是git仓库），尝试非git路径
-                    meta = ToolBackupManager._snapshot_non_git(
-                        workdir, task_id, tool_name, tool_args, commit_msg, timestamp, nest_name
+            meta: dict[str, Any] | None = None
+            # 🔧 git workdir：git 分支快照（临时索引，零复制；探测缓存防白跑）
+            meta = ToolBackupManager._snapshot_git_dispatch(
+                workdir, task_id, tool_name, tool_args, commit_msg, timestamp, nest_name
+            )
+
+            if meta is not None:
+                # git 快照成功：workdir 外文件补进备份仓库
+                if external_files:
+                    ext_commit = ExternalFileBackup.backup(
+                        task_id, external_files, f"{tool_name} @ {timestamp}",
+                        nest_name=nest_name,
                     )
-            elif _is_git_repo_local(workdir, nest_name):
-                meta = ToolBackupManager._snapshot_git(
-                    workdir, task_id, tool_name, tool_args, commit_msg, timestamp, nest_name
-                )
-            else:
-                meta = ToolBackupManager._snapshot_non_git(
-                    workdir, task_id, tool_name, tool_args, commit_msg, timestamp, nest_name
-                )
+                    meta["external_files"] = external_files
+                    meta["external_backup_commit"] = ext_commit
+                return meta
 
-            # 对外部文件（workdir外）做本地备份（与 nest 无关）
-            if meta and external_files:
-                ext_commit = ExternalFileBackup.backup(
-                    task_id, external_files, f"{tool_name} @ {timestamp}"
-                )
-                meta["external_files"] = external_files
-                meta["external_backup_commit"] = ext_commit
-
-            return meta
+            # 🔧 非git workdir：所有涉及文件（内外）统一进备份仓库（初始设计：
+            # \.peng\backups git 环境备份"工作目录外或非git管理的文件"——按绝对
+            # 路径映射为仓库子路径）。只备份工具涉及的文件，绝不扫描/镜像整个
+            # workdir（巨型目录如 D:\work 的全量基线是灾难）。
+            # workdir 内位于嵌套 git 仓库（如 fcc/.git）的文件由其仓库管理，
+            # 不进 backups；系统目录/临时路径（Temp/Program Files/Windows）跳过
+            # （🔧 第九轮+：git管理文件过滤 + 系统临时路径过滤）。
+            backup_files = ToolBackupManager._filter_unbackupable(
+                external_files + internal_files, workdir, nest_name
+            )
+            if not backup_files:
+                return None
+            spec = ExternalFileBackup.backup(
+                task_id, backup_files, f"{tool_name} @ {timestamp}",
+                nest_name=nest_name,
+            )
+            if not spec:
+                return None
+            commit_disp = spec if isinstance(spec, str) else json.dumps(spec)
+            return {
+                "type": "external",
+                "task_id": task_id,
+                "tool_name": tool_name,
+                "commit_hash": commit_disp[:40],
+                "workdir": workdir,
+                "nest_name": nest_name or "local",
+                "file_paths": [],
+                "external_files": backup_files,
+                "external_backup_commit": spec,
+                "timestamp": timestamp,
+                "rollback_cmd": "",
+            }
         except Exception as e:
             logger.warning(f"创建快照失败(task#{task_id}, {tool_name}): {e}", exc_info=True)
             return None
@@ -1011,25 +1197,14 @@ class ToolBackupManager:
 
         meta: dict[str, Any] | None = None
         try:
-            # 1. 工作目录 git 快照（复用 _snapshot_git / _snapshot_non_git）
+            # 1. 工作目录快照：git workdir → git 分支快照。
+            #    🔧 非git workdir 不做文件快照（初始设计：\.peng\backups 只备份
+            #    "工作目录外或非git管理的文件"=工具涉及文件，在 create_snapshot
+            #    时精确备份；迭代点全量基线对巨型 workdir（如 D:\work）是灾难）
             try:
-                if nest_name and nest_name != "local":
-                    # 远程 nest：先 git 后非 git（与 create_snapshot 相同的回退顺序）
-                    meta = ToolBackupManager._snapshot_git(
-                        workdir, task_id, "iteration_start", {}, commit_msg, timestamp, nest_name
-                    )
-                    if meta is None:
-                        meta = ToolBackupManager._snapshot_non_git(
-                            workdir, task_id, "iteration_start", {}, commit_msg, timestamp, nest_name
-                        )
-                elif _is_git_repo_local(workdir, nest_name):
-                    meta = ToolBackupManager._snapshot_git(
-                        workdir, task_id, "iteration_start", {}, commit_msg, timestamp, nest_name
-                    )
-                else:
-                    meta = ToolBackupManager._snapshot_non_git(
-                        workdir, task_id, "iteration_start", {}, commit_msg, timestamp, nest_name
-                    )
+                meta = ToolBackupManager._snapshot_git_dispatch(
+                    workdir, task_id, "iteration_start", {}, commit_msg, timestamp, nest_name
+                )
             except Exception as e:
                 logger.warning(f"迭代快照文件备份失败(task#{task_id}): {e}", exc_info=True)
                 meta = None
@@ -1075,7 +1250,7 @@ class ToolBackupManager:
             #    默认 data 仓库 + Windows 各盘符 \.peng\backups 仓库），
             #    回滚时从这些 commit 全量恢复 workdir 外文件（无需迭代开始时同步）
             try:
-                ext_heads = ExternalFileBackup.get_all_heads(task_id)
+                ext_heads = ExternalFileBackup.get_all_heads(task_id, nest_name=nest_name)
                 if ext_heads:
                     meta["external_head_commit"] = ext_heads
             except Exception as e:
@@ -1149,6 +1324,19 @@ class ToolBackupManager:
                 return ToolBackupManager._check_changes_non_git(
                     rollback_meta, str(workdir), nest_name
                 )
+            elif backup_type == "external":
+                # 🔧 非git workdir 快照：涉及文件统一在备份仓库（初始设计）
+                ext_files = rollback_meta.get("external_files", [])
+                ext_commit = rollback_meta.get("external_backup_commit")
+                changed = ExternalFileBackup.check_changes(
+                    int(rollback_meta.get("task_id", 0) or 0), ext_files, ext_commit,
+                    nest_name=nest_name,
+                )
+                if not changed:
+                    return None
+                rollback_meta["changed_files"] = changed
+                rollback_meta["added_files"] = []
+                return rollback_meta
             else:
                 return rollback_meta
         except Exception as e:
@@ -1196,7 +1384,8 @@ class ToolBackupManager:
                 external_files = rollback_meta.get("external_files", [])
                 if external_files:
                     ext_changed = ExternalFileBackup.check_changes(
-                        rollback_meta.get("task_id", 0), external_files
+                        rollback_meta.get("task_id", 0), external_files,
+                        nest_name=nest_name,
                     )
                     if ext_changed:
                         rollback_meta["changed_files"] = ext_changed
@@ -1237,7 +1426,8 @@ class ToolBackupManager:
             external_files = rollback_meta.get("external_files", [])
             if external_files:
                 ext_changed = ExternalFileBackup.check_changes(
-                    rollback_meta.get("task_id", 0), external_files
+                    rollback_meta.get("task_id", 0), external_files,
+                    nest_name=nest_name,
                 )
                 if ext_changed:
                     rollback_meta["changed_files"] = rollback_meta["changed_files"] + ext_changed
@@ -1394,7 +1584,8 @@ class ToolBackupManager:
             external_files = rollback_meta.get("external_files", [])
             if external_files:
                 ext_changed = ExternalFileBackup.check_changes(
-                    rollback_meta.get("task_id", 0), external_files
+                    rollback_meta.get("task_id", 0), external_files,
+                    nest_name=nest_name,
                 )
                 if ext_changed:
                     rollback_meta["changed_files"] = ext_changed
@@ -1419,7 +1610,7 @@ class ToolBackupManager:
         external_files = rollback_meta.get("external_files", [])
         if external_files:
             ext_changed = ExternalFileBackup.check_changes(
-                rollback_meta.get("task_id", 0), external_files
+                rollback_meta.get("task_id", 0), external_files, nest_name=nest_name
             )
             if ext_changed:
                 rollback_meta["changed_files"] = rollback_meta["changed_files"] + ext_changed
@@ -1441,13 +1632,37 @@ class ToolBackupManager:
     def _check_changes_non_git(
         rollback_meta: dict[str, Any], workdir: str, nest_name: str | None
     ) -> dict[str, Any] | None:
-        """非git场景：同步工作目录到备份仓库，对比差异"""
+        """非git场景变更检测（🔧 worktree 模式：--work-tree 临时索引对比；旧 mirror 模式兼容）"""
         backup_repo = rollback_meta["backup_repo"]
         commit_hash = rollback_meta["commit_hash"]
 
         if not _path_exists(backup_repo, nest_name):
             return rollback_meta
 
+        # 🔧 worktree 模式：零复制，临时索引 write-tree 对比
+        if rollback_meta.get("repo_mode") == "worktree":
+            try:
+                detection = ToolBackupManager._non_git_check_worktree(
+                    workdir, backup_repo, commit_hash, nest_name
+                )
+                if detection is None:
+                    return rollback_meta
+                changed_files, added_files = detection
+                if not changed_files and not added_files:
+                    logger.debug(f"非git检查: 无文件变化(commit={commit_hash[:8]})")
+                    return None
+                rollback_meta["changed_files"] = changed_files + added_files
+                rollback_meta["added_files"] = added_files
+                logger.info(
+                    f"非git检查: 检测到{len(changed_files)}个文件变化 "
+                    f"(commit={commit_hash[:8]}): {changed_files[:5]}"
+                )
+                return rollback_meta
+            except Exception as e:
+                logger.warning(f"非gitworktree变更检查失败: {e}", exc_info=True)
+                return rollback_meta
+
+        # 旧 mirror 模式（历史 meta）：同步工作目录到备份仓库后对比
         try:
             result = _run_git(
                 ["rev-parse", f"{commit_hash}^{{tree}}"], cwd=backup_repo, nest_name=nest_name
@@ -1750,7 +1965,12 @@ class ToolBackupManager:
             return None
 
         if data.get("error"):
-            logger.warning(f"远程批量快照git错误({nest_name}): {data['error'][:200]}")
+            err = str(data.get("error", ""))[:200]
+            if "rev-parse --git-dir failed" in err:
+                # workdir 非 git 仓库：正常探测失败（external 备份路径接管），降噪
+                logger.debug(f"workdir非git，走备份仓库路径({nest_name}): {workdir}")
+            else:
+                logger.warning(f"远程批量快照git错误({nest_name}): {err}")
             return None
 
         commit_hash = data.get("commit_hash", "")
@@ -1779,154 +1999,235 @@ class ToolBackupManager:
 
     # ==================== 非git 工作目录快照 ====================
 
+    # ==================== 非git workdir 的 work-tree 快照模式（🔧 事务#1847 第五轮） ====================
+    # 备份仓库只存 git 对象库（.git），用 --work-tree 指向真实 workdir 做快照：
+    # 不复制任何文件，git 增量对象天然只记录改动/删除（风主要求：只备份改动文件，
+    # 不镜像整个工作目录）。远程 nest 打包单脚本一次 HTTP。
+
     @staticmethod
-    def _snapshot_non_git(
-        workdir: str,
-        task_id: int,
-        tool_name: str,
-        tool_args: dict[str, Any],
-        commit_msg: str,
-        timestamp: str,
+    def _worktree_exclude_pathspec() -> list[str]:
+        """构造强制排除 pathspec（build/、build_*/ 等，任意层级）"""
+        specs = ["."]
+        for name in sorted(_FORCE_EXCLUDE_DIR_NAMES):
+            specs.append(f":(exclude,glob)**/{name}/**")
+            specs.append(f":(exclude,glob)**/{name}")
+        for p in _FORCE_EXCLUDE_DIR_PREFIXES:
+            specs.append(f":(exclude,glob)**/{p}*/**")
+        return specs
+
+    @staticmethod
+    def _non_git_wt_script_head(backup_repo: str, workdir: str) -> str:
+        """远程非git work-tree 操作脚本公共头"""
+        specs = ToolBackupManager._worktree_exclude_pathspec()
+        return (
+            "import subprocess, os, sys, json, uuid, shutil\n"
+            f"backup_repo = {backup_repo!r}\n"
+            f"workdir = {workdir!r}\n"
+            f"specs = {specs!r}\n"
+            "GITD = ['--git-dir', os.path.join(backup_repo, '.git'), '--work-tree', workdir]\n"
+            "def git(*a, env=None):\n"
+            "    e = dict(os.environ)\n"
+            "    if env: e.update(env)\n"
+            "    r = subprocess.run(['git'] + GITD + list(a), cwd=workdir, env=e,\n"
+            "                       capture_output=True, timeout=120)\n"
+            "    class R: pass\n"
+            "    rr = R(); rr.returncode = r.returncode\n"
+            "    rr.stdout = r.stdout.decode('utf-8', 'replace')\n"
+            "    rr.stderr = r.stderr.decode('utf-8', 'replace')\n"
+            "    return rr\n"
+            "out = {}\n"
+        )
+
+    @staticmethod
+    def _non_git_check_worktree(
+        workdir: str, backup_repo: str, commit_hash: str,
         nest_name: str | None = None,
-    ) -> dict[str, Any] | None:
-        """非git工作目录快照：同步到备份git仓库（纯文件操作）"""
-        backup_repo = ToolBackupManager._ensure_backup_repo(task_id, nest_name)
-        if not backup_repo:
-            return None
+        with_trees: bool = False,
+    ) -> tuple[list[str], list[str]] | tuple[list[str], list[str], str, str] | None:
+        """work-tree 变更检测：临时索引 write-tree 对比快照 commit tree
 
+        Returns:
+            (changed_files, added_files) 相对路径列表；
+            with_trees=True 时返回 (changed, added, backup_tree, current_tree)；
+            None 表示检测失败
+        """
+        specs = ToolBackupManager._worktree_exclude_pathspec()
+        idx = os.path.join(backup_repo, f"peng_wt_check_{uuid.uuid4().hex[:8]}")
         try:
-            all_paths = ToolBackupManager._extract_file_paths(tool_name, tool_args, workdir)
-            file_paths: list[str] = []
-            external_files: list[str] = []
-            for fp in all_paths:
-                fp_abs = fp if _is_abs_cross_platform(fp) else os.path.join(workdir, fp)
-                fp_norm = os.path.normpath(fp_abs)
-                if _is_abs_path_excluded(fp_norm):
-                    continue  # build/、build_*/等排除目录：不备份
-                wd_norm = os.path.normpath(workdir)
-                if fp_norm.startswith(wd_norm):
-                    rel = os.path.relpath(fp_norm, wd_norm)
-                    file_paths.append(rel)
+            if not nest_name or nest_name == "local":
+                git_dir = os.path.join(backup_repo, ".git")
+                base = ["--git-dir", git_dir, "--work-tree", workdir]
+                env = {"GIT_INDEX_FILE": idx}
+                subprocess.run(
+                    ["git"] + base + ["add", "-A", "--"] + specs,
+                    cwd=workdir, capture_output=True, text=True, timeout=120,
+                )
+                r = subprocess.run(
+                    ["git"] + base + ["write-tree"], cwd=workdir,
+                    capture_output=True, text=True, timeout=60,
+                )
+                if r.returncode != 0:
+                    return None
+                current_tree = r.stdout.strip()
+                r = subprocess.run(
+                    ["git"] + base + ["rev-parse", f"{commit_hash}^{{tree}}"], cwd=workdir,
+                    capture_output=True, text=True, timeout=30,
+                )
+                if r.returncode != 0:
+                    return None
+                backup_tree = r.stdout.strip()
+                bt, ct = backup_tree, current_tree
+                if current_tree == backup_tree:
+                    return ([], [], bt, ct) if with_trees else ([], [])
+                r = subprocess.run(
+                    ["git"] + base + ["diff", "--name-status", backup_tree, current_tree],
+                    cwd=workdir, capture_output=True, text=True, timeout=60,
+                )
+                raw = r.stdout
+            else:
+                py = ToolBackupManager._non_git_wt_script_head(backup_repo, workdir) + (
+                    f"commit_hash = {commit_hash!r}\n"
+                    f"idx_rel = {os.path.basename(idx)!r}\n"
+                    "idx = os.path.join(backup_repo, idx_rel)\n"
+                    "try:\n"
+                    "    git('add', '-A', '--', *specs, env={'GIT_INDEX_FILE': idx})\n"
+                    "    r = git('write-tree', env={'GIT_INDEX_FILE': idx})\n"
+                    "    if r.returncode != 0:\n"
+                    "        out['error'] = 'write-tree: ' + r.stderr[:200]\n"
+                    "    else:\n"
+                    "        current = r.stdout.strip()\n"
+                    "        r = git('rev-parse', commit_hash + '^{tree}')\n"
+                    "        if r.returncode != 0:\n"
+                    "            out['error'] = 'rev-parse: ' + r.stderr[:200]\n"
+                    "        else:\n"
+                    "            backup = r.stdout.strip()\n"
+                    "            out['backup_tree'] = backup\n"
+                    "            out['current_tree'] = current\n"
+                    "            if current == backup:\n"
+                    "                out['same'] = True\n"
+                    "            else:\n"
+                    "                r = git('-c', 'core.quotepath=false', 'diff', '--name-status', backup, current)\n"
+                    "                out['diff'] = r.stdout\n"
+                    "finally:\n"
+                    "    try:\n"
+                    "        if os.path.exists(idx): os.unlink(idx)\n"
+                    "    except Exception: pass\n"
+                    "print(json.dumps(out))\n"
+                )
+                result = _run_python_remote(py, timeout=180, nest_name=nest_name)
+                if result.returncode != 0:
+                    logger.warning(f"worktree检测远程失败({nest_name}): {str(result.stderr)[:200]}")
+                    return None
+                try:
+                    data = json.loads(result.stdout.strip().split("\n")[-1])
+                except (json.JSONDecodeError, IndexError):
+                    return None
+                if data.get("error"):
+                    logger.warning(f"worktree检测git错误({nest_name}): {data['error'][:200]}")
+                    return None
+                if data.get("same"):
+                    return (
+                        ([], [], data.get("backup_tree", ""), data.get("current_tree", ""))
+                        if with_trees else ([], [])
+                    )
+                bt = data.get("backup_tree", "")
+                ct = data.get("current_tree", "")
+                raw = data.get("diff", "")
+            changed: list[str] = []
+            added: list[str] = []
+            for line in raw.split("\n"):
+                if not line.strip():
+                    continue
+                parts = line.split("\t", 1)
+                status = parts[0]
+                filepath = parts[1] if len(parts) > 1 else ""
+                if status.startswith("A"):
+                    added.append(filepath)
                 else:
-                    external_files.append(fp_norm)
-
-            ToolBackupManager._sync_to_backup_repo(workdir, backup_repo, nest_name)
-
-            for ext_fp in external_files:
-                if _path_exists(ext_fp, nest_name):
-                    ToolBackupManager._copy_external_file(ext_fp, backup_repo, nest_name)
-
-            _run_git(["add", "-A"], cwd=backup_repo, nest_name=nest_name)
-            _run_git(
-                ["commit", "-m", commit_msg, "--allow-empty"], cwd=backup_repo, nest_name=nest_name
-            )
-
-            result = _run_git(["rev-parse", "HEAD"], cwd=backup_repo, nest_name=nest_name)
-            if result.returncode != 0:
-                logger.warning(f"无法获取备份仓库HEAD: {result.stderr}")
-                return None
-            commit_hash = result.stdout.strip()
-
-            return {
-                "type": "non_git",
-                "task_id": task_id,
-                "tool_name": tool_name,
-                "commit_hash": commit_hash,
-                "backup_repo": str(backup_repo),
-                "workdir": str(workdir),
-                "nest_name": nest_name or "local",
-                "file_paths": file_paths,
-                "external_files": external_files,
-                "timestamp": timestamp,
-                "rollback_cmd": "",  # 在 check_post_tool_changes 中更新
-            }
-        except Exception as e:
-            logger.warning(f"非git快照失败: {e}", exc_info=True)
-            return None
+                    changed.append(filepath)
+            if with_trees:
+                return changed, added, bt, ct
+            return changed, added
+        finally:
+            if not nest_name or nest_name == "local":
+                try:
+                    os.unlink(idx)
+                except OSError:
+                    pass
 
     @staticmethod
-    def _ensure_backup_repo(task_id: int, nest_name: str | None = None) -> str | None:
-        """确保备份git仓库存在并初始化
+    def _non_git_rollback_worktree(
+        workdir: str, backup_repo: str, commit_hash: str,
+        checkout_files: list[str], added_files: list[str],
+        nest_name: str | None = None,
+    ) -> tuple[int, int]:
+        """work-tree 回滚：checkout 恢复改动/删除文件 + 删除快照后新增文件
 
-        位置优先级：
-        1. 配置的 backups_dir/task#id（若配置目录在对应 nest 上存在）
-        2. 系统临时目录 / .peng / backups / task#id（配置目录不存在或未配置时）
-
-        跨平台说明：
-        - 本地 nest：用本地文件系统检查配置目录
-        - 远程 nest：通过远程探测检查配置目录是否存在（Linux服务端无法直接
-          判断 Windows 远程路径，必须走 _path_exists 远程检查）
+        Returns:
+            (恢复文件数, 删除新增文件数)
         """
-        backup_base: str | None = None
+        restored = deleted = 0
+        checkout_files = [f for f in checkout_files if f not in added_files]
+        if not nest_name or nest_name == "local":
+            git_dir = os.path.join(backup_repo, ".git")
+            base = ["--git-dir", git_dir, "--work-tree", workdir]
+            if checkout_files:
+                r = subprocess.run(
+                    ["git"] + base + ["checkout", commit_hash, "--"] + checkout_files,
+                    cwd=workdir, capture_output=True, text=True, timeout=120,
+                )
+                if r.returncode != 0:
+                    for fp in checkout_files:
+                        subprocess.run(
+                            ["git"] + base + ["checkout", commit_hash, "--", fp],
+                            cwd=workdir, capture_output=True, text=True, timeout=30,
+                        )
+                restored = len(checkout_files)
+            for fp in added_files:
+                p = Path(workdir) / fp
+                try:
+                    if p.is_file():
+                        p.unlink()
+                    elif p.is_dir():
+                        shutil.rmtree(str(p))
+                    deleted += 1
+                except OSError:
+                    pass
+            return restored, deleted
+        # 远程：打包单脚本（bytes 传输 diff 无关，仅命令）
+        py = ToolBackupManager._non_git_wt_script_head(backup_repo, workdir) + (
+            f"commit_hash = {commit_hash!r}\n"
+            f"checkout_files = {checkout_files!r}\n"
+            f"added_files = {added_files!r}\n"
+            "restored = deleted = 0\n"
+            "if checkout_files:\n"
+            "    r = git('checkout', commit_hash, '--', *checkout_files)\n"
+            "    if r.returncode != 0:\n"
+            "        for fp in checkout_files:\n"
+            "            git('checkout', commit_hash, '--', fp)\n"
+            "    restored = len(checkout_files)\n"
+            "import pathlib\n"
+            "for fp in added_files:\n"
+            "    p = pathlib.Path(workdir) / fp\n"
+            "    try:\n"
+            "        if p.is_file(): p.unlink()\n"
+            "        elif p.is_dir(): shutil.rmtree(str(p))\n"
+            "        deleted += 1\n"
+            "    except OSError: pass\n"
+            "out['restored'] = restored\n"
+            "out['deleted'] = deleted\n"
+            "print(json.dumps(out))\n"
+        )
+        result = _run_python_remote(py, timeout=180, nest_name=nest_name)
+        if result.returncode != 0:
+            logger.warning(f"worktree回滚远程失败({nest_name}): {str(result.stderr)[:200]}")
+            return 0, 0
         try:
-            from peng.config.loader import load_config
+            data = json.loads(result.stdout.strip().split("\n")[-1])
+            return int(data.get("restored", 0)), int(data.get("deleted", 0))
+        except (json.JSONDecodeError, IndexError, ValueError):
+            return 0, 0
 
-            config = load_config()
-            configured = config.paths.backups_dir_path
-            if configured:
-                configured_str = str(configured)
-                if not nest_name or nest_name == "local":
-                    # 本地：父目录存在即可用（backup_repo 由 _ensure_dir 自动创建）
-                    if Path(configured_str).parent.exists():
-                        backup_base = configured_str
-                else:
-                    # 远程 nest：跨平台探测配置目录是否存在（父目录存在即可）
-                    if _path_exists(configured_str, nest_name):
-                        backup_base = configured_str
-                    else:
-                        # 配置目录可能指向父目录尚不存在的路径，探测父目录
-                        parent = Path(configured_str.replace("\\", "/")).parent
-                        if _path_exists(str(parent), nest_name):
-                            backup_base = configured_str
-        except Exception:
-            pass
-
-        if not backup_base:
-            # 配置目录不存在（或未配置）→ 使用系统临时目录
-            tmp = _get_system_temp(nest_name)
-            backup_base = f"{tmp}/.peng/backups"
-
-        backup_repo = f"{backup_base}/task#{task_id}"
-
-        try:
-            if not _ensure_dir(backup_repo, nest_name):
-                return None
-
-            # 🔧 本地用 _git_repo_valid 验证（残缺 .git 自动重建，事务#1847）；
-            # 远程 nest 保持存在性探测（远程重建需多次往返，残缺时 git 操作
-            # 返回非零由上层日志暴露）
-            repo_ready = (
-                _git_repo_valid(backup_repo)
-                if not nest_name or nest_name == "local"
-                else _path_exists(f"{backup_repo}/.git", nest_name)
-            )
-            if not repo_ready:
-                if not nest_name or nest_name == "local":
-                    # 清除残缺 .git 残留（Windows rmtree 文件锁可能留下半初始化状态）
-                    shutil.rmtree(os.path.join(backup_repo, ".git"), ignore_errors=True)
-                result = _run_git(["init"], cwd=backup_repo, nest_name=nest_name)
-                if result.returncode != 0:
-                    logger.warning(f"git init失败: {result.stderr}")
-                    return None
-                _run_git(
-                    ["config", "user.email", "peng@backup"], cwd=backup_repo, nest_name=nest_name
-                )
-                _run_git(
-                    ["config", "user.name", "Peng Backup"], cwd=backup_repo, nest_name=nest_name
-                )
-                _run_git(["add", "-A"], cwd=backup_repo, nest_name=nest_name)
-                _run_git(
-                    ["commit", "-m", f"init backup repo for task#{task_id}", "--allow-empty"],
-                    cwd=backup_repo,
-                    nest_name=nest_name,
-                )
-
-            if not nest_name or nest_name == "local":
-                chown_to_project_owner(Path(backup_repo))
-            return backup_repo
-        except Exception as e:
-            logger.warning(f"初始化备份仓库失败: {e}", exc_info=True)
-            return None
 
     # ==================== 文件同步（本地/远程） ====================
 
@@ -2134,6 +2435,14 @@ class ToolBackupManager:
                 success, msg = ToolBackupManager._rollback_git(rollback_meta, nest_name)
             elif backup_type == "non_git":
                 success, msg = ToolBackupManager._rollback_non_git(rollback_meta, nest_name)
+            elif backup_type == "external":
+                # 🔧 非git workdir 快照：从备份仓库恢复涉及文件（初始设计）
+                ext_files = rollback_meta.get("external_files", [])
+                ext_commit = rollback_meta.get("external_backup_commit")
+                n = ExternalFileBackup.restore(
+                    task_id, ext_files, ext_commit, nest_name=nest_name
+                )
+                success, msg = True, f"已从备份仓库恢复 {n} 个文件"
             elif backup_type == "history_only":
                 # 仅 history 备份成功的迭代快照：只恢复上下文，不动文件
                 success, msg = True, "无文件快照，跳过文件回滚"
@@ -2155,7 +2464,10 @@ class ToolBackupManager:
                 if is_iteration:
                     ext_head = rollback_meta.get("external_head_commit")
                     if ext_head:
-                        ext_restored = ExternalFileBackup.restore_all(task_id, ext_head)
+                        ext_restored = ExternalFileBackup.restore_all(
+                            task_id, ext_head, nest_name=nest_name,
+                            workdir=rollback_meta.get("workdir", ""),
+                        )
                         if ext_restored > 0:
                             msg += f"，恢复 {ext_restored} 个外部文件"
                         elif ext_restored == 0:
@@ -2231,9 +2543,14 @@ class ToolBackupManager:
             if ext_head:
                 try:
                     # 🔧 多仓库基线：遍历默认 data 仓库 + Windows 各盘符仓库 ls-tree
-                    abs_paths = ExternalFileBackup.list_baseline_files(task_id, ext_head)
+                    abs_paths = ExternalFileBackup.list_baseline_files(
+                        task_id, ext_head, nest_name=nest_name
+                    )
+                    abs_paths = ToolBackupManager._filter_baseline_files(
+                        abs_paths, workdir, nest_name
+                    )
                     if abs_paths and ExternalFileBackup.check_changes(
-                        task_id, abs_paths, ext_head
+                        task_id, abs_paths, ext_head, nest_name=nest_name
                     ):
                         ext_changed_flag = True
                 except Exception as e:
@@ -2242,7 +2559,7 @@ class ToolBackupManager:
             external_files = rollback_meta.get("external_files", [])
             ext_commit = rollback_meta.get("external_backup_commit")
             if external_files and ExternalFileBackup.check_changes(
-                task_id, external_files, ext_commit
+                task_id, external_files, ext_commit, nest_name=nest_name
             ):
                 ext_changed_flag = True
 
@@ -2279,9 +2596,35 @@ class ToolBackupManager:
                     workdir, task_id, "rollback_undo", {}, commit_msg, timestamp, nest_name
                 )
             else:
-                meta = ToolBackupManager._snapshot_non_git(
-                    workdir, task_id, "rollback_undo", {}, commit_msg, timestamp, nest_name
+                # 🔧 非git workdir：备份将被回滚覆盖的文件当前版本（external 模式，
+                # 进 \.peng\backups 备份仓库；初始设计，绝不全量扫描 workdir）
+                undo_files = [
+                    f for f in original_meta.get("external_files", [])
+                    if _is_abs_cross_platform(f)
+                ] or [
+                    f for f in original_meta.get("changed_files", [])
+                    if _is_abs_cross_platform(f)
+                ]
+                spec = (
+                    ExternalFileBackup.backup(
+                        task_id, undo_files, f"undo @ {timestamp}", nest_name=nest_name
+                    ) if undo_files else None
                 )
+                meta = None
+                if spec:
+                    meta = {
+                        "type": "external",
+                        "task_id": task_id,
+                        "tool_name": "rollback_undo",
+                        "commit_hash": (spec if isinstance(spec, str) else json.dumps(spec))[:40],
+                        "workdir": workdir,
+                        "nest_name": nest_name or "local",
+                        "file_paths": [],
+                        "external_files": undo_files,
+                        "external_backup_commit": spec,
+                        "timestamp": timestamp,
+                        "rollback_cmd": "",
+                    }
 
             if meta:
                 meta["tool_name"] = f"撤销:{original_meta.get('tool_name', 'unknown')}"
@@ -2294,6 +2637,7 @@ class ToolBackupManager:
                         task_id,
                         original_external,
                         f"undo:{original_meta.get('tool_name', 'unknown')} @ {timestamp}",
+                        nest_name=nest_name,
                     )
                     meta["external_files"] = original_external
                     meta["external_backup_commit"] = undo_ext_commit
@@ -2388,7 +2732,9 @@ class ToolBackupManager:
             if external_files:
                 task_id = rollback_meta.get("task_id", 0)
                 ext_commit = rollback_meta.get("external_backup_commit")
-                ext_restored = ExternalFileBackup.restore(task_id, external_files, ext_commit)
+                ext_restored = ExternalFileBackup.restore(
+                    task_id, external_files, ext_commit, nest_name=nest_name
+                )
                 if ext_restored:
                     msg += f"，恢复 {ext_restored} 个外部文件"
 
@@ -2399,7 +2745,8 @@ class ToolBackupManager:
 
     @staticmethod
     def _rollback_non_git(rollback_meta: dict[str, Any], nest_name: str | None) -> tuple[bool, str]:
-        """从非git备份仓库回退
+        """从非git备份仓库回退（🔧 worktree 模式：--work-tree checkout 恢复+删除新增；
+        旧 mirror 模式兼容）
 
         changed_files 可能包含 workdir 内文件和 __external__/ 前缀的外部文件，
         需要分离处理。external_files 保存的是原始绝对路径，也需恢复。
@@ -2420,6 +2767,28 @@ class ToolBackupManager:
             wd_changed.append(fp)
 
         try:
+            # 🔧 worktree 模式：checkout 到 workdir + 删除快照后新增文件（零镜像）
+            if rollback_meta.get("repo_mode") == "worktree":
+                restored, deleted = ToolBackupManager._non_git_rollback_worktree(
+                    workdir, backup_repo, commit_hash, wd_changed, added_files, nest_name
+                )
+                msg = f"已回退 {restored} 个文件到 {commit_hash[:8]}"
+                if deleted:
+                    msg += f"（含删除 {deleted} 个新增文件）"
+                # 外部文件恢复（ExternalFileBackup，rollback 统一入口已处理，
+                # 此处补充恢复以覆盖 undo 场景 external_backup_commit）
+                task_id_val = rollback_meta.get("task_id", 0)
+                ext_commit = rollback_meta.get("external_backup_commit")
+                if external_files and task_id_val:
+                    ext_restored = ExternalFileBackup.restore(
+                        task_id_val, external_files, ext_commit, nest_name=nest_name
+                    )
+                    if ext_restored:
+                        msg += f"，恢复 {ext_restored} 个外部文件"
+                logger.info(f"非gitworktree回退成功: {msg}")
+                return True, msg
+
+            # 旧 mirror 模式（历史 meta）：从备份仓库工作区复制恢复
             # 强制从commit恢复备份仓库工作树文件（因为 _check_changes_non_git 会修改工作树但不commit）
             _run_git(["checkout", commit_hash, "--", "."], cwd=backup_repo, nest_name=nest_name)
 
@@ -2471,7 +2840,7 @@ class ToolBackupManager:
                 ext_commit = rollback_meta.get("external_backup_commit")
                 if task_id_val and ext_commit:
                     ext_restored = ExternalFileBackup.restore(
-                        task_id_val, external_files, ext_commit
+                        task_id_val, external_files, ext_commit, nest_name=nest_name
                     )
                     if ext_restored:
                         restored_count = max(restored_count, ext_restored)
@@ -2517,17 +2886,279 @@ class ToolBackupManager:
 
     # ==================== 辅助方法 ====================
 
+    # bash/cmd 命令中会修改/删除文件的动词（basename 匹配）
+    _CMD_FILE_VERBS = frozenset({
+        "rm", "rmdir", "mv", "cp", "touch", "truncate", "shred", "unlink", "tee",
+        "del", "erase", "move", "copy", "ren", "rename", "rd",
+    })
+    # 命令分段符（; | && || 换行）
+    _CMD_SEG_SPLIT = re.compile(r";|\|\||&&|\||\n")
+    # 脚本扩展名与解释器动词（🔧 执行脚本的命令需读取脚本内容提取内部路径）
+    _SCRIPT_EXTS = (".py", ".js", ".mjs", ".ts", ".sh", ".bash", ".bat", ".cmd", ".ps1")
+    _INTERPRETER_VERBS = frozenset({
+        "python", "python3", "python.exe", "py", "node", "node.exe", "deno",
+        "bash", "sh", "zsh", "pwsh", "powershell", "cmd", "cmd.exe", "wsl",
+    })
+
+    @staticmethod
+    def _tokens_of(segment: str) -> list[str]:
+        """命令段 token 化（保留引号内空格路径；去引号）"""
+        raw = re.findall(r'"([^"]*)"|\'([^\']*)\'|(\S+)', segment)
+        return [a or b or c for a, b, c in raw]
+
+    @staticmethod
+    def _read_text_file(path: str, nest_name: str | None) -> str:
+        """读文本文件内容（本地直读/远程单HTTP；失败返回空）"""
+        try:
+            if not nest_name or nest_name == "local":
+                return Path(path).read_text(encoding="utf-8", errors="replace")
+            py = (
+                "import json\n"
+                f"print(json.dumps(open({path!r}, encoding='utf-8', errors='replace').read()))\n"
+            )
+            r = _run_python_remote(py, timeout=15, nest_name=nest_name)
+            if r.returncode == 0:
+                return json.loads(r.stdout.strip().split("\n")[-1])
+        except Exception as e:
+            logger.debug(f"读取脚本内容失败({path}): {e}")
+        return ""
+
+    @staticmethod
+    def _extract_paths_from_script(
+        script_path: str, workdir: str | None, nest_name: str | None,
+    ) -> list[str]:
+        """读取脚本内容，提取其中涉及的文件路径（🔧 事务#1847 第八轮）
+
+        生产需求：`python a.py` 命令行只有一个脚本参数，脚本内部 open()/删除的
+        其他文件必须靠读脚本源码提取。策略：宽进严出——正则提取"路径样式"
+        token（带扩展名、引号内或裸词），相对路径以 workdir 与脚本所在目录
+        双基准解析，最终存在性过滤兜底误报（os.path 之类的模块名解析后
+        不存在，自然被滤掉）。
+        """
+        content = ToolBackupManager._read_text_file(script_path, nest_name)
+        if not content:
+            return []
+        wd = str(workdir) if workdir else ""
+        script_dir = os.path.dirname(script_path)
+        pat = re.compile(
+            r"[\'\"]((?:[A-Za-z]:)?[\w./\\\- ]+\.\w{1,8})[\'\"]"
+            r"|(?<![\'\"\w/\\])((?:[A-Za-z]:)?[\w./\\\-]+\.\w{1,8})"
+        )
+        out: list[str] = []
+        for m in pat.finditer(content):
+            tok = (m.group(1) or m.group(2) or "").strip()
+            if not tok or len(tok) > 260:
+                continue
+            if tok.startswith(("http:", "https:", "ftp:")):
+                continue
+            if _is_abs_cross_platform(tok):
+                bases = [""]
+            else:
+                bases = [wd, script_dir]
+            for base in bases:
+                p = ToolBackupManager._join_norm(base, tok) if base else ToolBackupManager._join_norm("", tok)
+                if _is_abs_path_excluded(p):
+                    continue
+                try:
+                    if _path_exists(p, nest_name):
+                        out.append(p)
+                        break
+                except Exception:
+                    continue
+        return out
+
+    @staticmethod
+    def _win_style(p: str) -> bool:
+        return bool(re.match(r"^[A-Za-z]:[\\/]", p))
+
+    @staticmethod
+    def _join_norm(base: str, tok: str) -> str:
+        """跨平台 join+normpath（Windows 盘符路径用 ntpath，避免 Linux 端
+        os.path.join 产生 D:\\x/y 混合斜杠形态）"""
+        if base and ToolBackupManager._win_style(base):
+            return ntpath.normpath(ntpath.join(base, tok))
+        joined = os.path.join(base, tok) if base else tok
+        if ToolBackupManager._win_style(joined):
+            return ntpath.normpath(joined)
+        return os.path.normpath(joined)
+
+    @staticmethod
+    def _extract_paths_from_command(
+        command: str, workdir: str | None = None, nest_name: str | None = None,
+    ) -> list[str]:
+        """从 bash/cmd 命令字符串提取将修改/删除的文件路径（🔧 事务#1847 第八轮）
+
+        生产事故：task#1886 用 bash `del D:\\work\\README.md` 删除文件无备份——
+        旧实现"bash 无法确定具体文件，返回空列表"。
+        规则（保守而全面）：
+        - 按 ; | && || 分段，段内 token 化（引号路径保留）
+        - 动词（rm/del/mv/move/cp/copy/ren/rename/rmdir/rd/touch/truncate/shred/
+          unlink/tee/erase，basename 匹配）后的非选项参数为涉及路径
+          （mv/cp/move/copy 的 src 和 dst 都收——dst 原有文件会被覆盖也需备份）
+        - 重定向目标（>file、>>file、独立 > 后跟 file）为写入路径
+        - 选项过滤：- 开头；Windows 单字母开关 /q /s /f /a（^/[A-Za-z]?$，
+          多段路径如 /home/x 不误伤）
+        - 相对路径 join(workdir) 解析；含通配符的跳过（无法静态展开）
+        - 最终仅保留真实存在的文件/目录（新增文件无需备份原版；删除不存在的
+          文件无内容可备）——语义自洽
+        """
+        if not command:
+            return []
+        wd = str(workdir) if workdir else ""
+        candidates: list[str] = []
+        patterns: list[str] = []  # 含通配符的路径模式（命令前 glob 展开为具体文件）
+
+        def resolve(tok: str, to_patterns: bool = True) -> str | None:
+            tok = tok.strip().strip('"').strip("'")
+            if not tok or not re.search(r"[A-Za-z0-9_.\-\u4e00-\u9fff]", tok):
+                return None
+            if _is_abs_cross_platform(tok):
+                full = ToolBackupManager._join_norm("", tok)
+            elif tok.startswith("~") or tok.startswith("%"):
+                return None  # 环境变量/家目录展开不了，跳过
+            elif wd:
+                full = ToolBackupManager._join_norm(wd, tok)
+            else:
+                return None
+            if to_patterns and any(w in full for w in "*?"):
+                patterns.append(full)
+                return None
+            return full
+
+        def is_option(tok: str) -> bool:
+            if tok.startswith("-"):
+                return True
+            return bool(re.match(r"^/[A-Za-z]?$", tok))  # /q /s；/home/x 不误伤
+
+        for seg in ToolBackupManager._CMD_SEG_SPLIT.split(command):
+            tokens = ToolBackupManager._tokens_of(seg)
+            i, n = 0, len(tokens)
+            collecting = False
+            while i < n:
+                tok = tokens[i]
+                base = re.split(r"[\\/]", tok)[-1].lower()
+                stripped = tok.lstrip("(")
+                base_s = re.split(r"[\\/]", stripped)[-1].lower()
+                if base_s in ToolBackupManager._CMD_FILE_VERBS or base in ToolBackupManager._CMD_FILE_VERBS:
+                    collecting = True
+                    i += 1
+                    continue
+                if collecting:
+                    # 重定向（动词后不再期望；由独立扫描处理）或控制符
+                    if tok.startswith(">"):
+                        redir = tok.lstrip(">").lstrip("(")
+                        r = resolve(redir) if redir else None
+                        if r:
+                            candidates.append(r)
+                        elif not redir and i + 1 < n:
+                            r = resolve(tokens[i + 1])
+                            if r:
+                                candidates.append(r)
+                            i += 1
+                        collecting = False
+                        i += 1
+                        continue
+                    if is_option(tok):
+                        i += 1
+                        continue
+                    r = resolve(tok)
+                    if r:
+                        candidates.append(r)
+                    i += 1
+                    continue
+                # 非收集状态：独立重定向目标（echo x > file）
+                if tok.startswith(">"):
+                    redir = tok.lstrip(">")
+                    r = resolve(redir) if redir else None
+                    if r:
+                        candidates.append(r)
+                    elif not redir and i + 1 < n:
+                        r = resolve(tokens[i + 1])
+                        if r:
+                            candidates.append(r)
+                        i += 1
+                i += 1
+
+        # 🔧 执行脚本检测（事务#1847 第八轮）：解释器（python/node/bash/...）后的
+        # 脚本参数，或任何脚本扩展名 token → 读取脚本内容提取内部涉及路径
+        # （命令行只有一个脚本参数，脚本内 open()/删除的其他文件靠源码提取）
+        script_files: list[str] = []
+        for seg in ToolBackupManager._CMD_SEG_SPLIT.split(command):
+            tokens = ToolBackupManager._tokens_of(seg)
+            expecting_script = False
+            for tok in tokens:
+                stripped_base = re.split(r"[\\/]", tok.lstrip("("))[-1].lower()
+                if (
+                    stripped_base in ToolBackupManager._INTERPRETER_VERBS
+                    or stripped_base.startswith(("python", "node", "pythonw"))
+                ):
+                    expecting_script = True
+                    continue
+                if not tok or is_option(tok):
+                    continue
+                r = resolve(tok, to_patterns=False)
+                if expecting_script:
+                    if r and r.lower().endswith(ToolBackupManager._SCRIPT_EXTS):
+                        script_files.append(r)
+                    expecting_script = False
+                elif tok.lower().endswith(ToolBackupManager._SCRIPT_EXTS) and r:
+                    script_files.append(r)
+        for sf in script_files[:3]:  # 限 3 个脚本，防失控
+            try:
+                if _path_exists(sf, nest_name):
+                    candidates.extend(
+                        ToolBackupManager._extract_paths_from_script(sf, wd, nest_name)
+                    )
+            except Exception:
+                continue
+
+        # 🔧 通配符模式在命令执行前展开为实际匹配文件（rm *.txt → 具体文件列表，
+        # 配合命令前后对比检测实际变化）
+        for pat in patterns:
+            try:
+                if not nest_name or nest_name == "local":
+                    candidates.extend(sorted(glob.glob(pat)))
+                else:
+                    py = f"import glob, json\nprint(json.dumps(sorted(glob.glob({pat!r}))))\n"
+                    r = _run_python_remote(py, timeout=15, nest_name=nest_name)
+                    if r.returncode == 0:
+                        candidates.extend(json.loads(r.stdout.strip().split("\n")[-1]))
+            except Exception as e:
+                logger.debug(f"命令通配符展开失败({pat}): {e}")
+
+        # 去重 + 存在性过滤（仅备份真实存在的对象原版）
+        seen: set[str] = set()
+        out: list[str] = []
+        for p in candidates:
+            k = p.replace("\\", "/").lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            if _is_abs_path_excluded(p):
+                continue
+            try:
+                if _path_exists(p, nest_name):
+                    out.append(p)
+            except Exception:
+                continue
+        return out
+
     @staticmethod
     def _extract_file_paths(
-        tool_name: str, tool_args: dict[str, Any], workdir: str | None = None
+        tool_name: str, tool_args: dict[str, Any], workdir: str | None = None,
+        nest_name: str | None = None,
     ) -> list[str]:
-        """从工具参数中提取涉及的文件路径"""
+        """从工具参数中提取涉及的文件路径（含 bash/cmd 命令解析，🔧 第八轮）"""
         paths: list[str] = []
         if tool_name in ("write", "edit", "line_edit"):
             fp = tool_args.get("filePath", "")
             if fp:
                 paths.append(fp)
-        # bash: 无法确定具体文件，返回空列表
+        elif tool_name in ("bash", "cmd"):
+            command = str(tool_args.get("command", "") or "")
+            paths.extend(
+                ToolBackupManager._extract_paths_from_command(command, workdir, nest_name)
+            )
         return paths
 
     # ==================== 显示生成 ====================
@@ -2569,6 +3200,74 @@ class ToolBackupManager:
         # \x1b[33m=橙色（非粗体）
         return f"\x1b[33m\x1b]8;;{uri}\x07{text}   \x1b]8;;\x07\x1b[0m"
 
+
+    @staticmethod
+    def _filter_baseline_files(
+        file_paths: list[str], workdir: str, nest_name: str | None = None
+    ) -> list[str]:
+        """过滤基线文件集：git 管理文件（嵌套仓库）+ 系统目录路径不参与
+        检测/预览/恢复（🔧 事务#1847 第十轮：旧基线 commit 含历史误备份的
+        fcc（git管理）与 Program Files/Temp 文件——回滚窗口数量虚高、回滚
+        会错误恢复它们；新备份已过滤，旧基线数据靠此处动态过滤兜底）"""
+        if not file_paths:
+            return file_paths
+        try:
+            return ToolBackupManager._filter_unbackupable(file_paths, workdir, nest_name)
+        except Exception as e:
+            logger.debug(f"基线文件过滤失败: {e}")
+            return file_paths
+
+    @staticmethod
+    def preview_rollback_diff_with_external(rollback_meta: dict[str, Any]) -> dict[str, Any]:
+        """回滚预览（含外部/非git管理文件的变更信息，🔧 第九轮）
+
+        webui 回滚确认窗口的完整数据源：在 preview_rollback_diff（workdir 变更）
+        基础上，追加"工作目录外或非git管理文件"的变更清单（备份仓库基线对比），
+        让用户在确认回滚前看到全部将恢复的对象。
+        """
+        result = ToolBackupManager.preview_rollback_diff(rollback_meta)
+        if rollback_meta.get("type") == "external":
+            return result  # external 分支的 changed_files 已是备份文件变更
+        task_id = int(rollback_meta.get("task_id", 0) or 0)
+        if not task_id:
+            return result
+        nest_name = rollback_meta.get("nest_name", "local")
+        ext_commit = (
+            rollback_meta.get("external_backup_commit")
+            or rollback_meta.get("external_head_commit")
+        )
+        if not ext_commit:
+            return result
+        # 🔧 history_only（非git workdir 迭代快照）主体返回 success=False
+        # （"仅上下文恢复"）——仍需补充外部/非git文件变更信息（生产事故：
+        # task#1886 回滚窗口看不到文件变更就是因为这里提前 return）
+        if not result.get("success") and rollback_meta.get("type") != "history_only":
+            return result
+        try:
+            files = ExternalFileBackup.list_baseline_files(
+                task_id, ext_commit, nest_name=nest_name
+            )
+            files = ToolBackupManager._filter_baseline_files(
+                files, rollback_meta.get("workdir", ""), nest_name
+            )
+            if not files:
+                return result
+            changed = ExternalFileBackup.check_changes(
+                task_id, files, ext_commit, nest_name=nest_name
+            )
+            if changed:
+                result["changed_files"] = list(result.get("changed_files") or []) + changed
+                result["message"] = (
+                    (result.get("message") or "")
+                    + f"；外部/非git管理文件变更 {len(changed)} 个"
+                )
+                if rollback_meta.get("type") == "history_only":
+                    # 有可展示的文件变更：置 success 让前端渲染变更区块
+                    result["success"] = True
+                    result["message"] = f"外部/非git管理文件变更 {len(changed)} 个（见列表）"
+        except Exception as e:
+            logger.debug(f"回滚预览外部文件变更检测失败(task#{task_id}): {e}")
+        return result
 
     @staticmethod
     def preview_rollback_diff(rollback_meta: dict[str, Any]) -> dict[str, Any]:
@@ -2624,6 +3323,39 @@ class ToolBackupManager:
         if cached and now - cached["ts"] < _PREVIEW_DIFF_CACHE_TTL:
             return cached["result"]
 
+        # 🔧 external 模式（非git workdir 快照：涉及文件统一在备份仓库，初始设计）
+        if backup_type == "external":
+            ext_files = rollback_meta.get("external_files", [])
+            ext_commit = rollback_meta.get("external_backup_commit")
+            changed = ExternalFileBackup.check_changes(
+                int(rollback_meta.get("task_id", 0) or 0), ext_files, ext_commit,
+                nest_name=nest_name,
+            )
+            if not changed:
+                return {"success": True, "diff": "", "changed_files": [], "truncated": False,
+                        "message": "无文件变更"}
+            return {"success": True, "diff": "", "changed_files": changed, "truncated": False,
+                    "message": f"共 {len(changed)} 个文件变更（见列表）"}
+
+        # 🔧 worktree 模式的 non_git（本地/远程统一走 check_worktree 路径，
+        # 不进 mirror 同步的 remote batch）
+        if backup_type == "non_git" and rollback_meta.get("repo_mode") == "worktree":
+            repo = rollback_meta.get("backup_repo", "")
+            det = ToolBackupManager._non_git_check_worktree(
+                workdir, repo, commit_hash, nest_name, with_trees=True
+            )
+            if det is None:
+                return {"success": False, "diff": "", "changed_files": [], "truncated": False,
+                        "message": "变更检测失败"}
+            changed, added, _bt, _ct = det
+            if not changed and not added:
+                return {"success": True, "diff": "", "changed_files": [], "truncated": False,
+                        "message": "无文件变更"}
+            changed_files = [f for f in (changed + added) if f]
+            return {"success": True, "diff": "", "changed_files": changed_files,
+                    "truncated": False,
+                    "message": f"共 {len(changed_files)} 个文件变更（见列表）"}
+
         # 🔧 远程nest：批量脚本一次HTTP完成（含non_git先同步），
         # 输出base64传输，避免Windows GBK解码git UTF-8输出导致的静默失败
         if nest_name and nest_name != "local":
@@ -2638,8 +3370,44 @@ class ToolBackupManager:
             return result
 
         try:
+            if backup_type == "non_git" and rollback_meta.get("repo_mode") == "worktree":
+                # 🔧 worktree 模式：零镜像，临时索引对比快照 commit tree
+                repo = rollback_meta.get("backup_repo", "")
+                det = ToolBackupManager._non_git_check_worktree(
+                    workdir, repo, commit_hash, nest_name, with_trees=True
+                )
+                if det is None:
+                    return {"success": False, "diff": "", "changed_files": [], "truncated": False,
+                            "message": "变更检测失败"}
+                changed, added, backup_tree, current_tree = det
+                if not changed and not added:
+                    return {"success": True, "diff": "", "changed_files": [], "truncated": False,
+                            "message": "无文件变更"}
+                changed_files = [f for f in (changed + added) if f]
+                diff_text = ""
+                if not nest_name or nest_name == "local":
+                    base = ["--git-dir", os.path.join(repo, ".git"), "--work-tree", workdir]
+                    r = subprocess.run(
+                        ["git"] + base + ["-c", "core.quotepath=false", "diff", "--no-color",
+                                          current_tree, backup_tree],
+                        cwd=workdir, capture_output=True, text=True, timeout=60,
+                    )
+                    if r.returncode == 0:
+                        diff_text = r.stdout
+                diff_text, truncated, truncated_bytes = _truncate_diff_by_bytes(diff_text)
+                if not diff_text:
+                    return {"success": True, "diff": "", "changed_files": changed_files,
+                            "truncated": False,
+                            "message": f"共 {len(changed_files)} 个文件变更（见列表）"}
+                result = {
+                    "success": True, "diff": diff_text, "changed_files": changed_files,
+                    "truncated": truncated, "truncated_bytes": truncated_bytes, "message": "ok",
+                }
+                _preview_diff_cache[cache_key] = {"ts": now, "result": result}
+                return result
+
             if backup_type == "non_git":
-                # 同步当前工作区到备份仓库（不commit），使工作树反映当前状态
+                # 旧 mirror 模式：同步当前工作区到备份仓库（不commit），使工作树反映当前状态
                 ToolBackupManager._sync_to_backup_repo(workdir, cwd, nest_name)
 
             git_dir = _get_git_dir(cwd, nest_name)
@@ -3499,36 +4267,48 @@ class ExternalFileBackup:
     """
 
     @staticmethod
-    def _split_drive_key(file_path: str) -> str | None:
-        """Windows 平台提取文件路径的盘符字母（大写）
+    def _win_drive_of(file_path: str) -> str:
+        """提取 Windows 盘符字母（大写）——纯路径形态判断，不依赖本地平台
 
-        仅当 peng 服务本地运行在 Windows（os.name == "nt"）且路径带单盘符
-        （如 "D:\\x" / "d:/x"）时返回盘符大写字母（如 "D"）；
-        非 Windows 平台 / Unix 路径 / UNC 路径（\\\\server\\share）返回 None。
-        （远程 Windows nest 返回的路径在 Linux 服务端不启用盘符仓库——
-        ExternalFileBackup 本就是纯本地备份，远程路径本地不可访问）
+        "D:\\x" / "d:/x" → "D"；Unix 路径 / UNC / 无盘符 → ""
+        （远程 Windows nest 返回的路径在 Linux 服务端也能正确识别盘符，
+        用于路由到 nest 端盘符仓库执行）
+        """
+        drive, _ = ntpath.splitdrive(str(file_path).replace("\\", "/"))
+        if len(drive) == 2 and drive[1] == ":":
+            return drive[0].upper()
+        return ""
+
+    @staticmethod
+    def _split_drive_key(file_path: str) -> str | None:
+        """本地备份场景的盘符提取（peng 本地运行在 Windows 时启用本地盘符仓库）
+
+        仅当 os.name == "nt" 且路径带单盘符时返回盘符大写字母；
+        非 Windows 平台 / Unix 路径 / UNC 路径返回 None。
+        （peng 主服务在 Linux + 远程 Windows nest 的架构下，盘符文件走
+        _win_drive_of + nest_name 的远程路径，不走本地盘符仓库）
         """
         if os.name != "nt":
             return None
-        drive = ntpath.splitdrive(str(file_path))[0]
-        if len(drive) == 2 and drive[1] == ":":
-            return drive[0].upper()
-        return None
+        return ExternalFileBackup._win_drive_of(file_path) or None
 
     @staticmethod
     def _repo_key(file_path: str) -> str:
-        """文件对应的备份仓库 key：盘符字母（Windows 盘符路径）或 ""（默认仓库）"""
+        """文件对应的本地备份仓库 key：盘符字母（Windows 盘符路径）或 ""（默认仓库）"""
         return ExternalFileBackup._split_drive_key(file_path) or ""
 
     @staticmethod
     def _repo_path_for_key(task_id: int, key: str) -> str:
         """仓库 key → 备份仓库路径（仅计算路径，不创建目录）
 
-        key="D" → D:\\.peng\\backups\\task#id；key="" → 默认 data 仓库（会确保存在）
+        🔧 初始设计还原（事务#1847 第七轮）：盘符根 \\.peng\\backups 本身是唯一
+        git 环境，所有 task 共用；备份文件按绝对路径映射为仓库子路径
+        （D:\\works\\t.txt → d/works/t.txt），不放 task#id 子目录。
+        key="D" → D:\\.peng\\backups；key="" → 默认 data 仓库（会确保存在）
         """
         if not key:
             return ExternalFileBackup._get_backup_repo(task_id)
-        return ntpath.join(ntpath.join(f"{key}:\\", ".peng", "backups"), f"task#{task_id}")
+        return ntpath.join(f"{key}:\\", ".peng", "backups")
 
     @staticmethod
     def _get_backup_repo_for(task_id: int, file_path: str) -> str:
@@ -3643,9 +4423,281 @@ class ExternalFileBackup:
                 keys.append(c)
         return keys
 
+    # ==================== 远程 nest 端执行（🔧 事务#1847 第四轮） ====================
+    # peng 主服务可能在 Linux（如 vnas），事务工作在远程 Windows nest（如 epyc）：
+    # 外部文件是 nest 端的 Windows 路径，本地 os.path.exists 恒 False → 备份静默失效。
+    # 因此远程 Windows 路径（带盘符）的备份/检测/恢复全部路由到 nest 端执行：
+    # 仓库位于 nest 端文件同盘符根 \.peng\backups\task#id（避免跨盘符复制），
+    # 每个操作打包为单个 Python 脚本经 nest exec 一次 HTTP 完成。
+
     @staticmethod
-    def get_all_heads(task_id: int) -> str | dict[str, str]:
-        """获取全部外部文件备份仓库的当前 HEAD commit
+    def _is_remote_nest(nest_name: str | None) -> bool:
+        return bool(nest_name and nest_name != "local")
+
+    @staticmethod
+    def _remote_py_head(task_id: int) -> str:
+        """远程批量脚本公共头（nest 端执行环境：盘符路由/仓库定位/git封装）"""
+        return (
+            "import subprocess, os, sys, json, shutil\n"
+            f"task_id = {task_id!r}\n"
+            f"excl_names = {sorted(_FORCE_EXCLUDE_DIR_NAMES)!r}\n"
+            f"excl_prefixes = {list(_FORCE_EXCLUDE_DIR_PREFIXES)!r}\n"
+            "def git_bytes(repo, *a):\n"
+            "    return subprocess.run(['git'] + list(a), cwd=repo, capture_output=True, timeout=60)\n"
+            "def git(repo, *a):\n"
+            "    r = git_bytes(repo, *a)\n"
+            "    class R: pass\n"
+            "    rr = R(); rr.returncode = r.returncode\n"
+            "    rr.stdout = r.stdout.decode('utf-8', 'replace'); rr.stderr = r.stderr.decode('utf-8', 'replace')\n"
+            "    return rr\n"
+            "def drive_of(fp):\n"
+            "    d = str(fp).replace(chr(92), '/')\n"
+            "    return d[0].upper() if len(d) >= 2 and d[1] == ':' else ''\n"
+            # 🔧 初始设计：盘符根 \.peng\backups 是唯一 git 环境（无 task#id 子目录）
+            "def repo_for(dr):\n"
+            "    return dr + ':\\\\.peng\\\\backups'\n"
+            # 备份仓库内路径：D:\works\t.txt → d/works/t.txt（盘符小写+完整路径映射）
+            "def rel_of(fp):\n"
+            "    d = str(fp).replace(chr(92), '/')\n"
+            "    return d[0].lower() + '/' + d[2:].lstrip('/') if len(d) >= 2 and d[1] == ':' else d.lstrip('/')\n"
+            # 备份内路径 → 源绝对路径（d/works/t.txt → D:\works\t.txt）
+            "def abs_of(dr, brel):\n"
+            "    return dr + ':\\\\' + brel.split('/', 1)[1].replace('/', chr(92)) if '/' in brel else dr + ':\\\\'\n"
+            "def excluded(fp):\n"
+            "    parts = str(fp).replace(chr(92), '/').split('/')\n"
+            "    return any(x in excl_names or x.startswith(tuple(excl_prefixes)) for x in parts[:-1])\n"
+            "def ensure_repo(repo):\n"
+            "    os.makedirs(repo, exist_ok=True)\n"
+            "    if git(repo, 'rev-parse', '--git-dir').returncode != 0:\n"
+            "        shutil.rmtree(os.path.join(repo, '.git'), ignore_errors=True)\n"
+            "        git(repo, 'init')\n"
+            "        git(repo, 'config', 'user.email', 'peng@files')\n"
+            "        git(repo, 'config', 'user.name', 'Peng Files')\n"
+            "        git(repo, 'add', '-A')\n"
+            "        git(repo, 'commit', '-m', 'init', '--allow-empty')\n"
+            "out = {}\n"
+        )
+
+    @staticmethod
+    def _remote_run(nest_name: str, py_code: str, timeout: int = 120) -> dict | None:
+        """执行远程批量脚本并解析 JSON 输出（末行）"""
+        result = _run_python_remote(py_code, timeout=timeout, nest_name=nest_name)
+        if result.returncode != 0:
+            logger.warning(
+                f"外部文件备份远程执行失败({nest_name}): rc={result.returncode} "
+                f"{str(result.stderr)[:200]}"
+            )
+            return None
+        try:
+            return json.loads(result.stdout.strip().split("\n")[-1])
+        except (json.JSONDecodeError, IndexError):
+            logger.warning(f"外部文件备份远程响应解析失败({nest_name}): {str(result.stdout)[:200]}")
+            return None
+
+    @staticmethod
+    def _remote_backup(
+        nest_name: str, task_id: int, file_paths: list[str], label: str
+    ) -> dict[str, str] | None:
+        """远程备份：按盘符分组复制+commit（nest端盘符根仓库），单次HTTP"""
+        if not file_paths:
+            return None
+        py = ExternalFileBackup._remote_py_head(task_id) + (
+            f"files = {file_paths!r}\n"
+            f"label = {label!r}\n"
+            "groups = {}\n"
+            "for fp in files:\n"
+            "    if not os.path.exists(fp) or excluded(fp): continue\n"
+            "    dr = drive_of(fp)\n"
+            "    if not dr: continue\n"
+            "    groups.setdefault(dr, []).append(fp)\n"
+            "commits = {}\n"
+            "for dr, fps in groups.items():\n"
+            "    repo = repo_for(dr)\n"
+            "    ensure_repo(repo)\n"
+            "    for fp in fps:\n"
+            "        dst = os.path.join(repo, rel_of(fp).replace('/', os.sep))\n"
+            "        os.makedirs(os.path.dirname(dst), exist_ok=True)\n"
+            "        if os.path.isfile(fp): shutil.copy2(fp, dst)\n"
+            "        elif os.path.isdir(fp): shutil.copytree(fp, dst, dirs_exist_ok=True)\n"
+            "    st = git(repo, 'status', '--porcelain')\n"
+            "    if st.stdout.strip():\n"
+            "        git(repo, 'add', '-A')\n"
+            # 🔧 初始设计：commit 消息含事务id+原路径映射+一键还原命令（:/消息前缀
+            # 定位本 commit 历史版本：git checkout ":/前缀" -- rel 取该版本到工作区
+            # ——二进制安全，再 copy 到原路径；纯 copy 只能拿最新工作区副本）。
+            # 一次 commit 无需 amend（消息引用自身 hash 数学上不可能）。纯 ASCII。
+            "        nl = chr(10)\n"
+            "        fl = 'peng backup task#' + str(task_id) + ': ' + label\n"
+            "        mlines = [fl, '', 'files (origin -> backup):']\n"
+            "        rst = []\n"
+            "        for fp in fps[:20]:\n"
+            "            brel = rel_of(fp)\n"
+            "            mlines.append('  ' + fp + ' -> ' + brel)\n"
+            "            bak = os.path.join(repo, *brel.split('/'))\n"
+            "            rst.append('  git -C ' + repo + ' checkout ' + chr(34) + ':/' + fl + chr(34) + ' -- ' + brel + ' && copy /y ' + chr(34) + bak + chr(34) + ' ' + chr(34) + fp + chr(34))\n"
+            "        if len(fps) > 20: mlines.append('  ...total ' + str(len(fps)) + ' files (list truncated)')\n"
+            "        mlines.append('')\n"
+            "        mlines.append('one-key restore (version of this commit):')\n"
+            "        mlines.extend(rst)\n"
+            "        git(repo, 'commit', '-m', nl.join(mlines))\n"
+            "    r = git(repo, 'rev-parse', 'HEAD')\n"
+            "    if r.returncode == 0 and r.stdout.strip(): commits[dr] = r.stdout.strip()\n"
+            "out['commits'] = commits\n"
+            "print(json.dumps(out))\n"
+        )
+        data = ExternalFileBackup._remote_run(nest_name, py)
+        return (data or {}).get("commits") or None
+
+    @staticmethod
+    def _remote_check_changes(
+        nest_name: str, task_id: int, file_paths: list[str],
+        commit_spec: str | dict[str, str] | None,
+    ) -> list[str]:
+        """远程变更检测：逐文件 hash-object 对比基线（nest端），单次HTTP"""
+        if not file_paths:
+            return []
+        spec = commit_spec if isinstance(commit_spec, dict) else None
+        py = ExternalFileBackup._remote_py_head(task_id) + (
+            f"files = {file_paths!r}\n"
+            f"spec = {spec!r}\n"
+            "changed = []\n"
+            "for fp in files:\n"
+            "    dr = drive_of(fp)\n"
+            "    if not dr: continue\n"
+            "    repo = repo_for(dr)\n"
+            "    base = (spec or {}).get(dr) or 'HEAD'\n"
+            "    rel = rel_of(fp)\n"
+            "    if not os.path.exists(fp):\n"
+            "        if git(repo, 'cat-file', '-e', base + ':' + rel).returncode == 0:\n"
+            "            changed.append(fp)\n"
+            "        continue\n"
+            "    r = git(repo, 'hash-object', fp)\n"
+            "    if r.returncode != 0:\n"
+            "        changed.append(fp); continue\n"
+            "    r2 = git(repo, 'rev-parse', base + ':' + rel)\n"
+            "    if r2.returncode != 0 or r2.stdout.strip() != r.stdout.strip():\n"
+            "        changed.append(fp)\n"
+            "out['changed'] = changed\n"
+            "print(json.dumps(out))\n"
+        )
+        data = ExternalFileBackup._remote_run(nest_name, py, timeout=60)
+        return (data or {}).get("changed", [])
+
+    @staticmethod
+    def _remote_restore(
+        nest_name: str, task_id: int, file_paths: list[str],
+        commit_spec: str | dict[str, str] | None,
+    ) -> int:
+        """远程恢复：git show 基线内容写回原路径（bytes模式防编码损坏），单次HTTP"""
+        if not file_paths:
+            return 0
+        spec = commit_spec if isinstance(commit_spec, dict) else None
+        py = ExternalFileBackup._remote_py_head(task_id) + (
+            f"files = {file_paths!r}\n"
+            f"spec = {spec!r}\n"
+            "restored = 0\n"
+            "for fp in files:\n"
+            "    dr = drive_of(fp)\n"
+            "    if not dr: continue\n"
+            "    repo = repo_for(dr)\n"
+            "    base = (spec or {}).get(dr)\n"
+            "    if not base: continue\n"
+            "    r = git_bytes(repo, 'show', base + ':' + rel_of(fp))\n"
+            "    if r.returncode != 0: continue\n"
+            "    os.makedirs(os.path.dirname(fp), exist_ok=True)\n"
+            "    with open(fp, 'wb') as f: f.write(r.stdout)\n"
+            "    restored += 1\n"
+            "out['restored'] = restored\n"
+            "print(json.dumps(out))\n"
+        )
+        data = ExternalFileBackup._remote_run(nest_name, py, timeout=90)
+        return int((data or {}).get("restored", 0))
+
+    @staticmethod
+    def _remote_get_drive_heads(nest_name: str, task_id: int) -> dict[str, str]:
+        """远程枚举 nest 端已存在的盘符仓库 HEAD（{盘符: commit}），单次HTTP"""
+        py = ExternalFileBackup._remote_py_head(task_id) + (
+            "heads = {}\n"
+            "for c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':\n"
+            "    repo = repo_for(c)\n"
+            "    if os.path.isdir(os.path.join(repo, '.git')):\n"
+            "        r = git(repo, 'rev-parse', 'HEAD')\n"
+            "        if r.returncode == 0 and r.stdout.strip(): heads[c] = r.stdout.strip()\n"
+            "out['heads'] = heads\n"
+            "print(json.dumps(out))\n"
+        )
+        data = ExternalFileBackup._remote_run(nest_name, py, timeout=60)
+        return (data or {}).get("heads", {})
+
+    @staticmethod
+    def _remote_list_baseline(
+        nest_name: str, task_id: int, commit_spec: dict[str, str]
+    ) -> list[str]:
+        """远程列出盘符仓库基线中的文件（rel→盘符绝对路径），单次HTTP"""
+        remote_spec = {k: v for k, v in commit_spec.items() if k}
+        if not remote_spec:
+            return []
+        py = ExternalFileBackup._remote_py_head(task_id) + (
+            f"spec = {remote_spec!r}\n"
+            "bl = []\n"
+            "for dr, commit in spec.items():\n"
+            "    if not dr or not commit: continue\n"
+            "    repo = repo_for(dr)\n"
+            "    if not os.path.isdir(repo): continue\n"
+            "    r = git(repo, '-c', 'core.quotepath=false', 'ls-tree', '-r', '--name-only', commit)\n"
+            "    for line in r.stdout.splitlines():\n"
+            "        line = line.strip()\n"
+            "        if not line: continue\n"
+            "        if line.startswith('__external__/'): line = line[len('__external__/'):]\n"
+            # 🔧 初始设计：备份内路径 d/works/t.txt → 源绝对路径 D:/works/t.txt
+            # （首段盘符字母转大写；其余段为原路径）。旧结构（无盘符段）按
+            # 去盘符路径处理，加回盘符
+            "        if line[:2] == dr.lower() + '/':\n"
+            "            bl.append(dr + ':/' + line[2:])\n"
+            "        else:\n"
+            "            bl.append(dr + ':/' + line)\n"
+            "out['files'] = bl\n"
+            "print(json.dumps(out))\n"
+        )
+        data = ExternalFileBackup._remote_run(nest_name, py, timeout=60)
+        return (data or {}).get("files", [])
+
+    @staticmethod
+    def _split_local_remote(
+        nest_name: str | None, file_paths: list[str]
+    ) -> tuple[list[str], list[str]]:
+        """按执行环境拆分文件：本地处理的 vs 远程nest处理的
+
+        远程 nest 存在时，Windows 盘符路径（远程端文件）→ 远程；其余 → 本地。
+        """
+        if not ExternalFileBackup._is_remote_nest(nest_name):
+            return list(file_paths), []
+        remote_set = {
+            fp for fp in file_paths if ExternalFileBackup._win_drive_of(fp)
+        }
+        local = [fp for fp in file_paths if fp not in remote_set]
+        return local, list(remote_set)
+
+    @staticmethod
+    def _merge_commits(
+        local: str | dict[str, str] | None, remote: dict[str, str] | None
+    ) -> str | dict[str, str] | None:
+        """合并本地/远程备份结果（仅默认仓库 → str 兼容旧 meta 格式）"""
+        if not remote:
+            return local
+        merged: dict[str, str] = {}
+        if isinstance(local, dict):
+            merged.update(local)
+        elif isinstance(local, str) and local:
+            merged[""] = local
+        merged.update(remote)
+        if set(merged.keys()) == {""}:
+            return merged[""]
+        return merged
+
+    @staticmethod
+    def _get_all_heads_local(task_id: int) -> str | dict[str, str]:
+        """获取本地全部外部文件备份仓库的当前 HEAD commit
 
         覆盖：默认 data 仓库 + Windows 各盘符 \\.peng\\backups\\task#id 仓库（已存在时）。
         仅默认仓库有内容 → 返回 str（兼容旧 meta 格式）；
@@ -3711,10 +4763,11 @@ class ExternalFileBackup:
     def _repo_rel(file_path: str, repo_key: str) -> str:
         """文件在其备份仓库内的相对路径（POSIX 分隔，按仓库类型计算）
 
-        - 盘符仓库（repo_key 非空）：去掉盘符前缀——Windows 目录名不能含 ':'，
-          os.path.join 也会把含盘符的路径当绝对路径处理（🔧 事务#1847 真实测试发现的
-          Windows 路径语义陷阱：join(仓库, "D:/x") == "D:/x" 恒等于源文件路径，
-          导致 copy2(源, 源) 抛 WinError 32）。如 D:\\peng\\x → peng/x
+        - 盘符仓库（repo_key 非空，即 \\.peng\\backups 根仓库）：绝对路径映射为
+          仓库子路径——D:\\works\\t.txt → d/works/t.txt（🔧 初始设计，事务#1847
+          第七轮：盘符字母小写作首段目录，去冒号，Windows 目录名不能含 ':'；
+          os.path.join 也会把含盘符的路径当绝对路径处理——join(仓库, "D:/x")
+          == "D:/x" 恒等于源文件路径，导致 copy2(源, 源) 抛 WinError 32）
         - 默认仓库（repo_key=""）：保留完整路径含盘符段（Linux peng 的
           data/file_backups 历史数据结构），如 D:\\peng\\x → D:/peng/x
 
@@ -3723,14 +4776,59 @@ class ExternalFileBackup:
             repo_key: 备份仓库 key（""=默认；盘符字母）
         """
         if repo_key:
-            return _strip_drive_rel(file_path)
+            return f"{repo_key.lower()}/" + _strip_drive_rel(file_path)
         return ExternalFileBackup._to_repo_path(file_path)
 
     @staticmethod
-    def backup(
+    def _backup_commit_message(
+        task_id: int, file_pairs: list[tuple[str, str]], label: str,
+        repo_path: str, win: bool, max_lines: int = 20,
+    ) -> str:
+        """构造备份 commit 消息（🔧 初始设计，事务#1847 第九轮）
+
+        格式：事务id + 原路径→备份路径映射 + 一键还原命令（从**本 commit 的
+        历史版本**还原）。commit hash 在 commit 前不可知且 amend 会改变 hash
+        （消息引用自身 hash 数学上不可能）——还原命令用 git 的 `:/<消息前缀>`
+        语法按消息首行定位本 commit（首行含事务id+label+时间戳，唯一），
+        git checkout ":/前缀" -- <rel> 取该版本到工作区（二进制安全）再 copy
+        到原路径；纯 copy 只能拿最新工作区副本，无法还原历史。
+        纯 ASCII 结构（中文会在 Windows GBK 控制台/脚本解码时崩溃）。
+
+        Args:
+            file_pairs: [(原路径, 备份仓库内rel)] 如
+                [(r"D:\\works\\t.txt", "d/works/t.txt")]
+            repo_path: 备份仓库根（如 D:\\.peng\\backups）
+            win: True → 还原命令用 copy /y（Windows）；False → cp（Linux）
+        """
+        nl = "\n"
+        first_line = f"peng backup task#{task_id}: {label}"
+        lines = [first_line, "", "files (origin -> backup):"]
+        restores: list[str] = []
+        for src, rel in file_pairs[:max_lines]:
+            lines.append(f"  {src} -> {rel}")
+            bak = os.path.join(repo_path, *rel.split("/")) if "/" in rel else os.path.join(repo_path, rel)
+            if win:
+                restores.append(
+                    f'  git -C "{repo_path}" checkout ":/{first_line}" -- {rel}'
+                    f' && copy /y "{bak}" "{src}"'
+                )
+            else:
+                restores.append(
+                    f'  git -C "{repo_path}" checkout ":/{first_line}" -- {rel}'
+                    f' && cp "{bak}" "{src}"'
+                )
+        if len(file_pairs) > max_lines:
+            lines.append(f"  ...total {len(file_pairs)} files (list truncated)")
+        lines.append("")
+        lines.append(f"one-key restore (version of this commit):")
+        lines.extend(restores)
+        return nl.join(lines)
+
+    @staticmethod
+    def _backup_local(
         task_id: int, file_paths: list[str], label: str = ""
     ) -> str | dict[str, str] | None:
-        """备份外部文件到本地 git 仓库（🔧 按文件仓库分组，Windows 盘符文件入同盘符仓库）
+        """备份外部文件到本地 git 仓库（🔧 按文件仓库分组，本地 Windows 盘符文件入同盘符仓库）
 
         Args:
             task_id: 事务ID
@@ -3760,16 +4858,17 @@ class ExternalFileBackup:
                 key = ExternalFileBackup._repo_key(fp)
                 if key not in groups:
                     groups[key] = (ExternalFileBackup._get_backup_repo_for(task_id, fp), [])
-                # 🔧 按仓库类型计算 rel：盘符仓库去盘符（Windows 目录名不能含 ':'，
-                # 且含盘符路径会让 os.path.join 视为绝对路径导致 dst==源文件）
+                # 🔧 按仓库类型计算 rel：盘符仓库 d/works/t.txt（盘符小写+完整路径
+                # 映射；Windows 目录名不能含':'，且含盘符路径会让 os.path.join
+                # 视为绝对路径导致 dst==源文件）
                 rel = ExternalFileBackup._repo_rel(fp, key)
-                dst = os.path.join(groups[key][0], rel)
+                dst = os.path.join(groups[key][0], *rel.split("/"))
                 Path(os.path.dirname(dst)).mkdir(parents=True, exist_ok=True)
                 if os.path.isfile(fp):
                     shutil.copy2(fp, dst)
                 elif os.path.isdir(fp):
                     shutil.copytree(fp, dst, dirs_exist_ok=True)
-                groups[key][1].append(fp)
+                groups[key][1].append((fp, rel))
                 backed_up += 1
 
             if skipped_excluded:
@@ -3785,7 +4884,7 @@ class ExternalFileBackup:
                 # 🔧 去重检测：文件内容与该仓库 HEAD 完全一致时复用 HEAD commit，
                 # 避免无变化时产生冗余空 commit（--allow-empty 已移除）
                 commit_hash: str | None = None
-                if not ExternalFileBackup.check_changes(task_id, files):
+                if not ExternalFileBackup.check_changes(task_id, [fp for fp, _ in files]):
                     result = subprocess.run(
                         ["git", "rev-parse", "HEAD"],
                         cwd=repo, capture_output=True, text=True, timeout=5,
@@ -3798,20 +4897,18 @@ class ExternalFileBackup:
                         )
                 if not commit_hash:
                     subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True, timeout=10)
-                    msg = f"external files backup: {label}\n\nTask#{task_id} @ {timestamp}"
+                    # 🔧 初始设计：commit 消息含事务id+原路径映射+一键还原命令
+                    # （:/消息前缀 定位本 commit 的历史版本，一次 commit 无需 amend）
+                    msg = ExternalFileBackup._backup_commit_message(
+                        task_id, files, label, repo, win=bool(key)
+                    )
                     subprocess.run(
                         ["git", "commit", "-m", msg],
-                        cwd=repo,
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
+                        cwd=repo, capture_output=True, text=True, timeout=10,
                     )
                     result = subprocess.run(
                         ["git", "rev-parse", "HEAD"],
-                        cwd=repo,
-                        capture_output=True,
-                        text=True,
-                        timeout=5,
+                        cwd=repo, capture_output=True, text=True, timeout=5,
                     )
                     if result.returncode == 0 and result.stdout.strip():
                         commit_hash = result.stdout.strip()
@@ -3842,10 +4939,10 @@ class ExternalFileBackup:
         return None
 
     @staticmethod
-    def list_baseline_files(
+    def _list_baseline_local(
         task_id: int, commit_spec: str | dict[str, str] | None
     ) -> list[str]:
-        """列出基线 commit 中备份的全部外部文件绝对路径（跨仓库合并）
+        """列出基线 commit 中备份的全部外部文件绝对路径（本地仓库部分）
 
         遍历基线涉及的每个备份仓库（默认 data 仓库 + Windows 各盘符仓库）
         执行 git ls-tree，将仓库相对路径反推为原始绝对路径。
@@ -3880,8 +4977,12 @@ class ExternalFileBackup:
                 if rel.startswith("__external__/"):
                     rel = rel[len("__external__/"):]
                 if repo_key:
-                    # 盘符仓库：备份时去掉了盘符（目录名不能含':'），加回盘符
-                    abs_path = f"{repo_key}:/{rel}"
+                    # 🔧 初始设计：备份内路径 d/works/t.txt → 源绝对路径 D:/works/t.txt
+                    # （首段盘符字母转大写）。旧结构（无盘符段）按去盘符路径加回盘符
+                    if rel[:2].lower() == f"{repo_key.lower()}/":
+                        abs_path = f"{repo_key}:/{rel[2:]}"
+                    else:
+                        abs_path = f"{repo_key}:/{rel}"
                 else:
                     # 默认仓库：rel 可能是含盘符的 Windows 路径或 Unix 路径
                     abs_path = rel if ntpath.isabs(rel) else "/" + rel
@@ -3889,48 +4990,12 @@ class ExternalFileBackup:
         return abs_paths
 
     @staticmethod
-    def restore_all(
-        task_id: int, commit_spec: str | dict[str, str] | None
-    ) -> int:
-        """从基线 commit 全量恢复所有外部文件到原始路径（🔧 支持多仓库）
-
-        迭代开始快照记录各备份仓库的 HEAD 作为基线（get_all_heads），
-        回滚时遍历基线涉及的每个仓库，用 git ls-tree 列出该 commit 下
-        全部文件并逐个恢复（不修改备份仓库工作树）。
-
-        Args:
-            task_id: 事务ID
-            commit_spec: 基线 commit（str=旧格式默认仓库；dict={repo_key: commit}）
-
-        Returns:
-            成功恢复的文件数
-        """
-        if not commit_spec:
-            return 0
-
-        try:
-            abs_paths = ExternalFileBackup.list_baseline_files(task_id, commit_spec)
-            if not abs_paths:
-                return 0
-
-            restored = ExternalFileBackup.restore(task_id, abs_paths, commit_spec)
-            if isinstance(commit_spec, dict):
-                base_desc = ",".join(f"{k or 'default'}:{v[:8]}" for k, v in commit_spec.items())
-            else:
-                base_desc = str(commit_spec)[:8]
-            logger.info(f"外部文件全量恢复 task#{task_id}: {restored} 个文件 from {base_desc}")
-            return restored
-        except Exception as e:
-            logger.warning(f"外部文件全量恢复失败 task#{task_id}: {e}", exc_info=True)
-            return 0
-
-    @staticmethod
-    def check_changes(
+    def _check_changes_local(
         task_id: int,
         file_paths: list[str],
         commit_hash: str | dict[str, str] | None = None,
     ) -> list[str]:
-        """检查外部文件是否有变化（🔧 按文件定位备份仓库，支持多仓库基线）
+        """检查外部文件是否有变化（🔧 按文件定位备份仓库，支持多仓库基线；本地执行）
 
         使用 git hash-object 逐文件比较 blob hash，不修改备份仓库工作树。
 
@@ -4005,12 +5070,12 @@ class ExternalFileBackup:
             return []
 
     @staticmethod
-    def restore(
+    def _restore_local(
         task_id: int,
         file_paths: list[str],
         commit_hash: str | dict[str, str] | None = None,
     ) -> int:
-        """从备份恢复外部文件（🔧 按文件定位备份仓库，支持多仓库基线）
+        """从备份恢复外部文件（🔧 按文件定位备份仓库，支持多仓库基线；本地执行）
 
         使用 `git show <commit>:<path>` 直接从指定 commit（默认 HEAD）读取文件内容，
         不修改备份仓库工作树，避免 undo 快照覆盖 HEAD 的问题。
@@ -4071,3 +5136,175 @@ class ExternalFileBackup:
         if isinstance(commit_spec, dict):
             return ",".join(f"{k or 'default'}:{str(v)[:8]}" for k, v in commit_spec.items())
         return str(commit_spec)[:8]
+
+    # ==================== 公开接口（本地/远程分派） ====================
+
+    @staticmethod
+    def backup(
+        task_id: int, file_paths: list[str], label: str = "",
+        nest_name: str | None = None,
+    ) -> str | dict[str, str] | None:
+        """备份外部文件（🔧 自动分派本地/远程nest端执行）
+
+        - 远程 nest 的 Windows 盘符路径 → nest 端同盘符根 \\.peng\\backups\\task#id
+          （避免跨盘符复制；peng 主服务在 Linux 时远程路径本地不可访问）
+        - 其余 → 本地仓库（默认 data / 本地Windows盘符仓库）
+
+        Returns:
+            仅默认仓库 → str；涉及盘符仓库 → dict {repo_key: commit}；失败 → None
+        """
+        if not file_paths:
+            return None
+        try:
+            local_files, remote_files = ExternalFileBackup._split_local_remote(
+                nest_name, file_paths
+            )
+            local_res = (
+                ExternalFileBackup._backup_local(task_id, local_files, label)
+                if local_files else None
+            )
+            remote_res = (
+                ExternalFileBackup._remote_backup(nest_name, task_id, remote_files, label)
+                if remote_files else None
+            )
+            return ExternalFileBackup._merge_commits(local_res, remote_res)
+        except Exception as e:
+            logger.warning(f"外部文件备份失败 task#{task_id}: {e}")
+        return None
+
+    @staticmethod
+    def check_changes(
+        task_id: int,
+        file_paths: list[str],
+        commit_hash: str | dict[str, str] | None = None,
+        nest_name: str | None = None,
+    ) -> list[str]:
+        """检查外部文件是否有变化（本地+远程nest分派，多仓库基线兼容 str|dict|None）"""
+        if not file_paths:
+            return []
+        local_files, remote_files = ExternalFileBackup._split_local_remote(
+            nest_name, file_paths
+        )
+        changed: list[str] = []
+        if local_files:
+            changed.extend(
+                ExternalFileBackup._check_changes_local(task_id, local_files, commit_hash)
+            )
+        if remote_files:
+            changed.extend(
+                ExternalFileBackup._remote_check_changes(
+                    nest_name, task_id, remote_files, commit_hash
+                )
+            )
+        return changed
+
+    @staticmethod
+    def restore(
+        task_id: int,
+        file_paths: list[str],
+        commit_hash: str | dict[str, str] | None = None,
+        nest_name: str | None = None,
+    ) -> int:
+        """从备份恢复外部文件（本地+远程nest分派，多仓库基线兼容 str|dict|None）"""
+        if not file_paths:
+            return 0
+        local_files, remote_files = ExternalFileBackup._split_local_remote(
+            nest_name, file_paths
+        )
+        restored = 0
+        if local_files:
+            restored += ExternalFileBackup._restore_local(task_id, local_files, commit_hash)
+        if remote_files:
+            restored += ExternalFileBackup._remote_restore(
+                nest_name, task_id, remote_files, commit_hash
+            )
+        logger.info(
+            f"外部文件恢复 task#{task_id}: {restored} 个文件 "
+            f"(from {ExternalFileBackup._baseline_desc(commit_hash)})"
+        )
+        return restored
+
+    @staticmethod
+    def get_all_heads(
+        task_id: int, nest_name: str | None = None
+    ) -> str | dict[str, str]:
+        """获取全部外部文件备份仓库的 HEAD（本地默认/本地盘符 + 远程nest盘符）
+
+        仅默认仓库有内容 → str（兼容旧 meta 格式）；涉及盘符仓库 → dict。
+        """
+        heads: dict[str, str] = {}
+        local = ExternalFileBackup._get_all_heads_local(task_id)
+        if isinstance(local, dict):
+            heads.update(local)
+        elif isinstance(local, str) and local:
+            heads[""] = local
+        if ExternalFileBackup._is_remote_nest(nest_name):
+            try:
+                heads.update(
+                    ExternalFileBackup._remote_get_drive_heads(nest_name, task_id)
+                )
+            except Exception as e:
+                logger.debug(f"外部文件基线: 远程盘符HEAD获取失败({nest_name}): {e}")
+        if not heads:
+            return ""
+        if set(heads.keys()) == {""}:
+            return heads[""]
+        return heads
+
+    @staticmethod
+    def list_baseline_files(
+        task_id: int, commit_spec: str | dict[str, str] | None,
+        nest_name: str | None = None,
+    ) -> list[str]:
+        """列出基线 commit 中备份的全部外部文件绝对路径（本地+远程nest合并）"""
+        if not commit_spec:
+            return []
+        abs_paths: list[str] = []
+        # 远程盘符 key 部分远程执行；其余（"" 与本地盘符）本地执行
+        if ExternalFileBackup._is_remote_nest(nest_name) and isinstance(commit_spec, dict):
+            abs_paths.extend(
+                ExternalFileBackup._remote_list_baseline(nest_name, task_id, commit_spec)
+            )
+            local_spec = {k: v for k, v in commit_spec.items() if not k}
+            if not local_spec:
+                return abs_paths
+            abs_paths.extend(
+                ExternalFileBackup._list_baseline_local(task_id, local_spec)
+            )
+            return abs_paths
+        return ExternalFileBackup._list_baseline_local(task_id, commit_spec)
+
+    @staticmethod
+    def restore_all(
+        task_id: int, commit_spec: str | dict[str, str] | None,
+        nest_name: str | None = None,
+        workdir: str = "",
+    ) -> int:
+        """从基线 commit 全量恢复所有外部文件（本地+远程nest分派）
+
+        🔧 workdir 提供时过滤基线文件集（git管理/系统路径不恢复——旧基线
+        含历史误备份数据的兜底）
+        """
+        if not commit_spec:
+            return 0
+        try:
+            abs_paths = ExternalFileBackup.list_baseline_files(
+                task_id, commit_spec, nest_name
+            )
+            if workdir:
+                abs_paths = ToolBackupManager._filter_baseline_files(
+                    abs_paths, workdir, nest_name
+                )
+            if not abs_paths:
+                return 0
+            restored = ExternalFileBackup.restore(
+                task_id, abs_paths, commit_spec, nest_name
+            )
+            logger.info(
+                f"外部文件全量恢复 task#{task_id}: {restored} 个文件 "
+                f"from {ExternalFileBackup._baseline_desc(commit_spec)}"
+            )
+            return restored
+        except Exception as e:
+            logger.warning(f"外部文件全量恢复失败 task#{task_id}: {e}", exc_info=True)
+            return 0

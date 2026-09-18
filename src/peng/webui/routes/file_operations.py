@@ -827,6 +827,9 @@ class FileRestoreResponse(BaseModel):
 class ToolRollbackRequest(BaseModel):
     """工具调用回退请求"""
     rollback_meta: dict
+    # 🔧 True=只回滚文件，跳过对话上下文(history)恢复
+    # （用户在确认框取消勾选"恢复对话上下文"时置true）
+    skip_context: bool = False
 
 
 class ToolRollbackResponse(BaseModel):
@@ -1571,6 +1574,17 @@ async def tool_rollback(request: ToolRollbackRequest) -> ToolRollbackResponse:
         if not rollback_meta:
             return ToolRollbackResponse(success=False, message="缺少回滚元数据")
 
+        # 🔧 用户取消勾选"恢复对话上下文"：置None——
+        # ToolBackupManager.rollback 内部的 history 恢复（rollback_meta.get("history_commit")）
+        # 与 _detect_rollback_changes 的 history 变更检测均读该字段，置None即自然跳过。
+        # 注：pydantic v2 构造时已对 dict 字段浅拷贝隔离（request.rollback_meta ≠ 调用方
+        # dict），此处再显式拷贝一次副本：不依赖 pydantic 版本实现细节，语义上明确
+        # "传给 rollback 的是去掉 history_commit 的视图，持久化 meta 不受影响"
+        if request.skip_context and rollback_meta.get("history_commit"):
+            rollback_meta = dict(rollback_meta)
+            rollback_meta["history_commit"] = None
+            logger.info("用户选择跳过对话上下文恢复，仅回滚文件")
+
         task_id = rollback_meta.get("task_id", 0)
 
         import asyncio
@@ -1692,7 +1706,7 @@ async def tool_rollback_preview(request: Request):
                     "message": "缺少回滚元数据"}
 
         file_task = asyncio.to_thread(
-            ToolBackupManager.preview_rollback_diff, rollback_meta
+            ToolBackupManager.preview_rollback_diff_with_external, rollback_meta
         )
 
         # checklist diff：仅快照包含 history_commit 时可计算（迭代/undo快照），

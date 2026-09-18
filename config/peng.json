@@ -7,7 +7,7 @@
     "data_dir": "data",
     "data_json_dir": "data/json",
     "messages_dir": "data",
-    "backups_dir": "~/backups",
+    "backups_dir": "data/backups",
     "config_dir": "config",
     "temp_dir": "data/temp",
     "logs_dir": "logs",
@@ -22,7 +22,7 @@
     "test_processes_db": "data/test_processes.db",
     "log_file": "logs/peng.log",
     "chat_history_file": "data/history/chat_history",
-    "changelog_file": "~/backups/CHANGELOG.md",
+    "changelog_file": "data/backups/CHANGELOG.md",
     "colors_json": "config/colors.json",
     "prompts_json": "config/prompts.jsonp",
     "webui_json": "config/webui.json",
@@ -31,7 +31,7 @@
     "failed_providers_json": "data/failed_providers.json",
     "input_history_json": "data/peng_input_history.json",
     "skill_md_name": "SKILL.md",
-    "postgresql_data_dir": "~/.db/postgresql",
+    "postgresql_data_dir": "data/postgresql",
     "fallback_postgresql_data_dir": "~/.db/postgresql",
     "_comment": "tool_call 允许读写的目录（相对于项目根目录）",
     "allowed_tool_call_dirs": [
@@ -58,7 +58,7 @@
   "monitor": {
     "inbox_monitor_interval": 0.5,
     "task_manager_check_interval": 300,
-    "default_heartbeat_timeout": 180,
+    "default_heartbeat_timeout": 300,
     "task_manager_prompt_name": "task_manager_prompt",
     "assistant_prompt_name": "assistant_prompt",
     "heartbeat_monitor_interval": 3,
@@ -114,7 +114,7 @@
     },
     "providers": {
       "z-glm5.3": {
-        "api_key": "",
+        "api_key": "your_key",
         "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
         "model": "glm-5.3",
         "small_model": "glm-5.3",
@@ -136,17 +136,16 @@
         "model": "glm-5.3-flash",
         "small_model": "glm-5.3-flash",
         "enable": true,
-        "compact_threshold": 512000,
         "thinking_dead_loop_threshold": 5,
         "vision": "yes",
         "icon": "🐱",
-        "price_input_hit": 0.2,
+        "price_input_hit": 0.23,
         "price_input_miss": 0.8,
         "price_output": 2.8,
         "priority": 98
       },
       "deepseek-pro": {
-        "api_key": "",
+        "api_key": "your_key",
         "base_url": "https://api.deepseek.com",
         "model": "deepseek-v4-pro",
         "small_model": "deepseek-v4-pro",
@@ -161,12 +160,16 @@
       },
       "deepseek-flash": {
         "clone": "deepseek-pro",
-        "model": "deepseek-v4-flash",
-        "small_model": "deepseek-v4-flash",
+        "model": "deepseek-flash",
+        "small_model": "deepseek-flash",
         "thinking_dead_loop_threshold": 5,
+        "vision": "yes",
+        "enable": false,
         "icon": "🐬",
         "priority": 86,
-        "enable": false
+        "price_input_hit": 0.02,
+        "price_input_miss": 1,
+        "price_output": 4
       },
       "s-qwen3.8": {
         "api_key": "dummy",
@@ -178,11 +181,13 @@
         "vision": "yes",
         "enable": false,
         "icon": "🐥",
-        "max_tokens": 36000,
-        "max_concurrent": 3,
+        "max_concurrent": 5,
         "thinking_overload_threshold": 32000,
-        "compact_threshold": 180000,
+        "compact_threshold": 192000,
         "priority": 90,
+        "price_input_hit": 0.08,
+        "price_input_miss": 1,
+        "price_output": 3,
         "thinking_dead_loop_threshold": 5,
         "content_dead_loop_threshold": 5,
         "overthinking_threshold": 3,
@@ -326,9 +331,9 @@
     ]
   },
   "channels": {
-    "enabled": true,
+    "enabled": false,
     "feishu": {
-      "enabled": true,
+      "enabled": false,
       "app_id": "",
       "app_secret": "",
       "verification_token": "",
@@ -336,7 +341,7 @@
       "bot_name": "鹏🐣"
     },
     "wechat": {
-      "enabled": true,
+      "enabled": false,
       "clawbot": {
         "bot_token": "",
         "base_url": "https://ilinkai.weixin.qq.com",

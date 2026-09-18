@@ -1453,9 +1453,10 @@ function handleRollbackLink(uri) {
     var addedFiles = rollbackMeta.added_files || [];
 
     // 弹出自定义确认框（禁止使用系统confirm）
-    showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, backupType, changedFiles, addedFiles, isUndo, function() {
+    // 🔧 skipContext：用户在确认框取消勾选"恢复对话上下文"时为true
+    showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, backupType, changedFiles, addedFiles, isUndo, function(skipContext) {
       // 用户确认后调用API
-      executeRollback(rollbackMeta);
+      executeRollback(rollbackMeta, skipContext);
     }, rollbackMeta);
   } catch (e) {
     console.error('[Rollback] 解析回滚链接失败:', e);
@@ -1492,8 +1493,9 @@ async function handleRollbackLinkById(metaId) {
     var changedFiles = rollbackMeta.changed_files || [];
     var addedFiles = rollbackMeta.added_files || [];
 
-    showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, backupType, changedFiles, addedFiles, isUndo, function() {
-      executeRollback(rollbackMeta);
+    // 🔧 skipContext：用户在确认框取消勾选"恢复对话上下文"时为true
+    showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, backupType, changedFiles, addedFiles, isUndo, function(skipContext) {
+      executeRollback(rollbackMeta, skipContext);
     }, rollbackMeta);
   } catch (e) {
     console.error('[Rollback] 获取回滚信息失败:', e);
@@ -1578,13 +1580,17 @@ function showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, bac
   if (isUndo) {
     ctxText = '对话上下文将恢复到回滚前时刻';
   } else if (isHistoryOnly) {
-    ctxText = '仅恢复对话上下文（不动文件），此后新对话将被模型遗忘';
+    // 🔧 与实际行为一致：非git workdir 迭代回滚恢复上下文+外部/非git管理文件
+    // （文件变更见下方异步预览），不能断言"不动文件"（与预览列表自相矛盾）
+    ctxText = '对话上下文恢复到快照时刻（快照之后的对话记录将被清除）；文件变更见下方预览，如有将一并恢复';
   } else if (hasHistory) {
-    ctxText = '回滚后对话上下文恢复到快照时刻，此后的新对话将被模型遗忘';
+    ctxText = '文件与对话上下文均恢复到快照时刻（快照之后的对话记录将被清除）';
   } else {
-    ctxText = '不影响对话上下文';
+    ctxText = '仅恢复文件，不影响对话上下文';
   }
   ctxColor = (isUndo || !hasHistory) ? '#8b949e' : (isHistoryOnly ? '#39c5cf' : '#f85149');
+  // 上下文是否可由用户选择（快照带history且非undo时显示checkbox）
+  var showCtxOption = hasHistory && !isUndo;
 
   headerEl.innerHTML = ''
     + '<div style="font-size:16px;font-weight:bold;margin-bottom:12px;color:' + accent + '">'
@@ -1597,7 +1603,8 @@ function showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, bac
     +   '</div>'
     +   '<div style="margin-bottom:8px">'
     +     '<span style="color:#8b949e">上下文：</span>'
-    +     '<span style="color:' + ctxColor + '">' + ctxText + '</span>'
+    // （🔧 id=rollback-ctx-desc：checkbox切换时动态改写——见绑定事件）
+    +     '<span id="rollback-ctx-desc" style="color:' + ctxColor + '">' + ctxText + '</span>'
     +   '</div>'
     +   (rollbackCmd
       ?   '<div style="margin-bottom:8px">'
@@ -1634,11 +1641,25 @@ function showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, bac
 
   var footerEl = document.createElement('div');
   // 上下文警示文案（与header的ctxText呼应，footer强调后果）
+  // 🔧 showCtxOption时不再断言上下文必然恢复——是否恢复由checkbox选项决定
+  //（checkbox文字已完整说明后果，此处重复会与"不勾选=不恢复"自相矛盾）
   var ctxWarn = '';
   if (isUndo) {
     ctxWarn = '对话上下文同时恢复到回滚前时刻。';
-  } else if (hasHistory) {
-    ctxWarn = '对话上下文也将恢复到快照时刻，快照后的新对话将被模型遗忘（可通过"撤销"找回）。';
+  }
+
+  // 上下文恢复选项（checkbox，默认勾选）：
+  // 快照带history且非undo时显示——用户可取消勾选实现"只回滚文件、保留当前对话记忆"
+  var ctxOptionHtml = '';
+  if (showCtxOption) {
+    ctxOptionHtml = ''
+      + '<div style="margin-top:12px;padding:8px 12px;background:rgba(210,153,34,0.08);border:1px solid rgba(210,153,34,0.25);border-radius:4px">'
+      +   '<label for="rollback-ctx-check" style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-size:var(--font-size-ui, 12px);line-height:1.5;color:' + text + '">'
+      +     '<input type="checkbox" id="rollback-ctx-check" checked style="margin-top:2px;accent-color:' + accent + ';cursor:pointer;flex-shrink:0">'
+      +     '<span>同时恢复对话上下文到快照时刻（快照之后的对话记录将被清除，可通过"撤销"找回）<br>'
+      +       '<span style="color:#8b949e">不勾选则仅回滚文件，保留当前对话记忆</span></span>'
+      +   '</label>'
+      + '</div>';
   }
   footerEl.innerHTML = ''
     + '<div style="margin-top:12px;padding:8px 12px;background:rgba(' + (isUndo ? '63,185,80' : '210,153,34') + ',0.1);border-radius:4px;font-size:var(--font-size-ui, 12px);color:' + (isUndo ? success : accent) + '">'
@@ -1647,6 +1668,7 @@ function showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, bac
       :   '⚠️ 将恢复到事务#' + taskId + ' @ ' + timestamp + ' 的快照。同期非本事务的变更将丢失，只能从其他事务的快照中找回。' + ctxWarn + '回滚后可通过"撤销"超链接恢复。')
     +   '</div>'
     + '</div>'
+    + ctxOptionHtml
     + '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">'
     +   '<button id="rollback-cancel-btn" style="padding:6px 16px;border:1px solid ' + border + ';background:transparent;color:' + text + ';border-radius:4px;cursor:pointer;font-size:var(--font-size-ui, 13px)">取消</button>'
     +   '<button id="rollback-ok-btn" style="padding:6px 16px;border:none;background:' + actionColor + ';color:#fff;border-radius:4px;cursor:pointer;font-size:var(--font-size-ui, 13px);font-weight:bold">确认' + actionLabel + '</button>'
@@ -1671,10 +1693,33 @@ function showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, bac
   });
 
   // 确认按钮
+  // 🔧 skipContext=用户取消勾选"恢复对话上下文"（无checkbox时undefined→false=默认恢复）
   document.getElementById('rollback-ok-btn').addEventListener('click', function() {
+    var ctxCheck = document.getElementById('rollback-ctx-check');
+    var skipContext = !!(ctxCheck && !ctxCheck.checked);
     overlay.remove();
-    if (onConfirm) onConfirm();
+    if (onConfirm) onConfirm(skipContext);
   });
+
+  // checkbox切换 → header上下文描述联动改写（与实际将执行的行为一致，防文案自相矛盾）
+  var ctxCheckEl = document.getElementById('rollback-ctx-check');
+  var ctxDescEl = document.getElementById('rollback-ctx-desc');
+  if (ctxCheckEl && ctxDescEl) {
+    ctxCheckEl.addEventListener('change', function() {
+      if (this.checked) {
+        // 勾选：恢复上下文（header恢复为初始ctxText/ctxColor）
+        ctxDescEl.textContent = ctxText;
+        ctxDescEl.style.color = ctxColor;
+      } else if (isHistoryOnly) {
+        // history_only快照无文件变更：跳过上下文=本次回滚无实际变化（后端将如实返回）
+        ctxDescEl.textContent = '保留当前对话记忆（不恢复上下文）——此快照无文件变更，本次回滚将无实际变化';
+        ctxDescEl.style.color = '#3fb950';
+      } else {
+        ctxDescEl.textContent = '仅恢复文件到快照时刻，保留当前对话记忆（不恢复上下文）';
+        ctxDescEl.style.color = '#3fb950';
+      }
+    });
+  }
 
   // 点击遮罩层取消
   overlay.addEventListener('click', function(e) {
@@ -1784,13 +1829,28 @@ async function loadRollbackDiffPreview(rollbackMeta, container) {
         if (data.truncated) {
           parts.push('<div style="color:' + YELLOW + ';margin-top:4px">⚠️ diff过长已截断，还有 ' + fmtBytes(data.truncated_bytes || 0) + ' 内容未显示，完整内容请查看备份分支</div>');
         }
-      } else if (data.message && data.message !== 'ok') {
-        // 无文件变更（如 history_only）或 diff生成失败的fallback说明
+      } else if (!(data.changed_files && data.changed_files.length) && data.message && data.message !== 'ok') {
+        // 无文件变更（diff与变更列表均空）的fallback说明
         parts.push('<div style="color:' + DIM + '">📄 工作目录文件：' + data.message + '</div>');
       }
     } else {
       // 文件diff不可用（history_only无文件快照、备份类型不支持、git错误等）
-      parts.push('<div style="color:' + DIM + '">📄 工作目录文件：' + (data.message || 'diff预览不可用') + '</div>');
+      if (!(data.changed_files && data.changed_files.length)) {
+        parts.push('<div style="color:' + DIM + '">📄 工作目录文件：' + (data.message || 'diff预览不可用') + '</div>');
+      }
+    }
+
+    // 3. 🔧 变更文件列表区块（diff 为空但有 changed_files 时渲染——
+    //    external/非git管理文件的变更（备份仓库基线对比）无 diff 文本，只有列表）
+    if (!data.diff && data.changed_files && data.changed_files.length) {
+      hasFileDiff = true;
+      parts.push('<div style="color:#39c5cf;margin:' + (hasChecklistDiff ? '8px' : '2px') + ' 0 1px">📁 变更文件（' + data.changed_files.length + '，回滚将恢复到快照版本）：</div>');
+      parts.push(data.changed_files.slice(0, 50).map(function(f) {
+        return '<div style="font-size:var(--font-size-ui,12px);color:#c9d1d9;padding:1px 0 1px 12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="' + String(f).replace(/"/g, '&quot;') + '">• ' + String(f).replace(/</g, '&lt;') + '</div>';
+      }).join(''));
+      if (data.changed_files.length > 50) {
+        parts.push('<div style="font-size:var(--font-size-ui,12px);color:' + DIM + ';padding:1px 0 1px 12px">... 共 ' + data.changed_files.length + ' 个文件</div>');
+      }
     }
 
     if (parts.length) {
@@ -1821,15 +1881,17 @@ async function loadRollbackDiffPreview(rollbackMeta, container) {
 /**
  * 调用API执行回滚
  * @param {object} rollbackMeta - 回滚元数据
+ * @param {boolean} [skipContext] - true=只回滚文件，跳过对话上下文(history)恢复
+ *   （用户在确认框取消勾选"恢复对话上下文"时传入）
  */
-async function executeRollback(rollbackMeta) {
+async function executeRollback(rollbackMeta, skipContext) {
   try {
     showSimpleToast('⏳ 正在执行回滚...', 'info');
 
     var response = await fetch('/api/tool-rollback', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rollback_meta: rollbackMeta })
+      body: JSON.stringify({ rollback_meta: rollbackMeta, skip_context: !!skipContext })
     });
 
     var data = await response.json();

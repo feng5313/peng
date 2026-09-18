@@ -87,22 +87,11 @@ async def _lifespan(app: FastAPI):
     logger.info("✅ 文件变化监测已启动")
 
     # 初始化Channel消息通道系统（微信/飞书等）
+    # 注意：load_config() 已合并 data/peng.json 覆盖层（deep merge），
+    # channels.enabled 等配置以 data 目录覆盖层为准
     try:
         peng_config = load_config()
-        channels_config = peng_config.channels if hasattr(peng_config, 'channels') else {}
-        if not channels_config:
-            # 尝试从原始配置字典获取
-            try:
-                import json
-                config_path = peng_config.paths.config_dir if hasattr(peng_config, 'paths') else "config"
-                from pathlib import Path
-                config_file = Path(config_path) / "peng.json"
-                if config_file.exists():
-                    with open(config_file, 'r', encoding='utf-8') as f:
-                        raw_config = json.load(f)
-                    channels_config = raw_config.get("channels", {})
-            except Exception:
-                channels_config = {}
+        channels_config = peng_config.channels
 
         if channels_config.get("enabled", False):
             from peng.channels.integration import init_channel_system
@@ -277,6 +266,7 @@ def create_app() -> FastAPI:
     from .routes.system import router as system_router
     from .routes.profile import router as profile_router
     from .routes.snapshots import router as snapshots_router
+    from .routes.undelete import router as undelete_router
     from .routes.nest_routes import router as nest_router
     from .routes.lsp_routes import router as lsp_router
 
@@ -289,6 +279,7 @@ def create_app() -> FastAPI:
     app.include_router(system_router, prefix="/api")
     app.include_router(profile_router, prefix="/api")
     app.include_router(snapshots_router, prefix="/api")
+    app.include_router(undelete_router, prefix="/api")  # 🔧 Task#1893：撤销删除恢复
     app.include_router(nest_router, prefix="/api")
     app.include_router(lsp_router, prefix="/api")
 

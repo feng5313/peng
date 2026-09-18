@@ -207,6 +207,12 @@ class ThroughputTracker:
                 tps = completion_tokens / duration_seconds
                 # 直接设置当前吞吐率（不经过EWMA平滑，因为是单次请求的精确值）
                 state["rate"] = round(tps, 1)
+                # 🔧 事务#1891：重置累计器，避免下一个请求的区间速率计算包含残留token
+                # 问题：record() 持续累加 accumulated_tokens，record_usage() 直接覆盖 rate
+                # 但不重置累计器，导致下一个请求的 interval_rate = (残留token + 新token) / dt 虚高
+                state["accumulated_tokens"] = 0.0
+                state["last_calc_time"] = time.time()
+                state["first_sample"] = True  # 下一个请求首次采样直接使用区间速率
                 logger.debug(
                     f"[ThroughputTracker] record_usage: provider={provider}, "
                     f"completion_tokens={completion_tokens}, duration={duration_seconds:.2f}s, tps={tps:.1f}"

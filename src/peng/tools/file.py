@@ -759,9 +759,7 @@ _EXTRA_IMAGE_EXTENSIONS = {".webp", ".ico", ".tiff", ".tif", ".avif", ".heic", "
 # 图片 MIME 白名单。BMP/TIFF/ICO/AVIF/HEIC 等不在其中——GLM 对 BMP 返回
 # 400"图片输入格式/解析错误"（事务#1822：1400x700 截图 BMP 像素≤1M 原样
 # 透传触发），故非白名单格式进入上下文前必须统一转码 PNG（无损）
-PROVIDER_SAFE_IMAGE_MIMES = frozenset(
-    {"image/jpeg", "image/png", "image/gif", "image/webp"}
-)
+PROVIDER_SAFE_IMAGE_MIMES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
 
 
 def normalize_image_bytes(data: bytes, mime: str) -> tuple[bytes, str, str]:
@@ -882,11 +880,15 @@ def _build_binary_attachment(file_path: str, b64_data: str, mime: str) -> DualOu
             ):
                 # PIL 不识别该格式（可能缺解码插件）：无法本地验证，
                 # 保留原始数据（provider 端可能支持）
-                logger.warning(f"read 图片格式无法本地验证(PIL不识别)，保留原始数据: {file_path}: {e}")
+                logger.warning(
+                    f"read 图片格式无法本地验证(PIL不识别)，保留原始数据: {file_path}: {e}"
+                )
                 note = ""
             else:
                 # 可识别格式但解码失败（截断/损坏）：拒绝入库，防止污染上下文
-                logger.warning(f"read 图片解码失败(文件可能损坏)，拒绝作为附件返回: {file_path}: {e}")
+                logger.warning(
+                    f"read 图片解码失败(文件可能损坏)，拒绝作为附件返回: {file_path}: {e}"
+                )
                 msg = f"{kind} 读取失败: 文件损坏或格式异常（无法解码），请检查源文件或重新生成"
                 return DualOutput(
                     summary=msg,
@@ -902,6 +904,92 @@ def _build_binary_attachment(file_path: str, b64_data: str, mime: str) -> DualOu
         display=f"📄 {msg}: {file_path}",
         attachments=[{"type": "file", "mime": mime, "url": data_url}],
     )
+
+
+# ============================================================
+# 目录条目格式化 - read 工具读取目录时输出友好文本
+# ============================================================
+
+# 🔧 事务#1887: 单次目录列表最大条目数——防超大目录(如 node_modules 万级条目)
+# 撑爆 LLM 上下文；超出部分截断并提示用 glob 精确查找
+MAX_DIR_ENTRIES = 500
+
+_DIR_ENTRY_META_SEP = "  "  # 名称与元信息之间的分隔
+
+
+def format_size_human(size: int | float | None) -> str | None:
+    """字节大小转人类可读格式（B/KB/MB/GB/TB）。None/负数返回 None"""
+    if size is None or size < 0:
+        return None
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{int(value)} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return None  # pragma: no cover（循环内已返回）
+
+
+def format_mtime_human(mtime: float | int | None) -> str | None:
+    """时间戳转 YYYY-MM-DD HH:MM（本地时区）。None/异常返回 None"""
+    if mtime is None:
+        return None
+    try:
+        from datetime import datetime
+
+        return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+    except (OSError, ValueError, OverflowError):
+        return None
+
+
+def _format_dir_entry(entry: Any) -> str:
+    """目录条目转输出行。
+
+    支持两种格式（与 webui file_operations.py 的双格式兼容一致，
+    防御远端 nest 版本未同步到 dict 格式的情况）：
+    - 新格式 dict: {"name", "is_dir", "size", "mtime"}（见 nest/local.py _read_directory）
+      → 子目录 `name/`（尾部 /），文件 `name  (大小, 修改时间)`（元信息缺失时省略）
+    - 旧格式 str: 原样返回（已带 / 尾部）
+    """
+    if isinstance(entry, dict):
+        name = entry.get("name") or ""
+        if not name:
+            return ""
+        if entry.get("is_dir"):
+            return f"{name}/"
+        parts = []
+        size_str = format_size_human(entry.get("size"))
+        if size_str:
+            parts.append(size_str)
+        mtime_str = format_mtime_human(entry.get("mtime"))
+        if mtime_str:
+            parts.append(mtime_str)
+        return f"{name}{_DIR_ENTRY_META_SEP}({', '.join(parts)})" if parts else name
+    return str(entry)
+
+
+def _build_directory_output(display_path: str, entries: list[Any]) -> str:
+    """构建目录列表输出（via_nest 与本地 fallback 两条路径共用，保证格式一致）。
+
+    超过 MAX_DIR_ENTRIES 截断，防止超大目录撑爆 LLM 上下文。
+    """
+    entry_lines = [ln for ln in (_format_dir_entry(e) for e in entries) if ln]
+    output_parts = [
+        f"<path>{display_path}</path>",
+        "<type>directory</type>",
+        "<entries>",
+    ]
+    shown = entry_lines[:MAX_DIR_ENTRIES]
+    output_parts.extend(shown)
+    total = len(entry_lines)
+    if total > MAX_DIR_ENTRIES:
+        output_parts.append(
+            f"\n(共 {total} 个条目，仅显示前 {MAX_DIR_ENTRIES} 个；"
+            f"请使用 glob 工具通过模式精确查找)"
+        )
+    else:
+        output_parts.append(f"\n(共 {total} 个条目)")
+    output_parts.append("</entries>")
+    return "\n".join(output_parts)
 
 
 # ============================================================
@@ -948,7 +1036,7 @@ READ_DESCRIPTION = """从远程 nest 读取文件或目录。如果路径不存�
 - 要读取后面的部分，请使用更大的 offset 再次调用此工具。
 - 使用 grep 工具在大型文件或长行文件中查找特定内容。
 - 如果不确定正确的文件路径，请使用 glob 工具通过 glob 模式查找文件名。
-- 返回的每行内容都带有行号前缀 `<line>: <content>`。例如，如果文件内容为 "foo\\n"，您将收到 "1: foo\\n"。对于目录，条目每行返回一个（不带行号），子目录带有尾部 `/`。
+- 返回的每行内容都带有行号前缀 `<line>: <content>`。例如，如果文件内容为 "foo\\n"，您将收到 "1: foo\\n"。对于目录，非递归列出条目（每行一个，不带行号），子目录带有尾部 `/`，文件附大小和修改时间；超过 500 个条目时截断（请用 glob 模式精确查找）。
 - 超过 2000 个字符的行会被截断。
 - 当您知道要读取多个文件时，请并行调用此工具。
 - 避免重复的小切片（30 行块）。如果需要更多上下文，请读取更大的窗口。
@@ -1067,17 +1155,15 @@ class ReadTool(Tool):
             result = await client.read(file_path, offset, limit)
 
             if result.get("type") == "directory":
-                entries = result.get("entries", [])
-                output_parts = [
-                    f"<path>{result.get('path', file_path)}</path>",
-                    "<type>directory</type>",
-                    "<entries>",
-                ]
-                output_parts.extend(entries)
-                output_parts.append(f"\n(共 {len(entries)} 个条目)")
-                output_parts.append("</entries>")
-                output = "\n".join(output_parts)
-                return DualOutput(summary=output, display=output)
+                # 🔧 事务#1887: entries 为 dict{name,is_dir,size,mtime} 列表
+                # （见 nest/local.py _read_directory），此前误当 str 列表直接 join
+                # 导致 "sequence item 3: expected str instance, dict found"
+                return DualOutput(
+                    summary=_build_directory_output(
+                        result.get("path", file_path), result.get("entries", [])
+                    ),
+                    display=None,
+                )
 
             if result.get("type") == "binary":
                 # 二进制文件（图片/PDF）；图片缩放到 1M 像素以内（不修改原图）
@@ -1127,20 +1213,24 @@ class ReadTool(Tool):
             )
 
         if path.is_dir():
+            # 🔧 事务#1887: 与 via_nest 路径统一——收集 stat 元信息(size/mtime)
+            # 并复用 _build_directory_output，两条路径输出格式完全一致
             entries = []
             for entry in sorted(path.iterdir(), key=lambda x: x.name):
-                suffix = "/" if entry.is_dir() else ""
-                entries.append(f"{entry.name}{suffix}")
-            output_parts = [
-                f"<path>{path}</path>",
-                "<type>directory</type>",
-                "<entries>",
-            ]
-            output_parts.extend(entries)
-            output_parts.append(f"\n(共 {len(entries)} 个条目)")
-            output_parts.append("</entries>")
-            output = "\n".join(output_parts)
-            return DualOutput(summary=output, display=output)
+                is_dir = entry.is_dir()
+                try:
+                    stat = entry.stat()
+                    entry_info = {
+                        "name": entry.name,
+                        "is_dir": is_dir,
+                        "size": None if is_dir else stat.st_size,
+                        "mtime": stat.st_mtime,
+                    }
+                except (OSError, ValueError):
+                    entry_info = {"name": entry.name, "is_dir": is_dir, "size": None, "mtime": None}
+                entries.append(entry_info)
+            output = _build_directory_output(str(path), entries)
+            return DualOutput(summary=output, display=None)
 
         # 图片/PDF：作为附件返回（图片缩放到 1M 像素以内，不修改原图）
         mime = get_mime_type(str(path))
@@ -1215,7 +1305,9 @@ WRITE_DESCRIPTION = """向远程 nest 写入文件。
 - 始终优先编辑代码库中的现有文件。除非明确要求，否则不要写入新文件。
 - 绝不要主动创建文档文件（*.md）或 README 文件。仅在用户明确要求时才创建文档文件。
 - 仅在用户明确要求时才使用表情符号。除非被要求，否则避免将表情符号写入文件。
-- ⚠️ 写入文件必须说明目的（purpose参数），要简明扼要（4-200个字符），否则将被拒绝执行！"""
+- ⚠️ 写入文件必须说明目的（purpose参数），要简明扼要（4-200个字符），否则将被拒绝执行！
+- ⚠️ 编辑代码必须使用 edit/line_edit/write工具，禁止用脚本、管道等间接方式修改代码！
+"""
 
 
 class WriteTool(Tool):
@@ -1409,6 +1501,7 @@ EDIT_DESCRIPTION = """在文件中执行精确字符串替换。
 - 使用 `replaceAll` 替换和重命名文件中的字符串。如果您想重命名变量，此参数很有用。
 - 如果报错oldString匹配问题，可尝试使用line_edit行编辑工具，用行号精确指定编辑范围。
 - ⚠️ 编辑文件必须说明目的（purpose参数），要简明扼要（4-200个字符），否则将被拒绝执行！
+- ⚠️ 编辑代码必须使用 edit/line_edit/write工具，禁止用脚本、管道等间接方式修改代码！
 """
 
 
@@ -1636,7 +1729,9 @@ LINE_EDIT_DESCRIPTION = """按行号编辑文件：删除指定行范围、替�
 - ⚠️ 重要：每次 line_edit 操作会改变文件行数，后续操作的行号会偏移！
   返回结果中的"编辑后行号预览"显示了编辑点附近的最新行号，务必参考此预览确定下一次操作的行号。
   如果不确定当前行号，请先用 read 工具重新读取文件确认。
-- ⚠️ 行编辑必须说明目的（purpose参数），要简明扼要（4-200个字符），否则将被拒绝执行！"""
+- ⚠️ 行编辑必须说明目的（purpose参数），要简明扼要（4-200个字符），否则将被拒绝执行！
+- ⚠️ 编辑代码必须使用 edit/line_edit/write工具，禁止用脚本、管道等间接方式修改代码！
+"""
 
 
 def _build_local_context(

@@ -294,6 +294,12 @@ async def move_task(task_id: int, request: MoveTaskRequest) -> dict[str, Any]:
     """移动事务到新的父事务下或变成树根"""
     task_manager = TaskManager()
     try:
+        # 🔧 Task#1893：移动前记录原父事务ID（供前端撤销）
+        previous_parent_task_id = None
+        task_before = task_manager.get_task(task_id)
+        if task_before:
+            previous_parent_task_id = task_before.get("parent_task_id")
+
         success = task_manager.db.move_task(task_id=task_id, target_id=request.target_id)
         if not success:
             raise HTTPException(status_code=400, detail=f"事务 {task_id} 移动失败，请检查事务状态")
@@ -303,7 +309,12 @@ async def move_task(task_id: int, request: MoveTaskRequest) -> dict[str, Any]:
         from ..websocket import broadcast_task_update
         await broadcast_task_update(task_id, "moved")
 
-        return {"success": True, "message": "事务移动成功", "task": task}
+        return {
+            "success": True,
+            "message": "事务移动成功",
+            "task": task,
+            "previous_parent_task_id": previous_parent_task_id,  # 🔧 Task#1893
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -324,12 +335,22 @@ async def delete_task(task_id: int) -> dict[str, Any]:
         if not task.get("parent_task_id"):
             raise HTTPException(status_code=400, detail="树根事务不可删除")
 
+        # 🔧 Task#1893：删除前备份快照（供撤销删除恢复，失败不阻塞删除）
+        from .undelete import backup_for_delete
+
+        backup_file = await asyncio.to_thread(backup_for_delete, "task", task_id)
+
         deleted_count = task_manager.db.delete_task_recursive(task_id)
 
         from ..websocket import broadcast_task_update
         await broadcast_task_update(task_id, "deleted")
 
-        return {"success": True, "message": f"事务已删除，共 {deleted_count} 个事务", "deleted_count": deleted_count}
+        return {
+            "success": True,
+            "message": f"事务已删除，共 {deleted_count} 个事务",
+            "deleted_count": deleted_count,
+            "backup_file": backup_file,  # 🔧 Task#1893：撤销删除凭据
+        }
     except HTTPException:
         raise
     except Exception as e:

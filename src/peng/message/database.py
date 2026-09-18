@@ -3040,7 +3040,8 @@ class MessageDatabase(metaclass=MetaSingleton):
                 if target_id in descendant_ids:
                     # 目标为子孙时，只交换content
                     content = msg.get("content")
-                    self.update_message(msg_id, content=target_parent.get("content"))
+                    target_content = target_parent.get("content")
+                    self.update_message(msg_id, content=target_content)
                     self.update_message(target_id, content=content)
                     # Bug #6修复：交换content后，重建链首的chain_context
                     original_chain_head_id = msg.get("chain_head_id")
@@ -3050,6 +3051,13 @@ class MessageDatabase(metaclass=MetaSingleton):
                         "success": True,
                         "message": f"目标消息#{target_id}为消息#{msg_id}的子孙消息，执行交换文本操作。",
                         "msg_id": msg_id,
+                        # 🔧 Task#1893：撤销/重做支持——记录交换双方与旧内容（再交换一次即撤销）
+                        "swapped": True,
+                        "swap_ids": [msg_id, target_id],
+                        "swap_old_contents": {
+                            str(msg_id): content,
+                            str(target_id): target_content,
+                        },
                     }
                 chain_head_id = target_parent.get("chain_head_id")
                 # Bug #1/#2修复：记录原链首ID，用于后续更新原消息树
@@ -3107,6 +3115,9 @@ class MessageDatabase(metaclass=MetaSingleton):
                     "success": True,
                     "message": f"消息#{msg_id}变为消息#{target_id}的分支消息。",
                     "msg_id": msg_id,
+                    # 🔧 Task#1893：撤销/重做支持——记录移动前的父消息ID
+                    "swapped": False,
+                    "previous_reply_to": original_reply_to,
                 }
             elif not original_reply_to:
                 # 根消息拖拽到空隙或者鹏🐣-忠实助手，无效操作
@@ -3124,7 +3135,14 @@ class MessageDatabase(metaclass=MetaSingleton):
                     f"[move_message] 拖拽到空隙，消息#{msg_id}变成树根，有{len(descendant_ids)}个子孙消息: {descendant_ids}"
                 )
                 self.build_context_history(msg_id)
-                return {"success": True, "message": f"消息#{msg_id}变为根消息。", "msg_id": msg_id}
+                return {
+                    "success": True,
+                    "message": f"消息#{msg_id}变为根消息。",
+                    "msg_id": msg_id,
+                    # 🔧 Task#1893：撤销/重做支持——记录移动前的父消息ID
+                    "swapped": False,
+                    "previous_reply_to": original_reply_to,
+                }
         except Exception as e:
             logger.error(f"[move_message] ❌ 移动消息失败: {e} {traceback.format_exc()}")
             return {"success": False, "message": f"移动消息失败: {e}", "msg_id": msg_id}

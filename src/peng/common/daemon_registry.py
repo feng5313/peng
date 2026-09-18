@@ -48,6 +48,11 @@ logger = logging.getLogger(__name__)
 
 _DAEMON_FILE_NAME = "daemon.json"
 
+# daemon退出码标记：包装命令在daemon进程结束时把退出码以
+# "{EXIT_CODE_MARKER}=<exit_code>" 形式追加写入日志文件尾部，
+# 供 daemon 退出检测（watcher）解析实际返回值
+EXIT_CODE_MARKER = "DAEMON_EXIT_CODE"
+
 
 def normalize_nest(nest: Any) -> str | None:
     """归一化nest名称：local/空/None → None（表示本地进程）"""
@@ -689,16 +694,69 @@ def _log_paths(workdir: str | Path | None, daemon_id: str) -> tuple[str, str]:
     return log_dir, log_file
 
 
-def _build_windows_daemon_bat(command: str, workdir: str | None, log_file: str) -> str:
-    """构建Windows daemon启动bat内容
+def _build_windows_daemon_bats(
+    command: str, workdir: str | None, log_file: str, inner_bat_file: str
+) -> tuple[str, str]:
+    """构建Windows daemon的outer/inner两个bat内容
 
-    daemon命令包装进bat文件，启动器只需引用bat路径（规避引号转义）。
+    用户命令不内联到outer的命令行（cmd引号规则无法任意嵌套：内联命令
+    含引号+管道/&&时被宿主cmd错误解析），而是原样写入inner.bat独立执行：
+
+    - inner（daemon_<id>_cmd.bat）: 用户命令原样写入（任意引号/管道/
+      &&/exit无需转义），独立子cmd执行——exit只退inner宿主、退出码透传
+    - outer（daemon_<id>.bat）: chcp 65001（UTF-8解析bat，中文命令可读）
+      + 调inner（重定向日志）+ 捕获ERRORLEVEL写标记行（用户exit不影响，
+      标记行必定执行）；">>"前保留空格（防"1>>"句柄歧义）；标记行前
+      echo.空行（防程序末行无换行粘连）
+
+    Returns:
+        (outer_bat内容, inner_bat内容)
     """
-    lines = ["@echo off"]
+    inner = f"@echo off\r\n{command}\r\n"
+    lines = ["@echo off", "chcp 65001 >nul"]
     if workdir:
         lines.append(f'cd /d "{workdir}"')
-    lines.append(f'{command} >> "{log_file}" 2>&1')
-    return "\r\n".join(lines) + "\r\n"
+    lines.append(f'cmd /s /c "{inner_bat_file}" >> "{log_file}" 2>&1')
+    lines.append(f'echo.>> "{log_file}"')
+    lines.append(f'echo {EXIT_CODE_MARKER}=%ERRORLEVEL% >> "{log_file}"')
+    outer = "\r\n".join(lines) + "\r\n"
+    return outer, inner
+
+
+def wrap_command_with_exit_code(command: str, log_file: str) -> str:
+    """Unix daemon命令包装：命令结束后把退出码写入日志尾部（供退出watcher解析）
+
+    用户命令作为子bash执行（隔离用户命令中的exit/多行/控制结构），
+    外层bash捕获其退出码后追加标记行，再以相同退出码退出
+    （daemon PID即外层bash，killpg整组杀不受影响）。
+
+    注意：
+    - printf格式串前导\\n：用户命令末行无换行时（如部分程序print无\\n），
+      防止标记行与末行输出粘连（预览可读性）；末行已有换行则多一空行，无害
+    - %s接变量而非内插到格式串（防退出码数值被printf解释为格式符）
+    """
+    import shlex
+
+    q_log = shlex.quote(log_file)
+    return (
+        f"bash -c {shlex.quote(command)}\n"
+        f"__peng_ec=$?\n"
+        f"printf '\\n{EXIT_CODE_MARKER}=%s\\n' \"$__peng_ec\" >> {q_log}\n"
+        f"exit $__peng_ec"
+    )
+
+
+def parse_exit_code(log_tail: str) -> int | None:
+    """从日志文本解析daemon退出码（取最后一次出现的标记行）
+
+    Args:
+        log_tail: 日志文本（通常为文件尾部片段）
+
+    Returns:
+        退出码；无标记时返回None
+    """
+    matches = re.findall(rf"{EXIT_CODE_MARKER}=(\-?\d+)", log_tail or "")
+    return int(matches[-1]) if matches else None
 
 
 def _build_windows_start_ps(bat_file: str) -> str:
@@ -750,10 +808,12 @@ def start_local_daemon(
 
     if sys.platform == "win32":
         bat_file = Path(log_dir) / f"daemon_{daemon_id}.bat"
-        bat_file.write_text(
-            _build_windows_daemon_bat(command, str(workdir) if workdir else None, log_file),
-            encoding="utf-8",
+        inner_file = Path(log_dir) / f"daemon_{daemon_id}_cmd.bat"
+        outer, inner = _build_windows_daemon_bats(
+            command, str(workdir) if workdir else None, log_file, str(inner_file)
         )
+        inner_file.write_text(inner, encoding="utf-8")
+        bat_file.write_text(outer, encoding="utf-8")
         # PowerShell Start-Process（wmic在Win11 24H2+已移除）
         # list形式传参：无cmd引号转义问题
         result = subprocess.run(
@@ -773,7 +833,7 @@ def start_local_daemon(
             )
         pid = int(m.group(1))
     else:
-        inner = shlex.quote(command)
+        inner = shlex.quote(wrap_command_with_exit_code(command, log_file))
         # setsid使daemon自成会话首进程（非交互shell下$!即最终PID）
         start_cmd = (
             f"setsid nohup bash -c {inner} >> {shlex.quote(log_file)} 2>&1 < /dev/null & "
@@ -849,16 +909,19 @@ async def start_remote_daemon(
     import shlex
 
     if is_windows or (platform or "").lower().startswith("win"):
-        # Windows远程：bat包装daemon命令（经nest write_file写bat），
-        # PowerShell Start-Process启动（wmic在Win11 24H2+已移除，PowerShell全版本可用）
+        # Windows远程：用户命令原样写入inner.bat（零转义），outer.bat调用并
+        # 捕获退出码（经nest write_file写bat），PowerShell Start-Process启动
+        # （wmic在Win11 24H2+已移除，PowerShell全版本可用）
         wd = workdir or "%CD%"
         log_dir = f"{wd}\\.peng\\daemon"
         log_file = f"{log_dir}\\daemon_{daemon_id}.log"
         bat_file = f"{log_dir}\\daemon_{daemon_id}.bat"
+        inner_file = f"{log_dir}\\daemon_{daemon_id}_cmd.bat"
 
-        bat_content = _build_windows_daemon_bat(command, workdir, log_file)
+        outer, inner = _build_windows_daemon_bats(command, workdir, log_file, inner_file)
         try:
-            await client.write_file(bat_file, bat_content)
+            await client.write_file(inner_file, inner)
+            await client.write_file(bat_file, outer)
         except Exception as e:
             from peng.tools.base import ToolError
 
@@ -883,7 +946,11 @@ async def start_remote_daemon(
     wd = workdir or "."
     log_dir = f"{wd}/.peng/daemon"
     log_file = f"{log_dir}/daemon_{daemon_id}.log"
-    daemon_cmd = f"nohup bash -c {shlex.quote(command)} >> {shlex.quote(log_file)} 2>&1 < /dev/null"
+    daemon_cmd = (
+        f"nohup bash -c "
+        f"{shlex.quote(wrap_command_with_exit_code(command, log_file))} "
+        f">> {shlex.quote(log_file)} 2>&1 < /dev/null"
+    )
     if platform and "linux" in platform.lower():
         # Linux: setsid使daemon成为会话首进程（非交互shell下$!即最终PID），可killpg整组杀
         # ⚠️ 用分号分隔mkdir（不能用&&）：&的优先级会使整个AND列表成为后台作业，
@@ -912,3 +979,186 @@ async def start_remote_daemon(
             f"{result.get('stderr', '')[:200]}"
         )
     return int(m.group(1)), log_file
+
+
+# ============================================================
+# daemon退出检测辅助（daemon工具watcher使用）
+# ============================================================
+
+_LOG_TAIL_BYTES = 4096  # 日志尾部读取字节数（足够包含退出码标记行）
+
+# ANSI转义序列清理正则：CSI序列（\x1b[...字母，含光标移动/SGR/擦除）、
+# OSC序列（\x1b]...\x07或\x1b\\，如超链接）、单字符转义（\x1bM等）
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|\x1b[@-Z\\-_]"
+)
+# 除\n\t外的C0控制字符（\r单独预处理：进度条场景保留每段末状态）
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def _decode_log_tail(data: bytes, drop_first_line: bool = False) -> str:
+    """daemon日志尾部字节块→干净文本（多编码探测+清理）
+
+    处理三重乱码/污染源（事务#1909实测）：
+    1. 编码不确定：程序日志可能UTF-8（Unix/现代程序）或GBK（中文Windows程序），
+       探测顺序 utf-8 strict → gbk strict → utf-8 replace 兜底（与nest端
+       _decode_output同思路）
+    2. 尾部切割碎字符：从文件中间切割时首行可能被切碎多字节字符/截断半行，
+       由调用方传drop_first_line=True丢弃首行（退出码标记行在文件最末不受影响；
+       文件小于读取窗口时块即全文，首行是真实内容不能丢）
+    3. 终端污染：ANSI转义序列（颜色/光标）与控制字符清理；
+       \\r为进度条回刷→按\\n分段（每段即该行最终状态）
+
+    Args:
+        data: 日志文件尾部原始字节块
+        drop_first_line: 块首行是否为切割碎行（offset>0时True）
+
+    Returns:
+        清理后的文本；空字节返回空字符串
+    """
+    if not data:
+        return ""
+    # 探测编码（strict失败逐级降级；latin-1永不失败但二进制无意义，不入列）
+    text: str | None = None
+    for encoding in ("utf-8", "gbk"):
+        try:
+            text = data.decode(encoding)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if text is None:
+        text = data.decode("utf-8", errors="replace")
+
+    # \r回刷→\n（进度条多帧分段，预览取尾部行自然保留最终状态）
+    text = text.replace("\r", "\n")
+    # 丢弃碎首行（仅中间切割时）
+    if drop_first_line:
+        first_nl = text.find("\n")
+        if first_nl >= 0:
+            text = text[first_nl + 1 :]
+    # 清理ANSI转义序列与控制字符
+    text = _ANSI_ESCAPE_RE.sub("", text)
+    text = _CONTROL_CHARS_RE.sub("", text)
+    return text
+
+
+def read_local_log_tail(log_file: str, max_bytes: int = _LOG_TAIL_BYTES) -> str:
+    """读取本地日志文件尾部并解码为干净文本（多编码探测，见_decode_log_tail）
+
+    Returns:
+        尾部文本；读取失败返回空字符串
+    """
+    try:
+        with open(log_file, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            offset = max(0, size - max_bytes)
+            f.seek(offset)
+            return _decode_log_tail(f.read(), drop_first_line=offset > 0)
+    except OSError as e:
+        logger.debug(f"读取日志尾部失败({log_file}): {e}")
+        return ""
+
+
+async def check_daemon_alive(entry: dict[str, Any]) -> bool | None:
+    """检查daemon进程是否存活
+
+    - 本地(nest=None): process_exists 直查
+    - 远程: 经nest执行批量存活检查命令（复用_build_remote_check_command）
+
+    Args:
+        entry: daemon注册表条目
+
+    Returns:
+        True=存活 False=已退出 None=远程查询失败（保守视为存活）
+    """
+    from peng.common.platform import process_exists
+
+    nest_name = normalize_nest(entry.get("nest"))
+    pid = int(entry.get("pid") or 0)
+    if pid <= 0:
+        return False
+    if nest_name is None:
+        return process_exists(pid)
+
+    from peng.nest.client import bash as nest_bash
+
+    cmd = _build_remote_check_command([pid], entry.get("platform"))
+    try:
+        resp = await nest_bash(command=cmd, timeout=15000, nest_name=nest_name)
+        if resp.error:
+            logger.debug(f"远程daemon存活检查失败({nest_name}): {resp.error}")
+            return None
+        return pid in _parse_alive_pids((resp.data or {}).get("stdout", ""))
+    except Exception as e:
+        logger.debug(f"远程daemon存活检查异常({nest_name}): {e}")
+        return None
+
+
+async def _read_remote_log_tail(nest_name: str, log_file: str) -> tuple[bytes, bool]:
+    """经nest read_bytes协议读取远程日志尾部字节（base64传输，二进制安全）
+
+    走字节协议彻底绕过命令行文本编码层（PowerShell按ANSI误读UTF-8日志、
+    nest端_decode_output二次转换等不可逆破坏，事务#1909实测乱码根源），
+    Windows/Unix通用，编码探测在Python端统一进行（_decode_log_tail）。
+
+    Returns:
+        (尾部字节块(≤_LOG_TAIL_BYTES), 是否从文件中间切割(offset>0))；失败返回(b"", False)
+    """
+    import base64
+
+    from peng.nest.client import read_bytes as nest_read_bytes
+
+    try:
+        # 第一次请求：探测文件总大小（chunk_size=1，total_size随响应返回）
+        probe = await nest_read_bytes(log_file, offset=0, chunk_size=1, nest_name=nest_name)
+        if probe.error:
+            logger.debug(f"远程探测日志大小失败({nest_name}): {probe.error}")
+            return b"", False
+        total_size = int((probe.data or {}).get("total_size") or 0)
+        if total_size <= 0:
+            return b"", False
+        offset = max(0, total_size - _LOG_TAIL_BYTES)
+        resp = await nest_read_bytes(
+            log_file,
+            offset=offset,
+            chunk_size=_LOG_TAIL_BYTES,
+            nest_name=nest_name,
+        )
+        if resp.error:
+            logger.debug(f"远程读取日志尾部失败({nest_name}): {resp.error}")
+            return b"", False
+        content_b64 = (resp.data or {}).get("content_b64") or ""
+        data = base64.b64decode(content_b64) if content_b64 else b""
+        return data, offset > 0
+    except Exception as e:
+        logger.debug(f"远程读取日志尾部异常({nest_name}): {e}")
+        return b"", False
+
+
+async def read_daemon_exit_code(entry: dict[str, Any]) -> tuple[int | None, str]:
+    """读取daemon日志尾部并解析退出码
+
+    - 本地: 直读日志文件尾部
+    - 远程: 经nest read_bytes字节协议读取（多编码探测统一在解码层）
+
+    Args:
+        entry: daemon注册表条目（含log_file/nest/platform）
+
+    Returns:
+        (exit_code, log_tail)：exit_code解析不到时为None（容错，不阻断提醒注入）
+    """
+    log_file = entry.get("log_file") or ""
+    if not log_file:
+        return None, ""
+
+    nest_name = normalize_nest(entry.get("nest"))
+    if nest_name is None:
+        tail = read_local_log_tail(log_file)
+        return parse_exit_code(tail), tail
+
+    data, from_middle = await _read_remote_log_tail(nest_name, log_file)
+    tail = _decode_log_tail(data, drop_first_line=from_middle)
+    return parse_exit_code(tail), tail

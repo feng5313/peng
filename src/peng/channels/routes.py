@@ -124,19 +124,9 @@ async def channels_status() -> dict[str, Any]:
 
 @router.get("/config")
 async def get_channels_config() -> dict[str, Any]:
-    """获取当前Channel配置（脱敏）"""
+    """获取当前Channel配置（脱敏，已合并 data/peng.json 覆盖层）"""
     try:
-        import json
-        from pathlib import Path
-
-        config_file = Path("config/peng.json")
-        if not config_file.exists():
-            return {"error": "Config file not found"}
-
-        with open(config_file, "r", encoding="utf-8") as f:
-            config = json.load(f)
-
-        channels = config.get("channels", {})
+        channels = _load_config().get("channels", {})
         # 脱敏处理
         result = {
             "enabled": channels.get("enabled", False),
@@ -160,27 +150,30 @@ async def get_channels_config() -> dict[str, Any]:
         return {"error": str(e)}
 
 
+def _load_overlay() -> dict:
+    """读取 data/peng.json 覆盖层原始内容（不合并基础层，保留用户定制字段）"""
+    from peng.common.paths import get_project_root
+
+    data_path = get_project_root() / "data" / "peng.json"
+    if data_path.exists():
+        try:
+            with open(data_path, "r", encoding="utf-8") as f:
+                return json.load(f) or {}
+        except Exception as e:
+            logger.warning(f"读取 data/peng.json 覆盖层失败: {e}")
+    return {}
+
+
 @router.post("/config/feishu")
 async def save_feishu_config(request: Request) -> dict[str, Any]:
-    """保存飞书配置并连接"""
+    """保存飞书配置并连接（写入 data/peng.json 覆盖层）"""
     try:
-        import json
-        from pathlib import Path
-
         body = await request.json()
 
-        config_file = Path("config/peng.json")
-        with open(config_file, "r", encoding="utf-8") as f:
-            config = json.load(f)
+        # 读取合并后的配置（config 基础 + data 覆盖层），用于保护已有字段
+        old_feishu = _load_config().get("channels", {}).get("feishu", {})
 
-        if "channels" not in config:
-            config["channels"] = {"enabled": True}
-
-        config["channels"]["enabled"] = True
-        # 保留原有配置中需要保护的字段
-        old_feishu = config.get("channels", {}).get("feishu", {})
-
-        config["channels"]["feishu"] = {
+        feishu_config = {
             "enabled": body.get("enabled", True),
             "app_id": body.get("app_id", ""),
             "app_secret": body.get("app_secret", ""),
@@ -190,12 +183,16 @@ async def save_feishu_config(request: Request) -> dict[str, Any]:
         }
 
         # app_secret 脱敏值保护：如果前端返回的是脱敏值，保留原值
-        new_secret = config["channels"]["feishu"]["app_secret"]
+        new_secret = feishu_config["app_secret"]
         if new_secret.startswith("***") and new_secret.endswith("***"):
-            config["channels"]["feishu"]["app_secret"] = old_feishu.get("app_secret", "")
+            feishu_config["app_secret"] = old_feishu.get("app_secret", "")
 
-        with open(config_file, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
+        # 只更新 data/peng.json 覆盖层的 channels 节点（保留其他顶层字段）
+        overlay = _load_overlay()
+        overlay.setdefault("channels", {})
+        overlay["channels"]["enabled"] = True
+        overlay["channels"]["feishu"] = feishu_config
+        _save_config(overlay)
 
         # 重新初始化通道
         _reinit_channels()
@@ -208,28 +205,19 @@ async def save_feishu_config(request: Request) -> dict[str, Any]:
 
 @router.post("/config/wechat")
 async def save_wechat_config(request: Request) -> dict[str, Any]:
-    """保存微信配置并连接"""
+    """保存微信配置并连接（写入 data/peng.json 覆盖层）"""
     try:
-        import json
-        from pathlib import Path
-
         body = await request.json()
 
-        config_file = Path("config/peng.json")
-        with open(config_file, "r", encoding="utf-8") as f:
-            config = json.load(f)
-
-        if "channels" not in config:
-            config["channels"] = {"enabled": True}
-
-        config["channels"]["enabled"] = True
-        config["channels"]["wechat"] = {
+        # 只更新 data/peng.json 覆盖层的 channels 节点（保留其他顶层字段）
+        overlay = _load_overlay()
+        overlay.setdefault("channels", {})
+        overlay["channels"]["enabled"] = True
+        overlay["channels"]["wechat"] = {
             "enabled": body.get("enabled", True),
             "clawbot": body.get("clawbot", {}),
         }
-
-        with open(config_file, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
+        _save_config(overlay)
 
         # 重新初始化通道
         _reinit_channels()
@@ -269,16 +257,11 @@ def _reinit_channels() -> None:
         return
 
     import asyncio
-    import json
-    from pathlib import Path
     from peng.channels.integration import init_channel_system
 
     try:
-        config_file = Path("config/peng.json")
-        with open(config_file, "r", encoding="utf-8") as f:
-            config = json.load(f)
-
-        channels_config = config.get("channels", {})
+        # 读取合并后的配置（config 基础 + data/peng.json 覆盖层）
+        channels_config = _load_config().get("channels", {})
 
         # 先停止所有通道
         loop = None
@@ -426,13 +409,17 @@ async def clawbot_poll_login(uuid: str = "", redirect_host: str = "") -> dict[st
                 ilink_bot_id = data.get("ilink_bot_id", "")
                 ilink_user_id = data.get("ilink_user_id", "")
                 if bot_token and base_url_val:
-                    config = _load_config()
-                    config.setdefault("channels", {}).setdefault("wechat", {}).setdefault("clawbot", {})
-                    config["channels"]["wechat"]["clawbot"]["bot_token"] = bot_token
-                    config["channels"]["wechat"]["clawbot"]["base_url"] = base_url_val
-                    config["channels"]["wechat"]["clawbot"]["ilink_bot_id"] = ilink_bot_id
-                    config["channels"]["wechat"]["clawbot"]["ilink_user_id"] = ilink_user_id
-                    _save_config(config)
+                    # 只更新 data/peng.json 覆盖层的 channels.wechat 节点
+                    # （保留覆盖层其他顶层字段；同时启用微信通道）
+                    overlay = _load_overlay()
+                    wechat = overlay.setdefault("channels", {}).setdefault("wechat", {})
+                    wechat["enabled"] = True
+                    clawbot = wechat.setdefault("clawbot", {})
+                    clawbot["bot_token"] = bot_token
+                    clawbot["base_url"] = base_url_val
+                    clawbot["ilink_bot_id"] = ilink_bot_id
+                    clawbot["ilink_user_id"] = ilink_user_id
+                    _save_config(overlay)
                     _reinit_channels()
                 return {"status": "confirmed", "message": "登录成功", "base_url": base_url_val}
             elif status_val == "scaned":

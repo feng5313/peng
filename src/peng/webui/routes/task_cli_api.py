@@ -694,8 +694,11 @@ async def get_task_field(task_id: int, field_name: str) -> dict[str, Any]:
 @router.put("/{task_id}/field/{field_name}")
 async def set_task_field(task_id: int, field_name: str, request: FieldUpdateRequest) -> dict[str, Any]:
     """设置事务字段值"""
-    _get_task_or_404(task_id)
+    task = _get_task_or_404(task_id)
     tm = _get_task_manager()
+
+    # 🔧 Task#1893：记录更新前的旧值（供前端撤销/重做）
+    old_value = task.get(field_name)
 
     value = request.value
     if request.file:
@@ -717,7 +720,10 @@ async def set_task_field(task_id: int, field_name: str, request: FieldUpdateRequ
     if not success:
         raise HTTPException(status_code=500, detail="无法更新事务")
 
-    result: dict[str, Any] = {"success": True, "task_id": task_id, "field": field_name, "value": value}
+    result: dict[str, Any] = {
+        "success": True, "task_id": task_id, "field": field_name, "value": value,
+        "old_value": old_value,  # 🔧 Task#1893：撤销/重做支持
+    }
 
     # 如果是 content 字段且为根事务，同步更新关联的根消息 content
     if field_name == "content" and value:

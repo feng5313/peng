@@ -144,6 +144,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     initRemoteTerminal();  // 不 await
 
     initEventListeners();
+    initOpUndoRedo();  // 🔧 Task#1893：初始化消息/事务操作撤销/重做按钮与历史栈
     initFileUpload();
     initFocusManagement();
     initOutputFilters();  // 初始化输出来源过滤器

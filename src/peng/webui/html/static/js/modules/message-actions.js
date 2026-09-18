@@ -235,6 +235,15 @@ async function archiveMessage(msgId) {
     showSimpleToast(`♻️  消息 #${msgId} ${isCurrentlyArchived ? '已取消归档' : '已归档'}`, 'success');
     state.output.clear(); state.currentColor = '';
 
+    // 🔧 Task#1893：记录撤销/重做历史（undo=恢复原归档状态，redo=重复本次切换）
+    pushOpHistory('message', {
+      kind: 'archive',
+      targetId: msgId,
+      label: `${isCurrentlyArchived ? '取消归档' : '归档'}消息#${msgId}`,
+      undo: { archive: isCurrentlyArchived },   // 恢复到操作前状态
+      redo: { archive: !isCurrentlyArchived },  // 重做本次切换
+    });
+
     // 🔧 Task#1346：跳过下一次轮询，避免与手动 loadMessages 竞争
     skipNextMessagesPoll = true;
 
@@ -296,6 +305,17 @@ async function deleteMessage(msgId, isRoot, rootMsgId = null) {
 
     const result = await response.json();
     showSimpleToast(`📜 消息 #${msgId} ${result.message}`, 'success');
+
+    // 🔧 Task#1893：记录撤销/重做历史（undo=从后端快照恢复，redo=重新删除）
+    if (result.backup_file) {
+      pushOpHistory('message', {
+        kind: 'delete',
+        targetId: msgId,
+        label: `删除消息#${msgId}`,
+        undo: { backupFile: result.backup_file, isRoot: !!isRoot },
+        redo: { isRoot: !!isRoot },
+      });
+    }
 
     // 清除选中状态
     if (state.currentMessageId === msgId) {
@@ -679,6 +699,17 @@ async function deleteTask(taskId) {
     const data = await response.json();
     const deletedCount = data.deleted_count || 1;
     showSimpleToast(`🚩  事务 #${taskId} 已删除，共 ${deletedCount} 个事务`, 'success');
+
+    // 🔧 Task#1893：记录撤销/重做历史（undo=从后端快照恢复，redo=重新删除）
+    if (data.backup_file) {
+      pushOpHistory('task', {
+        kind: 'delete',
+        targetId: taskId,
+        label: `删除事务#${taskId}`,
+        undo: { backupFile: data.backup_file },
+        redo: {},
+      });
+    }
 
     // 如果删除的是当前选中的事务，清除选中状态
     if (state.currentTaskId === taskId) {

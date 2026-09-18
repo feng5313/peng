@@ -12,6 +12,7 @@
 // 模块加载列表（按依赖顺序，路径相对于 /static/js/）
 var __peng_modules = [
   'modules/state.js',
+  'modules/undo-redo.js',
   'modules/output-history.js',
   'modules/config.js',
   'modules/utils.js',

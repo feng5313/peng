@@ -2949,6 +2949,8 @@ class PengConfig(BaseModel):
     webui_themes: WebUIThemesConfig = Field(default_factory=WebUIThemesConfig)
     nest: NestConfig = Field(default_factory=NestConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    # 消息通道配置（微信/飞书等，dict 透传，已合并 data/peng.json 覆盖层）
+    channels: dict = Field(default_factory=dict)
     db: dict = Field(default_factory=dict)
     max_iterations: int = 100
     agent_name: str = "鹏🐣"
@@ -3136,6 +3138,7 @@ class PengConfig(BaseModel):
             webui_themes=webui_themes_config,
             nest=NestConfig(**data.get("nest", {})),
             tools=ToolsConfig(**data.get("tools", {})),
+            channels=data.get("channels", {}),
             db=data.get("db", {}),
             max_iterations=data.get("max_iterations", 100),
             agent_name=data.get("agent_name", "鹏🐣"),

@@ -250,6 +250,27 @@ async function _executeDrop(dropTarget) {
       if (response.ok) {
         const result = await response.json();
         showSimpleToast(`✅ ${result.message}`, 'success');
+
+        // 🔧 Task#1893：记录撤销/重做历史
+        if (result.swapped) {
+          // 目标为子孙消息：后端执行了内容交换，撤销=按记录旧内容恢复（幂等交换）
+          pushOpHistory('message', {
+            kind: 'swap',
+            targetId: msgId,
+            label: `交换消息#${result.swap_ids ? result.swap_ids.join('↔#') : msgId}内容`,
+            undo: { contents: result.swap_old_contents || {} },
+            redo: { contents: result.swap_old_contents || {} },
+          });
+        } else if (typeof result.previous_reply_to !== 'undefined') {
+          pushOpHistory('message', {
+            kind: 'move',
+            targetId: msgId,
+            label: `移动消息#${msgId}到${dropTarget.targetId ? '#' + dropTarget.targetId : '根'}`,
+            undo: { parentId: result.previous_reply_to || null },
+            redo: { parentId: dropTarget.targetId ?? null },
+          });
+        }
+
         await loadMessages(true);
       } else {
         const error = await response.json();
@@ -265,6 +286,18 @@ async function _executeDrop(dropTarget) {
       if (response.ok) {
         const result = await response.json();
         showSimpleToast(`✅ ${result.message}`, 'success');
+
+        // 🔧 Task#1893：记录撤销/重做历史（previous_parent_task_id 由后端返回）
+        if (typeof result.previous_parent_task_id !== 'undefined') {
+          pushOpHistory('task', {
+            kind: 'move',
+            targetId: taskId,
+            label: `移动事务#${taskId}到${dropTarget.targetId ? '#' + dropTarget.targetId : '根'}`,
+            undo: { parentId: result.previous_parent_task_id || null },
+            redo: { parentId: dropTarget.targetId ?? null },
+          });
+        }
+
         await loadTasks();
       } else {
         const error = await response.json();

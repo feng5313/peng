@@ -1399,6 +1399,14 @@ class DaemonTool(BashTool):
 
     ALIASES = ()
 
+    # daemon退出watcher任务集合（持有asyncio.Task引用防GC，完成后自动移除）
+    _exit_watchers: set[asyncio.Task] = set()
+
+    # 退出watcher轮询间隔（秒）：本地PID直查开销极小用短间隔保证提醒及时；
+    # 远程每次轮询是一趟nest RPC，用长间隔降低负载
+    _WATCH_LOCAL_INTERVAL = 3
+    _WATCH_REMOTE_INTERVAL = 10
+
     @property
     def name(self) -> str:
         return "daemon"
@@ -1418,6 +1426,7 @@ class DaemonTool(BashTool):
 立即返回 daemon id，stdout/stderr 写入日志文件（用read工具读取查看输出）。
 停止方式： 用bash或daemon工具执行 stop <daemon_id>（或 stop all 清理全部）；也可用 task kill -d <daemon_id>。
 启动多个daemon时逐个启动并记录id，任务完成后务必stop清理！
+🔔 daemon进程自动结束时系统会自动注入结束提醒（含daemon id、命令、返回值、日志路径），注意查收处理！
 ⚠️ 运行命令必须说明目的（purpose参数），要简明扼要（4-200个字符），否则将被拒绝执行！
 """
 
@@ -1455,6 +1464,94 @@ class DaemonTool(BashTool):
         except Exception as e:
             logger.debug(f"获取nest '{nest_name}'平台失败: {e}")
             return "windows" if is_win else ""
+
+    def _start_exit_watcher(self, entry: dict) -> None:
+        """启动daemon退出watcher（进程自动结束时提醒大模型）
+
+        watcher与事务处理进程同生命周期：进程结束后watcher随之消亡，
+        残留daemon记录由cleanup_dead_daemons按既有机制清理。
+        启动失败仅记录日志，不影响daemon工具正常返回。
+        """
+        try:
+            task = asyncio.create_task(self._watch_daemon_exit(entry))
+            self._exit_watchers.add(task)
+            task.add_done_callback(self._exit_watchers.discard)
+        except Exception as e:
+            logger.warning(f"[daemon] 启动退出watcher失败({entry.get('id')}): {e}")
+
+    async def _watch_daemon_exit(self, entry_snapshot: dict) -> None:
+        """轮询daemon存活，进程自动结束时读取返回值并注入info提醒大模型
+
+        生命周期判定：
+        - 条目被stop/kill移除（remove_daemon）→ 静默退出
+          （主动停止，停止结果已由stop/kill命令直接返回给大模型）
+        - 进程退出且条目仍在 → 自动结束 → 读退出码 → 清理条目 → 注入info
+
+        提醒管道：add_task_info → tool_engine迭代循环 _get_task_info →
+        history.add_user（工具层无history访问权，此为项目标准注入管道，
+        与workdir冲突警告同模式）。提醒不以感叹号开头（is_urgent_content），
+        不打断运行中命令，由迭代边界自然处理。
+        """
+        import peng.common.daemon_registry as dr
+
+        daemon_id = entry_snapshot.get("id")
+        is_remote = dr.normalize_nest(entry_snapshot.get("nest")) is not None
+        interval = self._WATCH_REMOTE_INTERVAL if is_remote else self._WATCH_LOCAL_INTERVAL
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                current = dr.get_daemon(daemon_id)
+                if current is None:
+                    return  # 已被stop/kill/清理：主动停止，无需提醒
+                alive = await dr.check_daemon_alive(current)
+                if alive is False:
+                    break  # 进程已退出 → 自动结束
+                # alive is True/None：存活或远程查询失败（保守继续等待）
+
+            # 注入前再次确认条目仍存在（与stop竞态时放弃，避免把主动停止误报为自动结束）
+            final_entry = dr.get_daemon(daemon_id)
+            if final_entry is None:
+                return
+
+            exit_code, log_tail = await dr.read_daemon_exit_code(final_entry)
+            dr.remove_daemon(daemon_id)
+
+            task_id = final_entry.get("task_id")
+            if not task_id:
+                return
+            nest_name = dr.normalize_nest(final_entry.get("nest"))
+            nest_hint = f", nest={nest_name}" if nest_name else ""
+            ec_text = str(exit_code) if exit_code is not None else "未知（日志无退出码标记）"
+            # 日志尾部预览（最后3行非空行，每行截断120字符，帮助大模型快速判断成败）
+            preview_lines = [ln.strip()[:120] for ln in (log_tail or "").splitlines() if ln.strip()]
+            preview = "\n".join(f"  {ln}" for ln in preview_lines[-3:])
+            preview_part = f"\n日志尾部:\n{preview}" if preview else ""
+            info_text = (
+                f"🔔 daemon进程已自动结束: daemon {daemon_id} "
+                f"(PID {final_entry.get('pid')}{nest_hint})，返回值: {ec_text}\n"
+                f"命令: {final_entry.get('command')}\n"
+                f"日志: {final_entry.get('log_file')}（用read工具读取查看完整输出）"
+                f"{preview_part}"
+            )
+
+            task_manager = self.get_context("task_manager")
+            try:
+                if task_manager:
+                    task_manager.db.add_task_info(task_id, info_text)
+                else:
+                    from peng.task.database import TaskDatabase
+
+                    TaskDatabase().add_task_info(task_id, info_text)
+                logger.info(
+                    f"[daemon] {daemon_id} 自动结束(返回值{ec_text})，"
+                    f"已注入提醒到事务#{task_id}"
+                )
+            except Exception as e:
+                logger.warning(f"[daemon] {daemon_id} 自动结束提醒注入失败(task#{task_id}): {e}")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"[daemon] 退出watcher异常({daemon_id}): {e}")
 
     async def execute(self, **kwargs: Any) -> str:
         """非阻塞启动daemon进程，立刻返回daemon id"""
@@ -1544,6 +1641,9 @@ class DaemonTool(BashTool):
         # 构建返回信息
         daemon_id = entry["id"]
         nest_hint = "" if entry.get("nest") is None else f", nest={entry['nest']}"
+        # 启动退出watcher：daemon进程自动结束时注入info提醒大模型
+        # （含daemon id、命令、返回值、日志路径；stop/kill的主动停止不提醒）
+        self._start_exit_watcher(entry)
         output = (
             f"\n✅ daemon {daemon_id} 已启动 (PID {entry['pid']}{nest_hint})\n"
             f"命令: {command}\n"
