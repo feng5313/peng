@@ -1,5 +1,8 @@
 @echo off
 setlocal EnableExtensions
+REM Switch console to UTF-8 so Python/emoji output displays correctly
+REM (this file itself is ASCII-only, so parsing is unaffected).
+chcp 65001 >nul 2>&1
 REM ============================================================
 REM  Peng - One-click installer for Windows
 REM
@@ -313,14 +316,14 @@ goto :svc_install
 echo.
 echo == Check PostgreSQL ==
 echo [INFO] Checking local PostgreSQL...
-"%VENV_PYTHON%" -c "import sys; from peng.db.postgres_auto_deploy import check_postgresql_available; sys.exit(0 if check_postgresql_available() else 1)" >nul 2>&1
+"%VENV_PYTHON%" -X utf8 -c "import sys; from peng.db.postgres_auto_deploy import check_postgresql_available; sys.exit(0 if check_postgresql_available() else 1)" >nul 2>&1
 if not errorlevel 1 (
     echo [ OK ] PostgreSQL is ready
     goto :svc_install
 )
 echo [INFO] PostgreSQL not available, auto-installing via scoop/winget...
 echo        ^(this downloads PostgreSQL, may take several minutes; no admin rights needed^)
-"%VENV_PYTHON%" -c "import sys; from peng.db.postgres_auto_deploy import ensure_postgresql_fly; sys.exit(0 if ensure_postgresql_fly() else 1)"
+"%VENV_PYTHON%" -X utf8 -c "import sys; from peng.db.postgres_auto_deploy import ensure_postgresql_fly; sys.exit(0 if ensure_postgresql_fly() else 1)"
 if not errorlevel 1 (
     echo [ OK ] PostgreSQL installed and ready
 ) else (

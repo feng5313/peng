@@ -31,6 +31,18 @@ from peng.db.connection import get_config
 
 logger = logging.getLogger(__name__)
 
+# Windows GBK 控制台兼容：本模块的 print 带有 emoji（📋✅❌🚀 等），
+# 在 cp936/cp850 等非 UTF-8 控制台直接 print 会抛 UnicodeEncodeError
+# 导致整个自动部署崩溃。将无法编码的字符替换为 '?'，保证部署流程不中断。
+if sys.platform == "win32":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 # 全局变量：记录是否已执行过自动部署
 _auto_deploy_done: bool = False
 _container_name: str = "peng-postgres"
@@ -1499,30 +1511,37 @@ def _try_install_pg_on_windows() -> Path | None:
         print("ℹ️ 未找到 scoop，尝试 winget...")
 
     # 优先级2：winget（Windows 自带包管理器，无需管理员）
+    # 注意：winget 源中无版本号的 meta 包 `PostgreSQL.PostgreSQL` 已下架，
+    # 现在只有带版本号的包（.16/.17/.18 等），按优先级依次尝试。
     winget_path = shutil.which("winget")
     if winget_path:
         print("🚀 使用 winget 安装 PostgreSQL...")
         sys.stdout.flush()
-        try:
-            result = subprocess.run(
-                "winget install -e --id PostgreSQL.PostgreSQL "
-                "--accept-package-agreements --accept-source-agreements "
-                "--disable-interactivity",
-                timeout=180,
-                shell=True,
-            )
-            if result.returncode == 0:
-                print("✅ winget 安装 PostgreSQL 成功")
-                pg_bin = _find_pg_bin_on_windows()
-                if pg_bin:
-                    return pg_bin
-                print("⚠️ winget 安装成功但找不到 pg_ctl，可能需要重启终端或刷新 PATH")
-            else:
-                print(f"⚠️ winget 安装失败 (exit code: {result.returncode})")
-        except subprocess.TimeoutExpired:
-            print("⚠️ winget 安装超时（180秒）")
-        except (FileNotFoundError, OSError) as e:
-            print(f"⚠️ winget 安装异常: {e}")
+        for pkg_id in (
+            "PostgreSQL.PostgreSQL.17",
+            "PostgreSQL.PostgreSQL.18",
+            "PostgreSQL.PostgreSQL",
+        ):
+            try:
+                result = subprocess.run(
+                    f"winget install -e --id {pkg_id} "
+                    "--accept-package-agreements --accept-source-agreements "
+                    "--disable-interactivity",
+                    timeout=1800,
+                    shell=True,
+                )
+                if result.returncode == 0:
+                    print(f"✅ winget 安装 PostgreSQL 成功（{pkg_id}）")
+                    pg_bin = _find_pg_bin_on_windows()
+                    if pg_bin:
+                        return pg_bin
+                    print("⚠️ winget 安装成功但找不到 pg_ctl，可能需要重启终端或刷新 PATH")
+                else:
+                    print(f"⚠️ winget 安装 {pkg_id} 失败 (exit code: {result.returncode})")
+            except subprocess.TimeoutExpired:
+                print(f"⚠️ winget 安装 {pkg_id} 超时（1800秒）")
+            except (FileNotFoundError, OSError) as e:
+                print(f"⚠️ winget 安装 {pkg_id} 异常: {e}")
     else:
         print("ℹ️ 未找到 winget")
 
@@ -1599,19 +1618,24 @@ def deploy_with_windows_native() -> bool:
         # 第3步：检查 PostgreSQL 是否已经在运行
         print("📋 [3/6] 检查 PostgreSQL 是否已运行...")
         sys.stdout.flush()
-        # 先用socket直接检测实际端口是否可达（避免psycopg2依赖和端口不匹配问题）
+        # 只检测 peng 自管理实例所在的配置端口。
+        # 注意：5432 可能是 EDB 安装器注册的系统服务（winget/手动安装），
+        # peng 没有该实例的超级用户凭据，无法在其中创建 peng 用户/库，
+        # 因此 5432 可达不能作为"peng 已就绪"的依据；
+        # EDB 安装的二进制会在第 4-5 步被用于 initdb 自建 peng 集群。
         import socket as _socket
 
-        for _check_port in [config.port, 6000, 5432]:
+        _pg_ports = [config.port]
+        _override_port = os.environ.get("PENG_PG_PORT_OVERRIDE")
+        if _override_port and _override_port.isdigit():
+            _pg_ports.append(int(_override_port))
+        for _check_port in dict.fromkeys(_pg_ports):
             try:
                 _sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
                 _sock.settimeout(2)
                 if _sock.connect_ex(("127.0.0.1", _check_port)) == 0:
                     _sock.close()
                     print(f"✅ PostgreSQL 已运行（端口 {_check_port}）")
-                    # 更新端口覆盖到实际可达的端口
-                    if _check_port != 5432:
-                        os.environ["PENG_PG_PORT_OVERRIDE"] = str(_check_port)
                     # 重载配置（使 postgresql.conf 修改生效）
                     try:
                         _pg_ctl = pg_bin / "pg_ctl.exe"
