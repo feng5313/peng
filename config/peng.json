@@ -113,69 +113,11 @@
       "symbol_output_intervention": "⚠️ 你的输出被检测为无效输出（连续输出大量纯符号字符，无任何字母或中文文字）！该输出已被系统丢弃。请停止输出符号串，立即用正常的中英文语言思考或回复，并调用工具执行实际操作！"
     },
     "providers": {
-      "z-glm5.3": {
-        "api_key": "your_key",
-        "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
-        "model": "glm-5.3",
-        "small_model": "glm-5.3",
-        "max_concurrent": 8,
-        "thinking_type": "thinking",
-        "reasoning_effort": "max",
-        "reasoning_disabled_fallback": "low",
-        "thinking_persistence": false,
-        "icon": "🦊",
-        "enable": true,
-        "compact_threshold": 320000,
-        "priority": 96,
-        "price_input_hit": 2,
-        "price_input_miss": 8,
-        "price_output": 28
-      },
-      "z-glm5.3-flash": {
-        "clone": "z-glm5.3",
-        "model": "glm-5.3-flash",
-        "small_model": "glm-5.3-flash",
-        "enable": true,
-        "thinking_dead_loop_threshold": 5,
-        "vision": "yes",
-        "icon": "🐹",
-        "price_input_hit": 0.23,
-        "price_input_miss": 0.8,
-        "price_output": 2.8,
-        "priority": 98
-      },
-      "deepseek-pro": {
-        "api_key": "your_key",
-        "base_url": "https://api.deepseek.com",
-        "model": "deepseek-v4-pro",
-        "small_model": "deepseek-v4-pro",
-        "max_concurrent": 8,
-        "thinking_type": "thinking",
-        "enable": true,
-        "icon": "🐋",
-        "priority": 88,
-        "price_input_hit": 0.025,
-        "price_input_miss": 3,
-        "price_output": 6
-      },
-      "deepseek-flash": {
-        "clone": "deepseek-pro",
-        "model": "deepseek-flash",
-        "small_model": "deepseek-flash",
-        "thinking_dead_loop_threshold": 5,
-        "vision": "yes",
-        "enable": false,
-        "icon": "🐬",
-        "priority": 86,
-        "price_input_hit": 0.02,
-        "price_input_miss": 1,
-        "price_output": 4
-      },
       "swift-qwen3.8-iq3": {
         "api_key": "dummy",
-        "base_url": "http://epyc:8080/v1",
-        "model": "swift-1.5-iq3_xxs",
-        "small_model": "swift-1.5-iq3_xxs",
+        "base_url": "http://localhost:8080/v1",
+        "model": "swift-1.5-iq3_s",
+        "small_model": "swift-1.5-iq3_s",
         "thinking_type": "chat_template_kwargs",
         "reasoning_effort": "xhigh",
         "preserve_thinking": false,
@@ -203,13 +145,51 @@
             "top_p": 1.0
           }
         }
+      },      
+      "z-glm5.3": {
+        "api_key": "your_key",
+        "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+        "model": "glm-5.3",
+        "small_model": "glm-5.3",
+        "max_concurrent": 8,
+        "thinking_type": "thinking",
+        "reasoning_effort": "max",
+        "reasoning_disabled_fallback": "low",
+        "thinking_persistence": false,
+        "icon": "🦊",
+        "enable": false,
+        "compact_threshold": 320000,
+        "priority": 96,
+        "price_input_hit": 2,
+        "price_input_miss": 8,
+        "price_output": 28
       },
-      "swift-qwen3.8-iq3-2080ti": {
-        "clone": "swift-qwen3.8-iq3",
-        "base_url": "http://epyc:8081/v1",
-        "icon": "🐥",
-        "max_concurrent": 2,
-        "priority": 92
+      "z-glm5.3-flash": {
+        "clone": "z-glm5.3",
+        "model": "glm-5.3-flash",
+        "small_model": "glm-5.3-flash",
+        "enable": false,
+        "thinking_dead_loop_threshold": 5,
+        "vision": "yes",
+        "icon": "🐹",
+        "price_input_hit": 0.23,
+        "price_input_miss": 0.8,
+        "price_output": 2.8,
+        "priority": 98
+      },
+      "deepseek-flash": {
+        "api_key": "your_key",
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-v4-pro",
+        "small_model": "deepseek-v4-pro",
+        "max_concurrent": 8,
+        "thinking_type": "thinking",
+        "enable": false,
+        "icon": "🐋",
+        "priority": 88,
+        "price_input_hit": 0.02,
+        "price_input_miss": 1,
+        "price_output": 4
       }
     },
     "degenerate_loop_patterns": [
