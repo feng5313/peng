@@ -30,7 +30,13 @@ from peng.common import jsonp as json
 from peng.common.colors import ANSI_COLORS as _ANSI
 from peng.common.paths import get_temp_directory, chown_to_project_owner, ensure_dir_with_owner
 from peng.config import PathsConfig, get_agent_name, get_master_name, get_project_root
-from peng.tools.base import REPORT_SUCCESS_SUMMARY, DualOutput, Tool, ToolError
+from peng.common.option_split import find_unparsed_option_flags, split_trailing_options
+from peng.tools.base import (
+    REPORT_SUCCESS_SUMMARY,
+    DualOutput,
+    Tool,
+    ToolError,
+)
 from peng.tools.file import replace_content, trim_diff, normalize_line_endings
 from peng.common.utils import generate_colored_diff
 
@@ -581,6 +587,7 @@ class InfoTool(Tool):
 
 向指定id的事务注入上下文信息，用于父事务向运行中的子事务大模型发送紧急信息指示。
 info字段必须是普通字符串格式，支持\\n换行符。
+发送者由系统自动标识为「事务#当前事务ID」（事务#2089），接收方会看到info来源。
 常用功能：
 1. 向事务注入信息：info <task_id> <info_string>
      示例：info 1 "请暂停当前事务"
@@ -598,7 +605,7 @@ info字段必须是普通字符串格式，支持\\n换行符。
             "properties": {
                 "task_id": {
                     "type": "integer",
-                    "description": "事务ID",
+                    "description": "接收方事务ID（必须存在，事务不存在会报错）",
                 },
                 "info_string": {
                     "type": "string",
@@ -618,7 +625,7 @@ info字段必须是普通字符串格式，支持\\n换行符。
         执行InfoTool操作
 
         Args:
-            task_id: 事务ID
+            task_id: 接收方事务ID
             info_string: 信息字符串（可选）
                 - 不提供：显示 info
                 - 空字符串 ""：删除 info
@@ -627,6 +634,12 @@ info字段必须是普通字符串格式，支持\\n换行符。
             DualOutput: 执行结果
         """
         try:
+            if not task_id or task_id <= 0:
+                return DualOutput(
+                    summary=f"❌ 无效的事务ID: {task_id}",
+                    display=f"❌ 无效的事务ID: {task_id}",
+                )
+
             # 调用bin/task命令 - Windows 上需要通过 python 解释器执行无扩展名的脚本
             task_script = str(PROJECT_ROOT / "bin" / "task")
 
@@ -652,6 +665,9 @@ info字段必须是普通字符串格式，支持\\n换行符。
                         cmd.extend(["--workdir", str(ctx_workdir)])
                 return cmd
 
+            # 发送者标识（事务#2089）：接收方info中会显示 [来自 事务#N]
+            sender_tag = f"事务#{self.get_context('task_id')}" if self.get_context("task_id") else None
+
             # 根据info_string参数构建命令
             temp_file = None
             if info_string is None:
@@ -663,7 +679,10 @@ info字段必须是普通字符串格式，支持\\n换行符。
             else:
                 # 添加 info - 将 info_string 写入临时文件，通过 --file 参数传递
                 temp_file = _write_temp_file(info_string)
-                cmd = _build_task_cmd("info", str(task_id), "--file", temp_file)
+                cmd_args = ["info", str(task_id), "--file", temp_file]
+                if sender_tag:
+                    cmd_args.extend(["--sender", sender_tag])
+                cmd = _build_task_cmd(*cmd_args)
 
             try:
                 result = subprocess.run(
@@ -745,6 +764,7 @@ class TaskTool(Tool):
       示例：output 7 --line-count（只显示事务#7输出文件的总行数，不显示文件内容）
 9. 向运行中事务注入实时提示信息：info <id> 提示信息  发实时提示信息给事务，若事务不在处理则启动事务
       示例：info 3 编辑文件后要用git diff确认是否修改正确！ （提醒事务3核对文件编辑结果）
+      （发送者自动标识为 事务#当前事务ID，接收方info中显示 [来自 事务#N]）
 10. 修改事务需求描述：content <id> <detail>  (只允许在监控子事务时使用)
       示例：content 5 修改后的需求描述内容（修改事务#5的需求描述）
       示例：content 5 -d（清空事务#5的需求描述）
@@ -761,7 +781,9 @@ class TaskTool(Tool):
 1. 参数中禁止管道操作
 2. 支持换行转义符\\n，允许在参数中使用换行符
 3. 避免使用英文单引号或双引号，建议使用中文引号或不使用引号
-4. 使用--help参数获取详细帮助
+4. 选项（--workdir/--prompt/--creator/--small-model 等）必须写在参数**末尾**（内容之后），
+   否则会被当作内容的一部分而失效！例如：subtask 1 需求描述 --workdir /x --small-model
+5. 使用--help参数获取详细帮助
     """
 
     @property
@@ -856,16 +878,59 @@ class TaskTool(Tool):
             "report",
         }
 
+        # 内容型子命令的选项定义（事务#1998）：
+        # LLM 传入的 args 是「内容 + 尾部选项」的纯文本，选项必须从内容中分离出来
+        # 作为命令行参数传给 bin/task，否则会被当作内容写进 --file 临时文件而失效。
+        value_flags: tuple[str, ...] = ("--file",)
+        bool_flags: tuple[str, ...] = ("-d", "--delete")
+        if subcmd == "subtask":
+            value_flags = ("--prompt", "-p", "--workdir", "-w", "--creator", "-c", "--file")
+            bool_flags = ("--small-model",)
+        elif subcmd == "info":
+            # 事务#2089：--sender 由工具自动注入（事务#N），需从内容中分离后剥离
+            value_flags = ("--file", "--sender")
+
         temp_file = None
+        hint = ""
         if subcmd in content_subcmds and subcmd_args:
-            cmd = _build_task_cmd(subcmd)
+            # 分离「内容」与「尾部选项」：内容经--file传递，选项原样交给CLI解析
+            content, option_tokens = split_trailing_options(subcmd_args, value_flags, bool_flags)
+            if option_tokens:
+                logger.info(f"[task工具] 从内容中分离出尾部选项: {' '.join(option_tokens)}")
+
+            # 事务#2089：info 注入时发送者由系统自动标识（剥离LLM传入的--sender）
+            info_sender_args: list[str] = []
+            if subcmd == "info":
+                from peng.tools.message import _pop_option_pairs
+
+                option_tokens, removed_sender = _pop_option_pairs(option_tokens, ("--sender",))
+                if removed_sender:
+                    logger.warning(
+                        f"[task工具] info已剥离LLM传入的 --sender: {' '.join(removed_sender)}"
+                    )
+                ctx_task_id = self.get_context("task_id")
+                if ctx_task_id:
+                    info_sender_args = ["--sender", f"事务#{ctx_task_id}"]
+
+            # 先构建命令（连同选项），便于 _build_task_cmd 判断是否需要注入上下文 workdir
+            cmd = _build_task_cmd(subcmd, *option_tokens)
+            # info 发送者标识追加在选项之后
+            cmd.extend(info_sender_args)
             # 如果子命令有ID参数（如 info 3 或 content 5），分离ID和内容
-            arg_parts = subcmd_args.split(maxsplit=1)
+            arg_parts = content.split(maxsplit=1)
             if arg_parts and arg_parts[0].isdigit():
                 cmd.append(arg_parts[0])
                 content = arg_parts[1] if len(arg_parts) > 1 else ""
-            else:
-                content = subcmd_args
+
+            # 内容中残留疑似选项文本时给出显式提示，避免"选项被当作内容静默忽略"
+            suspicious = find_unparsed_option_flags(content, value_flags + bool_flags)
+            if suspicious:
+                hint = (
+                    f"\n⚠️ 提示：内容中检测到疑似选项 {' '.join(suspicious)}，但未被解析为选项。"
+                    f"若要传入选项，必须写在参数末尾（内容之后），例如："
+                    f"{subcmd} 1 需求描述 --workdir /x；若只是正文提到这些字样可忽略本提示。"
+                )
+                logger.warning(f"[task工具] {subcmd} 内容疑似包含未解析选项: {suspicious}")
 
             if content:
                 temp_file = _write_temp_file(content)
@@ -902,7 +967,7 @@ class TaskTool(Tool):
         # 防御性检查：Windows下GBK解码失败可能导致stdout/stderr为None
         stdout = result.stdout or ""
         stderr = result.stderr or ""
-        output = " ".join(cmd) + "\n" + stderr + "\n" + stdout
+        output = " ".join(cmd) + "\n" + stderr + "\n" + stdout + hint
         if result.returncode != 0:
             output = f"❌  task工具调用失败： " + output
         else:

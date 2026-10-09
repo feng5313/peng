@@ -55,7 +55,7 @@ from typing import Any
 
 from peng.common.utils import get_text_from_args, fix_markdown_linebreaks
 from peng.common.colors import get_task_colors
-from peng.config import get_agent_name, get_project_root
+from peng.config import get_agent_name, get_master_name, get_project_root
 from peng.config.loader import get_default_heartbeat_timeout
 from peng.db.connection import get_connection, get_cursor
 
@@ -1504,7 +1504,13 @@ def _cmd_show_html(args):
                 color = "#8b949e" if item["read"] else "#3fb950"
                 unread_link = f'<a href="javascript:void(0)" onclick="markTaskInfoItemUnread({task["id"]}, {i - 1}, {str(item["read"]).lower()})" style="margin-left:1ch; color:#58a6ff; font-size:0.85em; text-decoration:underline;">{"改未读" if item["read"] else "改已读"}</a>'
                 delete_link = f'<a href="javascript:void(0)" onclick="deleteTaskInfoItem({task["id"]}, {i - 1})" style="margin-left:1ch; color:#f85149; font-size:0.85em; text-decoration:underline;">删除</a>'
-                all_info_html += f'<div class="task-text task-info-item" data-info-index="{i - 1}" style="color:{color}">[{i}] {_h_with_links(item["content"], task.get("nest"))}{unread_link}{delete_link}</div>\n'
+                # 事务#2089：显示发送者标识（旧数据无sender时不显示）
+                sender_span = (
+                    f'<span style="color:#58a6ff">[来自 {item["sender"]}]</span> '
+                    if item.get("sender")
+                    else ""
+                )
+                all_info_html += f'<div class="task-text task-info-item" data-info-index="{i - 1}" style="color:{color}">[{i}] {sender_span}{_h_with_links(item["content"], task.get("nest"))}{unread_link}{delete_link}</div>\n'
             # 默认显示：最后一条已读 + 所有未读（保持原样）——使用路径超链接转换
             default_html = ""
             last_read_idx = None
@@ -1519,7 +1525,12 @@ def _cmd_show_html(args):
                 default_html += f'<div class="task-text" style="color:#3fb950">未读 {unread_count} 条 <a href="javascript:void(0)" onclick="markTaskInfoRead({task["id"]})" style="color:#58a6ff; font-size:0.85em; text-decoration:underline;">标记为已读（不处理）</a></div>'
                 for i, item in enumerate(info_list, 1):
                     if not item["read"]:
-                        default_html += f'<div class="task-text task-info-item" style="color:#3fb950">[{i}] {_h_with_links(item["content"], task.get("nest"))}</div>'
+                        sender_span = (
+                            f'<span style="color:#58a6ff">[来自 {item["sender"]}]</span> '
+                            if item.get("sender")
+                            else ""
+                        )
+                        default_html += f'<div class="task-text task-info-item" style="color:#3fb950">[{i}] {sender_span}{_h_with_links(item["content"], task.get("nest"))}</div>'
             # 注入信息标题为可点击超链接，点击后替换为全部 info 内容
             parts.append(f"""<div class="task-section" id="info-section-{task["id"]}">
                 <h3 class="task-info-toggle" onclick="toggleTaskInfo({task["id"]}, this)" style="cursor:pointer; text-decoration:underline;">
@@ -2799,9 +2810,13 @@ def cmd_info(args):
                     if not item["read"]
                     else f"{Colors.DIM}📭已读{Colors.RESET}"
                 )
+                # 事务#2089：显示发送者标识（旧数据无sender时不显示）
+                sender_part = (
+                    f"{Colors.BLUE}[{item['sender']}]{Colors.RESET} " if item.get("sender") else ""
+                )
                 if not item["read"]:
                     unread_count += 1
-                print(f"  [{i}] {status} {item['content']}")
+                print(f"  [{i}] {status} {sender_part}{item['content']}")
             print(
                 f"\n{Colors.DIM}共 {len(info_list_with_status)} 条信息（{unread_count} 条未读）{Colors.RESET}"
             )
@@ -2828,13 +2843,16 @@ def cmd_info(args):
     # 将 \n 转换为真正的换行符
     new_info = get_text_from_args(new_info)
 
+    # 发送者标识（事务#2089）：CLI调用者默认为风主；LLM工具调用时显式传入 事务#N
+    sender = getattr(args, "sender", None) or get_master_name()
+
     # 通过 database 函数添加
-    success = tm.db.add_task_info(args.id, new_info)
+    success = tm.db.add_task_info(args.id, new_info, sender=sender)
 
     if success:
         info_list_with_status = tm.db.get_task_info(args.id, mode="all") or []
         unread_count = sum(1 for item in info_list_with_status if not item["read"])
-        print(f"{Colors.GREEN}✅ 事务 {formatted_id} 注入信息已添加（未读）{Colors.RESET}")
+        print(f"{Colors.GREEN}✅ 事务 {formatted_id} 注入信息已添加（未读，来自 {sender}）{Colors.RESET}")
         print(f"  添加：{new_info}")
         print(
             f"{Colors.DIM}当前共 {len(info_list_with_status)} 条信息（{unread_count} 条未读）{Colors.RESET}"
@@ -3841,6 +3859,13 @@ def main():
     info_parser.add_argument("-u", "--unread", action="store_true", help="标记所有信息为未读")
     info_parser.add_argument("-r", "--read", action="store_true", help="标记所有信息为未读")
     info_parser.add_argument("--file", type=str, help="从文件读取信息内容")
+    info_parser.add_argument(
+        "--sender",
+        type=str,
+        default=None,
+        help="发送者标识（事务#2089：如 事务#2089；缺省=风主🍃——CLI调用者默认为风主，"
+        "LLM工具调用时会显式传入事务#ID）",
+    )
     info_parser.set_defaults(func=cmd_info)
 
     # output 命令

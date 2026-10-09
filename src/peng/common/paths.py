@@ -77,6 +77,107 @@ def chown_to_project_owner(path: str | Path) -> None:
         logger.warning(f"chown {path} 失败（非致命）: {e}")
 
 
+def open_log_with_owner(
+    path: str | Path,
+    mode: str = "a",
+    encoding: str = "utf-8",
+    errors: str = "replace",
+):
+    """打开日志文件，root 时确保（含新建）文件属主为项目属主
+
+    解决的问题：以 root 身份运行 fly/nest 命令时，open() 新建的日志文件归
+    root 所有，导致之后以普通用户（如 systemd 服务 User=feng）运行的进程
+    无法写入（Permission denied），内置 local nest 启动失败。
+
+    模式与 NestConnector.create_stop_signal 一致：先写文件，再 chown。
+    （chown_to_project_owner 对不存在的文件是 no-op，必须在 open 之后调用）
+
+    Args:
+        path: 日志文件路径
+        mode: 打开模式（默认追加 "a"）
+        encoding: 文件编码
+        errors: 编码错误处理策略
+
+    Returns:
+        已打开的文件对象
+    """
+    f = open(path, mode, encoding=encoding, errors=errors)
+    chown_to_project_owner(path)
+    return f
+
+
+def get_project_owner_info() -> tuple[int, int, str] | None:
+    """返回项目根目录属主的 (uid, gid, home)
+
+    仅当当前进程为 root 且项目属主不是 root 时返回有效值（即需要降权的场景），
+    其他情况（Windows / 非 root / 项目属主就是 root）返回 None。
+
+    Returns:
+        (uid, gid, home) 元组；home 可能为空字符串（无法查询 passwd 时）
+    """
+    if os.name == "nt":
+        return None
+    try:
+        if os.getuid() != 0:
+            return None  # 非 root 无需降权
+    except (AttributeError, OSError):
+        return None
+
+    project_root = get_project_root()
+    try:
+        dir_stat = project_root.stat()
+    except OSError:
+        return None
+    uid, gid = dir_stat.st_uid, dir_stat.st_gid
+    if uid == 0:
+        return None  # 项目属主就是 root，无需降权
+
+    home = ""
+    try:
+        import pwd
+
+        home = pwd.getpwuid(uid).pw_dir or ""
+    except (KeyError, ImportError, OSError):
+        pass
+    return uid, gid, home
+
+
+def get_popen_owner_context() -> tuple[dict | None, object]:
+    """返回适合传给 subprocess.Popen 的 (env, preexec_fn)，
+    使 root 启动的子进程降权为项目属主身份运行
+
+    典型场景：root 运行 fly start 的手动兜底逻辑启动 nest connect 子进程时，
+    若直接以 root 启动，子进程创建的一切文件（日志/缓存/__pycache__）都会
+    归 root 所有，污染项目目录权限。降权为项目属主后从根源上避免此问题。
+
+    用法:
+        env, preexec = get_popen_owner_context()
+        proc = subprocess.Popen(cmd, env=env, preexec_fn=preexec, ...)
+
+    Returns:
+        (env, preexec_fn) 二元组：
+        - 无需降权时为 (None, None)（Popen 按默认行为执行）
+        - env 为调整了 HOME 的环境副本（或 None 表示沿用默认）
+        - preexec_fn 为降权函数（setgroups/setgid/setuid）
+    """
+    info = get_project_owner_info()
+    if info is None:
+        return None, None
+    uid, gid, home = info
+
+    def _demote() -> None:
+        # fork 后 exec 前在子进程中执行：完整降权（清空补充组 → setgid → setuid）
+        os.setgroups([])
+        os.setgid(gid)
+        os.setuid(uid)
+
+    env = None
+    if home and os.environ.get("HOME") != home:
+        env = os.environ.copy()
+        env["HOME"] = home
+    return env, _demote
+
+
 def ensure_dir_with_owner(path: str | Path) -> Path:
     """创建目录并确保 owner 为项目目录的所有者
 

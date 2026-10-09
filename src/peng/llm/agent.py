@@ -320,12 +320,18 @@ class PengAgent:
         # 尝试从配置获取 AGENTS.md 路径
         config = load_config()
         agent_md = ""
-        # 尝试多个可能的路径作为备选
+        # 🔧 事务#2105：改为基于项目根目录的绝对路径解析（消除CWD依赖）。
+        # 原实现用相对路径 "./AGENTS.md"，依赖进程CWD——而任务runner子进程
+        # 会继承peng服务进程CWD（WebUI工作区切换set_workdir→os.chdir会改
+        # 变服务进程CWD），导致远程nest事务（workdir在本地不存在，agent.
+        # run_stream不chdir）回退时读到其他工作目录（如huizi）的AGENTS.md，
+        # 跨工作目录污染系统提示词（@provider!锁定标记随之泄漏）。
         from peng.config import get_project_root
 
+        project_root = Path(get_project_root())
         possible_paths = [
-            Path("./AGENTS.md"),
-            Path(".peng/AGENTS.md"),
+            project_root / "AGENTS.md",
+            project_root / ".peng" / "AGENTS.md",
         ]
 
         for path in possible_paths:

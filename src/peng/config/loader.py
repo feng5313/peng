@@ -952,6 +952,12 @@ class ProviderConfig(BaseModel):
     thinking_persistence: bool = (
         True  # 是否支持思考内容持久化（GLM等不复用history中的reasoning_content，需写入文件）
     )
+    # 是否在多轮请求与history持久化中保留 reasoning_content（qwen 系列）
+    # 实机验证（事务#2111）：swift/vLLM/llama.cpp 等后端会把 assistant 消息中的
+    # reasoning_content 渲染回 prompt（模型可复用上轮思考，prompt_tokens 相应增加）。
+    # 默认 False=序列化时剥离思考内容以节省 token；True=保留（并合并进相邻
+    # assistant 消息，独立空 content 的 thinking 消息后端读不到）
+    preserve_thinking: bool = False
     compact_threshold: int | None = None  # 上下文压缩阈值，None时使用全局compact_threshold
     # 费用配置（元/百万tokens），None时使用全局默认值(0)
     price_input_hit: float | None = None  # 命中缓存的输入价格
@@ -962,6 +968,11 @@ class ProviderConfig(BaseModel):
     icon: str = "🤖"  # Provider 图标（emoji机器人）
     priority: int = 50  # Provider 优先级（0-99，默认50，越高优先级越高）
     max_concurrent: int | None = None  # 该provider最大并发数，None时使用全局max_concurrent
+
+    # 🔧 事务#2114：工具结果drop清理提示阈值（字节）。超过此字节数的工具返回结果
+    # 末尾追加带唯一4位数字id的drop清理提示，模型确认结果毫无用处时可用drop工具清理。
+    # None时使用全局 llm.drop_hint_threshold（默认1024）；0=禁用该provider的提示
+    drop_hint_threshold: int | None = None
 
     # 采样参数覆盖（按模型作者要求，部分模型在不同thinking模式下需要不同采样参数）
     # 格式: {"thinking_on": {"temperature": 0.6, "top_p": 0.95}, "thinking_off": {"temperature": 0.001, "top_p": 1.0}}
@@ -1113,6 +1124,19 @@ class LLMPromptsConfig(BaseModel):
     # 达到最大迭代强制结束（{max_iterations} 为变量）
     iteration_exhausted: str = " @compact! 达到最大迭代次数 {max_iterations}，强制结束对话循环"
 
+    # 🔧 事务#2114：思考后无正式内容提醒——模型只输出思考内容（无content无tool_calls）
+    # 时注入，提醒模型思考内容不会保留在后续上下文中（默认被剥离），必须输出正式内容
+    thinking_only_reminder: str = (
+        "思考内容不会保留在上下文中，因此思考后必须输出正式内容总结，以免丢失思考成果！"
+    )
+
+    # 🔧 事务#2114：超长工具结果的drop清理提示（{drop_id} 为唯一4位数字ID）。
+    # 工具返回结果字节数超过 drop_hint_threshold（provider级可配，默认1024）时
+    # 追加此提示，模型确认结果毫无用处时调用drop工具清理以节省上下文空间
+    drop_hint: str = (
+        "\n 如果这些返回结果是毫无用处的垃圾信息，请用drop工具清理，id {drop_id}，尽量节省上下文空间！"
+    )
+
 
 class LLMConfig(BaseModel):
     """LLM 配置（只通过 providers 配置）"""
@@ -1152,6 +1176,10 @@ class LLMConfig(BaseModel):
     # 并发控制
     max_concurrent: int = 5  # 大模型并发数
     small_model_max_concurrent: int = 200  # 小模型并发数
+    # 🔧 事务#2114：工具结果drop清理提示阈值（字节，全局默认，provider级可覆盖）。
+    # 超过此字节数的工具返回结果末尾追加drop清理提示（见llm.prompts.drop_hint）；
+    # 0=禁用
+    drop_hint_threshold: int = 1024
     # 向后兼容：顶层 model 字段（将从 current_provider 获取）
     model: str = ""
     # 向后兼容：顶层 model 字段（将从 current_provider 获取）
@@ -1685,6 +1713,7 @@ class LLMConfig(BaseModel):
                         "reasoning_effort": prov_config.reasoning_effort,
                         "reasoning_disabled_fallback": prov_config.reasoning_disabled_fallback,
                         "thinking_persistence": prov_config.thinking_persistence,
+                        "preserve_thinking": prov_config.preserve_thinking,
                         "timeout": self.timeout,
                         "max_tokens": prov_config.max_tokens
                         if prov_config.max_tokens is not None
@@ -1695,6 +1724,9 @@ class LLMConfig(BaseModel):
                         "compact_threshold": prov_config.compact_threshold
                         if prov_config.compact_threshold is not None
                         else self.compact_threshold,
+                        "drop_hint_threshold": prov_config.drop_hint_threshold
+                        if prov_config.drop_hint_threshold is not None
+                        else self.drop_hint_threshold,
                         "price_input_hit": prov_config.price_input_hit
                         if prov_config.price_input_hit is not None
                         else self.price_input_hit,
@@ -1770,6 +1802,7 @@ class LLMConfig(BaseModel):
                     "reasoning_effort": prov_config.reasoning_effort,
                     "reasoning_disabled_fallback": prov_config.reasoning_disabled_fallback,
                     "thinking_persistence": prov_config.thinking_persistence,
+                    "preserve_thinking": prov_config.preserve_thinking,
                     "timeout": self.timeout,
                     "max_tokens": prov_config.max_tokens
                     if prov_config.max_tokens is not None
@@ -1780,6 +1813,9 @@ class LLMConfig(BaseModel):
                     "compact_threshold": prov_config.compact_threshold
                     if prov_config.compact_threshold is not None
                     else self.compact_threshold,
+                    "drop_hint_threshold": prov_config.drop_hint_threshold
+                    if prov_config.drop_hint_threshold is not None
+                    else self.drop_hint_threshold,
                     "price_input_hit": prov_config.price_input_hit
                     if prov_config.price_input_hit is not None
                     else self.price_input_hit,
@@ -1894,6 +1930,7 @@ class LLMConfig(BaseModel):
                             "reasoning_effort": prov_config.reasoning_effort,
                             "reasoning_disabled_fallback": prov_config.reasoning_disabled_fallback,
                             "thinking_persistence": prov_config.thinking_persistence,
+                            "preserve_thinking": prov_config.preserve_thinking,
                             "timeout": self.timeout,
                             "max_tokens": prov_config.max_tokens
                             if prov_config.max_tokens is not None
@@ -1904,6 +1941,9 @@ class LLMConfig(BaseModel):
                             "compact_threshold": prov_config.compact_threshold
                             if prov_config.compact_threshold is not None
                             else self.compact_threshold,
+                            "drop_hint_threshold": prov_config.drop_hint_threshold
+                            if prov_config.drop_hint_threshold is not None
+                            else self.drop_hint_threshold,
                             "price_input_hit": prov_config.price_input_hit
                             if prov_config.price_input_hit is not None
                             else self.price_input_hit,
@@ -2102,6 +2142,7 @@ class LLMConfig(BaseModel):
             "reasoning_effort": prov_config.reasoning_effort,
             "reasoning_disabled_fallback": prov_config.reasoning_disabled_fallback,
             "thinking_persistence": prov_config.thinking_persistence,
+            "preserve_thinking": prov_config.preserve_thinking,
             "timeout": self.timeout,
             "max_tokens": prov_config.max_tokens
             if prov_config.max_tokens is not None
@@ -2112,6 +2153,9 @@ class LLMConfig(BaseModel):
             "compact_threshold": prov_config.compact_threshold
             if prov_config.compact_threshold is not None
             else self.compact_threshold,
+            "drop_hint_threshold": prov_config.drop_hint_threshold
+            if prov_config.drop_hint_threshold is not None
+            else self.drop_hint_threshold,
             "price_input_hit": prov_config.price_input_hit
             if prov_config.price_input_hit is not None
             else self.price_input_hit,
@@ -2315,6 +2359,11 @@ class MonitorConfig(BaseModel):
     archive_after_days: int = 3
     auto_start_pending_tasks: bool = False
     default_heartbeat_timeout: int = 600  # 事务默认心跳超时时间（秒）
+    # 🔧 事务#2087：备份快照总预算（秒）——工具调用前/迭代开始的快照链
+    # （远程大仓库git快照+外部文件备份串行堆叠）超过预算时跳过快照直接
+    # 执行工具，防止#2081式152秒静默阻塞（bash timeout从execute才开始
+    # 计时，被快照绕过）。0=禁用预算限制（恢复旧行为）
+    snapshot_budget_seconds: int = 60
     # 鹏🐣-忠实助手定时重启配置
     task_manager_check_interval: int = 300  # 检查间隔（秒），默认5分钟
     task_manager_prompt_name: str = "task_manager_prompt"  # 鹏🐣-忠实助手的prompt字段值
@@ -3541,10 +3590,23 @@ def get_default_heartbeat_timeout() -> int:
     获取事务默认心跳超时时间（秒）
 
     Returns:
-        默认心跳超时时间（从配置中读取，默认180秒）
+        默认心跳超时（从配置中读取，默认180秒）
     """
     try:
         config = load_config()
         return config.monitor.default_heartbeat_timeout
     except Exception:
         return 320
+
+
+def get_snapshot_budget_seconds() -> int:
+    """获取备份快照总预算（秒，事务#2087）
+
+    工具调用前/迭代开始的快照链超过该预算时跳过快照直接执行工具。
+    0 表示禁用预算限制。
+    """
+    try:
+        config = load_config()
+        return max(0, int(config.monitor.snapshot_budget_seconds))
+    except Exception:
+        return 60

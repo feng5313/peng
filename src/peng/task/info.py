@@ -11,6 +11,30 @@ master指示：两边调用同样的代码！！不要写两份！
 from peng.common import jsonp as json
 
 
+def next_info_id(info_list_with_status: list[dict]) -> int:
+    """
+    为新info项分配唯一id：现有最大id+1（无id项视为0）
+
+    info项id由add_task_info在写入时分配（持久化后稳定），用于消费时
+    精确标记已读（事务#2064：修复消费瞬间新注入info被mode="all"误杀）。
+
+    Args:
+        info_list_with_status: 带状态的info列表
+
+    Returns:
+        新的唯一id
+    """
+    max_id = 0
+    for item in info_list_with_status:
+        try:
+            item_id = int(item.get("id", 0) or 0)
+        except (TypeError, ValueError):
+            item_id = 0
+        if item_id > max_id:
+            max_id = item_id
+    return max_id + 1
+
+
 def parse_info_to_list_with_status(info_field: str) -> list[dict]:
     """
     解析 info 字段为带状态的列表
@@ -21,11 +45,16 @@ def parse_info_to_list_with_status(info_field: str) -> list[dict]:
     - 旧格式对象：{"info": ["信息1", "信息2"]} -> 转为新格式，默认未读
     - 纯字符串：直接转为单元素列表，默认未读
 
+    项结构：{"content": str, "read": bool, "id": int|缺失}。
+    id为可选字段（add_task_info写入时分配，旧数据无id），
+    sender为可选字段（事务#2089：发送者标识，如 事务#2089/风主🍃，旧数据无），
+    保留解析出的id/sender（不在此处补分配，保证重复解析结果稳定）。
+
     Args:
         info_field: info 字段的原始值
 
     Returns:
-        列表，每个元素为 {"content": str, "read": bool}
+        列表，每个元素为 {"content": str, "read": bool}（可含 "id"/"sender"）
     """
     if not info_field or info_field == "[]" or info_field == "null":
         return []
@@ -37,11 +66,27 @@ def parse_info_to_list_with_status(info_field: str) -> list[dict]:
             # 检查是否是新格式（带状态的dict列表）
             if parsed and isinstance(parsed[0], dict) and "content" in parsed[0]:
                 # 新格式：[{"content": "xxx", "read": false}, ...]
-                return [
-                    {"content": str(item.get("content", "")), "read": bool(item.get("read", False))}
-                    for item in parsed
-                    if item.get("content")
-                ]
+                result = []
+                for item in parsed:
+                    if not item.get("content"):
+                        continue
+                    entry: dict = {
+                        "content": str(item.get("content", "")),
+                        "read": bool(item.get("read", False)),
+                    }
+                    # 保留合法id（add_task_info分配的唯一标识）
+                    try:
+                        item_id = int(item.get("id", 0) or 0)
+                    except (TypeError, ValueError):
+                        item_id = 0
+                    if item_id > 0:
+                        entry["id"] = item_id
+                    # 事务#2089：保留发送者标识（可追踪info来源，旧数据无此字段）
+                    sender = item.get("sender")
+                    if sender:
+                        entry["sender"] = str(sender)
+                    result.append(entry)
+                return result
             else:
                 # 旧格式字符串列表：["信息1", "信息2"]
                 return [

@@ -27,6 +27,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from peng.common.option_split import split_trailing_options
 from peng.common.paths import get_temp_directory
 from peng.message.manager import MessageManager
 from peng.task.manager import TaskManager
@@ -40,6 +41,17 @@ from peng.webui.routes._common import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _cleanup_temp_file(path: str | None) -> None:
+    """删除命令执行时写入的临时内容文件（避免 /task、/msg 残留临时文件）。"""
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError as e:
+        logger.warning(f"删除临时文件失败: {path} ({e})")
 
 
 # ==================== 方案A: Pending Eval缓存（刷新重连支持） ====================
@@ -185,17 +197,35 @@ async def execute_command(request: CommandRequest) -> dict[str, Any]:
             args = parts[2].strip() if len(parts) > 2 else ""
             msg_content_subcmds = {"send", "reply", "content", "title", "search"}
             cmd_args = ["--local", subcmd]
+            msg_temp_path: str | None = None
 
             if subcmd in msg_content_subcmds and args:
+                # 分离「内容」与「尾部选项」（事务#1998）：选项必须作为命令行参数传给
+                # bin/msg 才能生效（如 send 内容 --nest win11 --workdir D:\work\temp），
+                # 否则会被当作内容写进 --file 临时文件而失效。
+                msg_value_flags: tuple[str, ...] = ("--file",)
+                msg_bool_flags: tuple[str, ...] = ("-d", "--delete")
+                if subcmd in ("send", "reply"):
+                    msg_value_flags = (
+                        "--from",
+                        "--to",
+                        "--timeout",
+                        "--file",
+                        "--nest",
+                        "-n",
+                        "--workdir",
+                        "-w",
+                    )
+                    msg_bool_flags = ()
+                content, option_tokens = split_trailing_options(
+                    args, msg_value_flags, msg_bool_flags
+                )
+                cmd_args.extend(option_tokens)
                 if subcmd in ("reply", "content", "title"):
-                    arg_parts = args.split(maxsplit=1)
+                    arg_parts = content.split(maxsplit=1)
                     if arg_parts and arg_parts[0].isdigit():
                         cmd_args.append(arg_parts[0])
                         content = arg_parts[1] if len(arg_parts) > 1 else ""
-                    else:
-                        content = args
-                else:
-                    content = args
 
                 if content:
                     from datetime import datetime as _dt
@@ -204,6 +234,7 @@ async def execute_command(request: CommandRequest) -> dict[str, Any]:
                     with open(temp_path, "w", encoding="utf-8") as _tf:
                         _tf.write(content)
                     cmd_args.extend(["--file", temp_path])
+                    msg_temp_path = temp_path
             elif args:
                 cmd_args.extend(args.split())
 
@@ -220,6 +251,8 @@ async def execute_command(request: CommandRequest) -> dict[str, Any]:
                 return {"success": False, "command": "/msg", "output": "❌ 命令执行超时"}
             except Exception as e:
                 return {"success": False, "command": "/msg", "output": f"❌ 执行失败: {e}"}
+            finally:
+                _cleanup_temp_file(msg_temp_path)
 
         # /task 命令
         if cmd == "/task" or cmd.startswith("/task "):
@@ -230,14 +263,33 @@ async def execute_command(request: CommandRequest) -> dict[str, Any]:
             args = parts[2].strip() if len(parts) > 2 else ""
             task_content_subcmds = {"info", "content", "title", "prompt", "description", "subtask", "result", "metadata", "workdir", "branch", "context"}
             cmd_args = ["--local", subcmd]
+            task_temp_path: str | None = None
 
             if subcmd in task_content_subcmds and args:
-                arg_parts = args.split(maxsplit=1)
+                # 分离「内容」与「尾部选项」（事务#1998）：选项必须作为命令行参数传给
+                # bin/task 才能生效（如 subtask 1 需求 --workdir /x --prompt coder），
+                # 否则会被当作内容写进 --file 临时文件而失效。
+                task_value_flags: tuple[str, ...] = ("--file",)
+                task_bool_flags: tuple[str, ...] = ("-d", "--delete")
+                if subcmd == "subtask":
+                    task_value_flags = (
+                        "--prompt",
+                        "-p",
+                        "--workdir",
+                        "-w",
+                        "--creator",
+                        "-c",
+                        "--file",
+                    )
+                    task_bool_flags = ("--small-model",)
+                content, option_tokens = split_trailing_options(
+                    args, task_value_flags, task_bool_flags
+                )
+                cmd_args.extend(option_tokens)
+                arg_parts = content.split(maxsplit=1)
                 if arg_parts and arg_parts[0].isdigit():
                     cmd_args.append(arg_parts[0])
                     content = arg_parts[1] if len(arg_parts) > 1 else ""
-                else:
-                    content = args
 
                 if content:
                     from datetime import datetime as _dt
@@ -246,6 +298,7 @@ async def execute_command(request: CommandRequest) -> dict[str, Any]:
                     with open(temp_path, "w", encoding="utf-8") as _tf:
                         _tf.write(content)
                     cmd_args.extend(["--file", temp_path])
+                    task_temp_path = temp_path
             elif args:
                 cmd_args.extend(args.split())
 
@@ -262,6 +315,8 @@ async def execute_command(request: CommandRequest) -> dict[str, Any]:
                 return {"success": False, "command": "/task", "output": "❌ 命令执行超时"}
             except Exception as e:
                 return {"success": False, "command": "/task", "output": f"❌ 执行失败: {e}"}
+            finally:
+                _cleanup_temp_file(task_temp_path)
 
         # /cmd 命令
         if cmd == "/cmd" or cmd.startswith("/cmd "):

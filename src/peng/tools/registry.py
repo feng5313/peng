@@ -485,6 +485,7 @@ class ToolRegistry(metaclass=MetaSingleton):
         if self._tools:
             return
         from peng.tools.bash import BashTool, DaemonTool
+        from peng.tools.drop import DROP_TOOL
         from peng.tools.file import EditTool, LineEditTool, ReadTool, WriteTool
         from peng.tools.glob import GlobTool
         from peng.tools.grep import GrepTool
@@ -530,6 +531,8 @@ class ToolRegistry(metaclass=MetaSingleton):
         self.register(InputTool())
         # Nest管理工具
         self.register(NestTool())
+        # 超长工具结果清理工具（事务#2114，上下文长度优化）
+        self.register(DROP_TOOL)
 
     def load_from_directory(self, path: str) -> None:
         """

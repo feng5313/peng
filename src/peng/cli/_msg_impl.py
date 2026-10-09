@@ -943,10 +943,12 @@ def _read_file_content(file_path: str) -> str:
 
 
 def _inject_nest_workdir_defaults(args: list[str]) -> list[str]:
-    """对 send/reply 子命令自动注入 --nest 和 --workdir
+    """对 send 子命令自动注入 --nest 和 --workdir
 
     与 bin/msg 脚本的注入逻辑保持一致，确保 console_scripts 入口
     （.venv/bin/msg）在远程模式下也正确转发 nest 和 workdir。
+    事务#2089：reply 不再注入——回复消息的 nest/workdir 由数据库层
+    从链首消息继承，保证消息链上下文一致。
 
     Args:
         args: 命令行参数列表（不含 --local）
@@ -954,7 +956,7 @@ def _inject_nest_workdir_defaults(args: list[str]) -> list[str]:
     Returns:
         可能追加了 --nest/--workdir 的参数列表
     """
-    _msg_subcommands_needing_defaults = {"send", "reply"}
+    _msg_subcommands_needing_defaults = {"send"}
     _msg_all_subcommands = {
         "list", "trees", "show", "content", "title", "nest", "workdir",
         "delete", "status", "pause", "cancel", "restart", "resume",

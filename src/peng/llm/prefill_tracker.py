@@ -53,6 +53,16 @@ logger = logging.getLogger(__name__)
 # 心跳更新间隔（秒）：远小于默认心跳超时300s，确保prefill期间心跳持续刷新
 PREFILL_HEARTBEAT_INTERVAL = 10.0
 
+# 心跳续命绝对上限（秒）：单个请求prefill超过此时长仍未收到首个chunk，
+# 停止刷新心跳，交由heartbeat_monitor判定并强制恢复。
+# 正常路径下SSE停滞检测（stall_timeout=timeout_read，当前240s）会先触发
+# StreamStallError走错误重试/切换provider流程，远早于此上限；此上限仅在
+# httpx层面卡死（既无数据也无超时异常）等极端场景兜底，防止事务永久
+# 停留在"prefill中"僵死状态（事务#2016：服务崩溃重启期间事务无限prefill）。
+# 取值依据：timeout_read(240s) + 120s余量，覆盖服务自动重启(~3min)场景，
+# 不会在正常长prefill或服务自动恢复窗口内误触发。
+PREFILL_HEARTBEAT_MAX_ELAPSED = 360.0
+
 # 输出文件进度行写入间隔（秒）：CLI watch可见的进度提示（低频避免刷屏）
 PREFILL_OUTPUT_INTERVAL = 60.0
 
@@ -219,6 +229,7 @@ class PrefillTracker:
         """后台追踪线程：定期更新心跳+写状态文件+写输出进度行"""
         start_time = time.time()
         last_output_write = 0.0  # 0.0表示尚未写过输出进度行（首次达标即写）
+        heartbeat_capped_logged = False  # 心跳续命达上限后仅告警一次
 
         while not stop_event.is_set():
             stop_event.wait(PREFILL_HEARTBEAT_INTERVAL)
@@ -229,13 +240,24 @@ class PrefillTracker:
             elapsed = now - start_time
 
             # 1. 更新事务心跳（防止heartbeat_monitor超时误杀）——核心功能，
-            #    从prefill开始就持续刷新，与提示阈值无关
-            try:
-                from peng.task.database import TaskDatabase
+            #    从prefill开始就持续刷新，与提示阈值无关。
+            #    绝对上限：超过PREFILL_HEARTBEAT_MAX_ELAPSED秒仍未收到首个chunk
+            #    则停止续命，让heartbeat_monitor介入（事务#2016兜底）。
+            if elapsed <= PREFILL_HEARTBEAT_MAX_ELAPSED:
+                try:
+                    from peng.task.database import TaskDatabase
 
-                TaskDatabase().update_heartbeat(task_id)
-            except Exception as e:
-                logger.debug(f"[PrefillTracker] 更新心跳失败(task_id={task_id}): {e}")
+                    TaskDatabase().update_heartbeat(task_id)
+                except Exception as e:
+                    logger.debug(f"[PrefillTracker] 更新心跳失败(task_id={task_id}): {e}")
+            elif not heartbeat_capped_logged:
+                heartbeat_capped_logged = True
+                logger.warning(
+                    f"[PrefillTracker] 事务#{task_id} prefill已{elapsed:.0f}秒"
+                    f"无首个chunk，停止心跳续命"
+                    f"（上限{PREFILL_HEARTBEAT_MAX_ELAPSED:.0f}秒），"
+                    f"交由heartbeat_monitor判定处理"
+                )
 
             # 2. prefill未超过PREFILL_OUTPUT_MIN_ELAPSED秒不提示（短请求无感知，
             #    避免"已等待0秒"刷屏）——状态文件与输出进度行同阈值

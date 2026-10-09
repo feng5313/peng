@@ -246,7 +246,30 @@ class BashTool(Tool):
             中断原因字符串，None表示未中断
         """
         _last_known_reply_count = -1
-        check_interval = 2  # 每2秒检查一次
+        # 🔧 事务#2064：检测间隔2秒→1秒（打断更及时）；所有同步DB查询经
+        # asyncio.to_thread+wait_for(5s)执行——DB瞬时卡顿（锁/网络）不再
+        # 阻塞事件循环导致监控协程僵死（00:32:27命令124秒未打断事故的
+        # 防御性根治：无论DB状态如何，监控循环永不卡死）
+        check_interval = 1
+        logger.info(
+            f"[interrupt_monitor] 事务#{task_id}命令中断监控已启动"
+            f"(interval={check_interval}s, check_all={check_all})"
+        )
+
+        async def _db_call(func, *args):
+            """同步DB查询线程化+5秒超时，防止卡死监控/事件循环"""
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(func, *args), timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[interrupt_monitor] 事务#{task_id}DB查询超时5s(跳过本轮): {func.__name__}"
+                )
+                return None
+            except Exception as e:
+                logger.debug(f"[interrupt_monitor] 事务#{task_id}DB查询失败: {e}")
+                return None
 
         while True:
             await asyncio.sleep(check_interval)
@@ -255,17 +278,14 @@ class BashTool(Tool):
             # cancel/pause等系统级控制操作必须立即响应，覆盖所有场景）
             task = None
             if task_manager and task_id:
-                try:
-                    task = task_manager.db.get_task(task_id)
-                    if task:
-                        status = task.get("status")
-                        if status not in ("running", "accepting"):
-                            status_cn = task_manager.STATUS_CHINESE.get(status, status)
-                            return f"事务已被{status_cn}（状态: {status}），命令已终止。请立刻处理事务状态变更。"
-                except Exception as e:
-                    logger.debug(f"[interrupt_monitor] 检查事务状态失败: {e}")
+                task = await _db_call(task_manager.db.get_task, task_id)
+                if task:
+                    status = task.get("status")
+                    if status not in ("running", "accepting"):
+                        status_cn = task_manager.STATUS_CHINESE.get(status, status)
+                        return f"事务已被{status_cn}（状态: {status}），命令已终止。请立刻处理事务状态变更。"
 
-                # 条件2: info字段检查
+                # 条件2: info字段检查（优先级最高——用户紧急指示）
                 # check_all（含sleep命令，原有行为）：任何未读info都打断
                 # 否则（事务#1860）：仅感叹号开头的紧急未读info打断
                 try:
@@ -302,10 +322,17 @@ class BashTool(Tool):
                         from peng.message.database import MessageDatabase
 
                         msg_db = MessageDatabase()
-                        reply_count = msg_db.get_reply_count(message_id)
-                        if _last_known_reply_count >= 0 and reply_count > _last_known_reply_count:
+                        reply_count = await _db_call(
+                            msg_db.get_reply_count, message_id
+                        )
+                        if (
+                            reply_count is not None
+                            and _last_known_reply_count >= 0
+                            and reply_count > _last_known_reply_count
+                        ):
                             return f"根消息#{message_id}收到新回复（当前{reply_count}条），命令已终止。请立刻用message工具查看并处理。"
-                        _last_known_reply_count = reply_count
+                        if reply_count is not None:
+                            _last_known_reply_count = reply_count
                     except Exception as e:
                         logger.debug(f"[interrupt_monitor] 检查消息回复失败: {e}")
                 else:
@@ -317,10 +344,12 @@ class BashTool(Tool):
                         from peng.message.database import MessageDatabase
 
                         msg_db = MessageDatabase()
-                        replies = msg_db.get_processing_replies(
-                            message_id, receiver=get_agent_name()
+                        replies = await _db_call(
+                            msg_db.get_processing_replies,
+                            message_id,
+                            get_agent_name(),
                         )
-                        for reply in replies:
+                        for reply in replies or []:
                             if is_urgent_content(reply.get("content")):
                                 content = (reply.get("content") or "").replace("\\n", "\n")
                                 return (
@@ -478,7 +507,11 @@ class BashTool(Tool):
                 try:
                     done, pending = await asyncio.wait(
                         [bash_task, monitor_task],
-                        timeout=timeout / 1000,
+                        # 🔧 事务#2064：wait超时与bash_task实际超时对齐——
+                        # nest侧ws_timeout=timeout/1000+10，wait若用裸timeout/1000
+                        # 会在nest响应返回前抢先超时，误报"命令执行超时"并cancel
+                        # 尚未返回的命令结果
+                        timeout=timeout / 1000 + 15,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
 
@@ -505,6 +538,10 @@ class BashTool(Tool):
 
                     # 中断监控触发：发送kill命令到远程nest
                     if interrupt_reason:
+                        # 🔧 事务#2064：打断审计日志（此前无日志，无法确认bash打断是否工作）
+                        logger.info(
+                            f"⚡ [bash] 事务#{task_id}远程命令被中断监控终止：{command[:80]} | {interrupt_reason}"
+                        )
                         # 尝试远程终止进程
                         try:
                             await client.bash(
@@ -753,6 +790,10 @@ class BashTool(Tool):
 
                     # 中断监控触发
                     if interrupt_reason:
+                        # 🔧 事务#2064：打断审计日志（此前无日志，无法确认bash打断是否工作）
+                        logger.info(
+                            f"⚡ [bash] 事务#{task_id}命令被中断监控终止：{command[:80]} | {interrupt_reason}"
+                        )
                         await self._kill_proc_safely(proc)
                         # 等待 stream_task 被 cancel 完成
                         for t in pending:

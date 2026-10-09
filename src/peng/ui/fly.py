@@ -1379,14 +1379,27 @@ def run_fly(argv: list[str] | None = None) -> int:
                     ensure_dir_with_owner(log_dir)
                     nest_log = str(log_dir / "nest_connect.log")
                     chown_to_project_owner(nest_log)
-                    with open(nest_log, "a", encoding="utf-8", errors="replace") as log_f:
+                    # 【关键】open 后必须再 chown：文件不存在时上面的 chown 是 no-op，
+                    # root 新建的文件会归 root 所有，导致之后 feng 服务的
+                    # systemd 进程无法写入、内置 local nest 启动失败(Permission denied)
+                    from peng.common.paths import (
+                        open_log_with_owner,
+                        get_popen_owner_context,
+                    )
+
+                    with open_log_with_owner(nest_log) as log_f:
+                        # root 运行 fly 时降权为项目属主启动子进程，
+                        # 避免子进程创建的文件（日志/缓存/__pycache__）污染项目目录属主
+                        _env, _preexec = get_popen_owner_context()
                         proc = _sp.Popen(
                             nest_cmd,
                             stdout=log_f,
                             stderr=_sp.STDOUT,
                             cwd=str(project_root),
+                            env=_env,
                             close_fds=True,
                             start_new_session=True,
+                            preexec_fn=_preexec,
                         )
                     print(f"🪹  ✅ local nest 已手动启动 (PID: {proc.pid})")
                 except Exception as e:

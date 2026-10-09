@@ -12,6 +12,8 @@
 1. ReadTool - 分批读取、行截断、字节限制、二进制检测、目录读取、图片/PDF支持
 2. WriteTool - 检查存在、显示diff
 3. EditTool - 多策略智能替换（9种Replacer按优先级尝试）
+4. 四工具 execute 入口自动纠正 LLM 用错的参数名（file_path→filePath、
+   old_string→oldString、new_string→newString 等 snake_case→camelCase）
 
 opencode版权声明：  Copyright (c) 2025 Kujtim Hoxha
 
@@ -97,6 +99,53 @@ def convert_to_line_ending(text: str, ending: str) -> str:
     if ending == "\n":
         return text.replace("\r\n", "\n")
     return text.replace("\n", "\r\n")
+
+
+# ============================================================
+# 参数名自动纠错 - LLM 偶发用 snake_case 调用 camelCase 参数
+# ============================================================
+
+
+def _snake_to_camel(name: str) -> str:
+    """snake_case 转 camelCase：file_path → filePath，old_string → oldString"""
+    head, *rest = name.split("_")
+    return head + "".join(part[:1].upper() + part[1:] for part in rest)
+
+
+def normalize_arg_names(kwargs: dict[str, Any], properties: dict[str, Any]) -> dict[str, Any]:
+    """自动纠正 LLM 用错的参数名（snake_case → 工具声明的 camelCase）。
+
+    大模型偶发以 file_path/old_string/new_string/replace_all/start_line/end_line
+    等蛇形命名调用 read/write/edit/line_edit（正确名为 filePath/oldString/
+    newString/replaceAll/startLine/endLine），错误参数被忽略后 filePath 落空，
+    返回"filePath 是必填项"，白白浪费一轮迭代重试。按工具声明的 JSON
+    Schema properties 自动纠错：
+
+    - 仅当传入参数名未在 properties 中声明、且其 camelCase 形式恰好是
+      已声明参数时才重命名（file_path→filePath）；其余未知参数原样保留；
+    - 同时传了正确名和错误名（filePath 与 file_path 并存）时正确名优先，
+      绝不覆盖；
+    - 不含下划线的参数名不受影响（offset/limit/content 等本就合法）。
+    """
+    if not kwargs or not properties:
+        return kwargs
+    corrected: dict[str, Any] = {}
+    renames: list[str] = []
+    for key, value in kwargs.items():
+        if key in properties:
+            corrected[key] = value
+            continue
+        camel = _snake_to_camel(key)
+        if camel != key and camel in properties:
+            if camel not in kwargs:
+                corrected[camel] = value
+                renames.append(f"{key}→{camel}")
+            # 正确名已存在：丢弃错误名的冗余副本（正确名优先，不覆盖）
+        else:
+            corrected[key] = value
+    if renames:
+        logger.info(f"🔧 已自动纠正 LLM 用错的参数名: {', '.join(renames)}")
+    return corrected
 
 
 # ============================================================
@@ -761,6 +810,59 @@ _EXTRA_IMAGE_EXTENSIONS = {".webp", ".ico", ".tiff", ".tif", ".avif", ".heic", "
 # 透传触发），故非白名单格式进入上下文前必须统一转码 PNG（无损）
 PROVIDER_SAFE_IMAGE_MIMES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
 
+# PIL 标准安装即原生支持的图片 MIME（png/jpeg/gif/webp/bmp/tiff/ico，
+# 无需额外插件）。事务#1959：这些格式的 UnidentifiedImageError 必然意味着
+# 数据为空/损坏/根本不是图片（而非"缺解码插件"），必须拒绝入库——
+# 0字节 png 正是借此豁免分支透传空 data URL，导致 GLM 400
+# "file必须传入file_id、file_url、file_data至少之一" 且无法自愈。
+# 仅 heic/avif 等确实依赖可选插件的格式保留原始数据透传。
+PIL_BUILTIN_IMAGE_MIMES = frozenset(
+    {
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "image/bmp",
+        "image/x-bmp",
+        "image/x-ms-bmp",
+        "image/tiff",
+        "image/x-icon",
+        "image/vnd.microsoft.icon",
+    }
+)
+
+# 🔧 事务#2119：PIL 识别出的**实际**图片格式 → MIME 映射。图片附件的 MIME
+# 必须以内容为准：read 工具/webui 附件是按扩展名推导 mime 的，文件被误命名
+# （截图脚本把 BMP 数据存成 .png，事务#2081 实测 w_R1.png 魔数为 'BM'、
+# 520x688）时会构造出 `data:image/png;base64,<BMP字节>` 这种声明与实际不符
+# 的附件——provider 按声明解码必然失败（本地 Strata 引擎返回 400
+# "the image could not be read: cannot read the image ..."，GLM 等外部 API
+# 同样不支持 BMP），且该错误原先不匹配任何关键词，被当普通 4xx 处理 →
+# 重试后切换 provider → 所有 provider 都失败 → 事务卡在等待循环。
+PIL_FORMAT_TO_MIME = {
+    "PNG": "image/png",
+    "JPEG": "image/jpeg",
+    "JPG": "image/jpeg",
+    "MPO": "image/jpeg",  # 多帧JPEG（部分手机拍照），按JPEG处理
+    "GIF": "image/gif",
+    "WEBP": "image/webp",
+    "BMP": "image/bmp",
+    "DIB": "image/bmp",
+    "TIFF": "image/tiff",
+    "ICO": "image/x-icon",
+    "CUR": "image/x-icon",
+    "AVIF": "image/avif",
+    "HEIF": "image/heif",
+    "HEIC": "image/heic",
+}
+
+# 🔧 事务#1959：非文本格式附件的最小字节数下限。图片有PIL全量解码校验、
+# PDF有魔数校验，但PDF/无法本地解码的格式（缺插件图片）还须体积下限：
+# <1KB 的PDF/媒体文件必然是空壳/截断/生成未完成的产物（最小有效文档
+# 也远超1KB），直接拒绝防止坏附件污染上下文（multimodal.py 的
+# MIN_MEDIA_FILE_BYTES 从此处导入，保持单一事实源）。
+MIN_BINARY_ATTACHMENT_BYTES = 1024
+
 
 def normalize_image_bytes(data: bytes, mime: str) -> tuple[bytes, str, str]:
     """规范化图片字节流：全量解码验证 + 缩放至 1M 像素内 + 转码为 provider 通用格式。
@@ -768,10 +870,12 @@ def normalize_image_bytes(data: bytes, mime: str) -> tuple[bytes, str, str]:
     三项处理（🔧 事务#1834 新增格式转码）：
     1. 全量解码验证（load）：截断/损坏数据在 load() 时抛异常，由调用方拒绝入库
     2. 等比缩放到 MAX_IMAGE_PIXELS 以内（仅内存中处理，不修改原图）
-    3. 格式规范化：mime 不在 PROVIDER_SAFE_IMAGE_MIMES 白名单（BMP/TIFF/ICO
+    3. 格式规范化：**实际内容格式**（PIL识别，🔧 事务#2119 起按内容而非扩展名
+       推导的 mime 判断）不在 PROVIDER_SAFE_IMAGE_MIMES 白名单（BMP/TIFF/ICO
        等 provider 普遍不支持的格式）时转码为 PNG（无损，截图类体积通常更小）；
        像素≤1M 时原样透传非白名单格式会在部分 provider（GLM 不支持 BMP）
-       触发 400 图片解析错误，清除附件重试又丢失视觉信息，导致反复报错
+       触发 400 图片解析错误，清除附件重试又丢失视觉信息，导致反复报错。
+       返回的 MIME 始终与实际字节内容一致（扩展名与实际不符的文件按内容纠正）。
 
     仅在内存中处理，不修改磁盘上的原图文件。
 
@@ -795,6 +899,14 @@ def normalize_image_bytes(data: bytes, mime: str) -> tuple[bytes, str, str]:
         # 截断/损坏文件在缩放或发送前都不会暴露问题，必须在读取时 load()
         # 全量解码，损坏数据一律在此拒绝（配合 _build_binary_attachment）
         src.load()
+        # 🔧 事务#2119：格式以**实际内容**（PIL识别）为准，而非调用方按扩展名
+        # 推导的 mime（DIB/BMP 数据存成 .png 时按声明透传 → provider 按声明
+        # 解码失败，事务#2081）。纠正声明后，非白名单实际格式才会进入下方
+        # 转码分支，保证发出的 data URL 的 mime 与字节内容始终一致。
+        _declared_mime = mime
+        _detected_mime = PIL_FORMAT_TO_MIME.get((src.format or "").upper())
+        mime = _detected_mime or mime
+        _mime_corrected = bool(_detected_mime) and _detected_mime != _declared_mime
         # 按 EXIF orientation 摆正像素方向（重编码后 EXIF 会丢失，避免方向错误）
         src = ImageOps.exif_transpose(src) or src
         width, height = src.size
@@ -808,7 +920,13 @@ def normalize_image_bytes(data: bytes, mime: str) -> tuple[bytes, str, str]:
             # 非白名单格式转码：脱离源文件句柄复制后再编码
             img = src.copy()
         else:
-            # 白名单格式且未超像素上限：原样返回
+            # 白名单格式且未超像素上限：原样返回（mime 已按实际内容纠正）
+            if _mime_corrected:
+                return (
+                    data,
+                    mime,
+                    f"（已按实际内容纠正格式声明（{_declared_mime}→{mime}），原图未修改）",
+                )
             return data, mime, ""
 
         # 重新编码。缩放时按原格式重编码（JPEG/WEBP 有损压缩控制体积）；
@@ -832,6 +950,9 @@ def normalize_image_bytes(data: bytes, mime: str) -> tuple[bytes, str, str]:
     notes = []
     if needs_downscale:
         notes.append(f"已缩放至 ≤{MAX_IMAGE_PIXELS_LABEL}")
+    if _mime_corrected:
+        # 文件被误命名（扩展名与实际内容不符）时提示模型，便于其修正生成脚本
+        notes.append(f"已按实际内容纠正格式声明（{_declared_mime}→{mime}）")
     if out_mime != mime:
         short = out_mime.split("/", 1)[1].upper()  # png→PNG jpeg→JPEG
         notes.append(f"已转换为{short}通用格式")
@@ -858,15 +979,40 @@ def _build_binary_attachment(file_path: str, b64_data: str, mime: str) -> DualOu
     （GLM不支持BMP）以400"图片输入格式/解析错误"拒绝，清除附件重试又丢失
     视觉信息导致模型反复read反复失败（事务#1822），故统一转码PNG后入库。
 
-    例外：PIL 完全不识别的格式（UnidentifiedImageError，如无插件时的
-    heic/avif）无法验证，保留原始数据交由 vision provider 判断。
+    🔧 事务#1959：内容有效性硬校验——空数据（0字节文件）与 PIL 内建格式
+    （png/jpeg/gif/webp/bmp/tiff/ico）的 UnidentifiedImageError 一律拒绝
+    入库。0字节 png 此前借"PIL不识别→保留原始数据"豁免分支透传空
+    data URL，附件入库后 GLM 报 400 "file必须传入file_id、file_url、
+    file_data至少之一"，且该错误不匹配内容解析关键词、无法自愈，只能
+    人工回滚清除上下文。PDF 同样校验非空与 %PDF 魔数。
+
+    例外：heic/avif 等依赖可选插件的格式（PIL_BUILTIN_IMAGE_MIMES 之外）
+    无法本地验证，保留原始数据交由 vision provider 判断。
     """
     import base64
 
     kind = "图片" if mime.startswith("image/") else "PDF"
+
+    # 前置解码（图片/PDF共用）：b64 非法或解码后为空一律拒绝
+    try:
+        raw = base64.b64decode(b64_data)
+    except Exception as e:
+        logger.warning(f"read 附件base64解码失败，拒绝返回: {file_path}: {e}")
+        msg = f"{kind} 读取失败: 文件数据编码异常（base64解码失败），请检查源文件"
+        return DualOutput(
+            summary=msg,
+            display=f"❌ {msg}: {file_path}\n解码错误: {e}",
+        )
+    if not raw:
+        logger.warning(f"read {kind}文件为空(0字节)，拒绝作为附件返回: {file_path}")
+        msg = (
+            f"{kind} 读取失败: 文件为空(0字节)，可能生成/截图未完成或失败，"
+            f"请检查生成脚本或重新生成后再读取"
+        )
+        return DualOutput(summary=msg, display=f"❌ {msg}: {file_path}")
+
     if kind == "图片":
         try:
-            raw = base64.b64decode(b64_data)
             data, mime, note = normalize_image_bytes(raw, mime)
             if note:
                 b64_data = base64.b64encode(data).decode("utf-8")
@@ -875,16 +1021,10 @@ def _build_binary_attachment(file_path: str, b64_data: str, mime: str) -> DualOu
         except Exception as e:
             from PIL import UnidentifiedImageError
 
-            if isinstance(e, UnidentifiedImageError) or (
+            _unidentified = isinstance(e, UnidentifiedImageError) or (
                 type(e).__name__ == "UnidentifiedImageError"
-            ):
-                # PIL 不识别该格式（可能缺解码插件）：无法本地验证，
-                # 保留原始数据（provider 端可能支持）
-                logger.warning(
-                    f"read 图片格式无法本地验证(PIL不识别)，保留原始数据: {file_path}: {e}"
-                )
-                note = ""
-            else:
+            )
+            if not _unidentified:
                 # 可识别格式但解码失败（截断/损坏）：拒绝入库，防止污染上下文
                 logger.warning(
                     f"read 图片解码失败(文件可能损坏)，拒绝作为附件返回: {file_path}: {e}"
@@ -894,7 +1034,53 @@ def _build_binary_attachment(file_path: str, b64_data: str, mime: str) -> DualOu
                     summary=msg,
                     display=f"❌ {msg}: {file_path}\n解码错误: {e}",
                 )
+            if mime.lower() in PIL_BUILTIN_IMAGE_MIMES:
+                # 内建格式（png/jpeg/gif/webp/bmp/tiff/ico）PIL 都不识别：
+                # 数据必然为空/损坏/非图片（无"缺插件"可能），拒绝入库。
+                # 0字节png（事务#1959）与垃圾数据冒充图片均在此拦截。
+                logger.warning(
+                    f"read 图片数据无效(PIL不识别的内建格式{mime})，拒绝作为附件返回: {file_path}: {e}"
+                )
+                msg = (
+                    f"{kind} 读取失败: 文件内容无效（{mime} 数据无法识别为图片），"
+                    f"文件可能为空/损坏或并非真实图片，请重新生成"
+                )
+                return DualOutput(
+                    summary=msg,
+                    display=f"❌ {msg}: {file_path}\n识别错误: {e}",
+                )
+            # 依赖可选插件的格式（heic/avif等）：无法本地验证内容，
+            # 至少执行非文本格式体积下限（<1KB必然是空壳/截断/未完成），
+            # 达标才保留原始数据（provider端可能支持）
+            if len(raw) < MIN_BINARY_ATTACHMENT_BYTES:
+                logger.warning(
+                    f"read 图片文件过小({len(raw)}字节<1KB，无法本地验证且疑损坏/未完成)，"
+                    f"拒绝作为附件返回: {file_path}"
+                )
+                msg = (
+                    f"{kind} 读取失败: 文件过小（{len(raw)}字节 <1KB），"
+                    f"疑为损坏或生成未完成，请重新生成后再读取"
+                )
+                return DualOutput(summary=msg, display=f"❌ {msg}: {file_path}")
+            logger.warning(
+                f"read 图片格式无法本地验证(可能缺解码插件)，保留原始数据: {file_path}: {e}"
+            )
+            note = ""
     else:
+        # PDF：非空+魔数+体积下限三重校验（伪造/截断/空壳数据直接拒绝）
+        if len(raw) < MIN_BINARY_ATTACHMENT_BYTES:
+            logger.warning(
+                f"read PDF文件过小({len(raw)}字节<1KB，疑损坏/未完成)，拒绝作为附件返回: {file_path}"
+            )
+            msg = (
+                f"PDF 读取失败: 文件过小（{len(raw)}字节 <1KB），"
+                f"疑为损坏或生成未完成，请重新生成后再读取"
+            )
+            return DualOutput(summary=msg, display=f"❌ {msg}: {file_path}")
+        if not raw.startswith(b"%PDF"):
+            logger.warning(f"read PDF魔数校验失败，拒绝作为附件返回: {file_path}")
+            msg = "PDF 读取失败: 文件内容无效（缺少PDF文件头），文件可能损坏或并非PDF"
+            return DualOutput(summary=msg, display=f"❌ {msg}: {file_path}")
         note = ""
 
     msg = f"{kind} 读取成功{note}"
@@ -1078,6 +1264,8 @@ class ReadTool(Tool):
 
     async def execute(self, **kwargs: Any) -> DualOutput:
         """执行读取文件 - 通过 nest 远程，local nest 不可用时本地 fallback"""
+        # 🔧 自动纠正 LLM 用错的参数名（file_path → filePath 等）
+        kwargs = normalize_arg_names(kwargs, self.parameters.get("properties", {}))
         file_path: str = kwargs.get("filePath", "")
         offset: int = kwargs.get("offset", 1)
         limit: int = kwargs.get("limit", DEFAULT_READ_LIMIT)
@@ -1344,6 +1532,8 @@ class WriteTool(Tool):
 
     async def execute(self, **kwargs: Any) -> DualOutput:
         """执行写入文件 - 通过 nest 远程，local nest 不可用时本地 fallback"""
+        # 🔧 自动纠正 LLM 用错的参数名（file_path → filePath 等）
+        kwargs = normalize_arg_names(kwargs, self.parameters.get("properties", {}))
         file_path: str = kwargs.get("filePath", "")
         content: str = kwargs.get("content", "")
 
@@ -1547,6 +1737,8 @@ class EditTool(Tool):
 
     async def execute(self, **kwargs: Any) -> DualOutput:
         """执行编辑文件 - 通过 nest 远程，local nest 不可用时本地 fallback"""
+        # 🔧 自动纠正 LLM 用错的参数名（file_path/old_string/new_string → filePath/oldString/newString 等）
+        kwargs = normalize_arg_names(kwargs, self.parameters.get("properties", {}))
         file_path: str = kwargs.get("filePath", "")
         oldString: str = kwargs.get("oldString", "")
         newString: str = kwargs.get("newString", "")
@@ -1837,6 +2029,8 @@ class LineEditTool(Tool):
 
     async def execute(self, **kwargs: Any) -> DualOutput:
         """执行按行编辑 - 通过 nest 远程，local nest 不可用时本地 fallback"""
+        # 🔧 自动纠正 LLM 用错的参数名（file_path/start_line/end_line → filePath/startLine/endLine 等）
+        kwargs = normalize_arg_names(kwargs, self.parameters.get("properties", {}))
         file_path: str = kwargs.get("filePath", "")
         operation: str = kwargs.get("operation", "")
         start_line = kwargs.get("startLine")
@@ -2154,11 +2348,13 @@ __all__ = [
     "normalize_line_endings",
     "detect_line_ending",
     "convert_to_line_ending",
+    "normalize_arg_names",
     "is_binary_file",
     "get_mime_type",
     "is_image_file",
     "is_pdf_file",
     "PROVIDER_SAFE_IMAGE_MIMES",
+    "PIL_FORMAT_TO_MIME",
     "normalize_image_bytes",
     "find_similar_files",
     # 替换器

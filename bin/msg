@@ -77,9 +77,10 @@ if __name__ == "__main__" and _VENV_PYTHON.exists() and sys.executable != str(_V
 _force_local = "--local" in sys.argv
 _clean_args = [a for a in sys.argv[1:] if a != "--local"]
 
-# 对于 send/reply 子命令和无子命令模式，自动注入 --nest 和 --workdir
+# 对于 send 子命令，自动注入 --nest 和 --workdir（事务#2089：reply 不再注入——
+# 回复消息的 nest/workdir 由数据库层从链首消息继承，保证消息链上下文一致）
 # 连接优先级：本地服务优先，无本地服务时连接默认 nest 的 host
-_msg_subcommands_needing_defaults = {"send", "reply"}
+_msg_subcommands_needing_defaults = {"send"}
 _msg_all_subcommands = {
     "list",
     "trees",

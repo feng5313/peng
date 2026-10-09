@@ -2367,6 +2367,39 @@ class TaskDatabase(metaclass=MetaSingleton):
             logger.error(f"插入事务控制失败: {e}")
             return None
 
+    def count_recent_task_controls(self, task_id: int, action: str, minutes: int = 15) -> int:
+        """🔧 事务#2084：统计事务近期控制命令条数（引擎自触发restart死循环熔断用）
+
+        背景：事务#2080因服务端引擎未就绪被误判为上下文超标，引擎反复
+        insert restart控制（每次restart清空历史重新请求，服务端问题依旧），
+        20分钟内死循环93次。本方法供熔断逻辑查询近期窗口内的同类控制次数。
+
+        Args:
+            task_id: 事务ID
+            action: 控制动作（如restart）
+            minutes: 时间窗口（分钟）
+
+        Returns:
+            窗口内匹配的控制条数；查询失败返回0（由调用方决定降级行为）
+        """
+        try:
+            from datetime import datetime, timedelta
+
+            since = (datetime.now() - timedelta(minutes=minutes)).isoformat()
+            with self._get_connection() as conn:
+                cursor = conn.execute(
+                    """SELECT COUNT(*) AS n FROM task_controls
+                       WHERE task_id = %s AND action = %s AND created_at >= %s""",
+                    (task_id, action, since),
+                )
+                row = cursor.fetchone()
+                return int(row["n"]) if row else 0
+        except Exception as e:
+            import logging
+
+            logging.getLogger(__name__).error(f"统计事务控制条数失败: {e}")
+            return 0
+
     def get_tasks_by_message_ids_basic(
         self, message_ids: list[int], status: str | None = None
     ) -> list[dict[str, Any]]:
@@ -3216,9 +3249,15 @@ class TaskDatabase(metaclass=MetaSingleton):
 
     # ==================== Info 字段管理 ====================
 
-    def add_task_info(self, task_id: int, info_content: str, dedup: bool = False) -> bool:
+    def add_task_info(
+        self,
+        task_id: int,
+        info_content: str,
+        sender: str | None = None,
+        dedup: bool = False,
+    ) -> bool:
         """
-        向事务添加一条info信息（追加到末尾，默认未读）
+        向事务添加一条info信息（追加到末尾，默认未读，分配唯一id）
 
         使用 SELECT ... FOR UPDATE 在单个数据库事务中原子地执行 read-modify-write，
         防止多进程并发时的 Lost Update 问题。
@@ -3226,12 +3265,17 @@ class TaskDatabase(metaclass=MetaSingleton):
         Args:
             task_id: 事务ID
             info_content: 信息内容
+            sender: 发送者标识（事务#2089：如 事务#2089 / 风主🍃，None=系统消息不显示来源）
             dedup: 是否去重（为True时，如果最后一条未读info内容相同则不重复添加）
 
         Returns:
             是否成功
         """
-        from peng.task.info import parse_info_to_list_with_status, serialize_info_list
+        from peng.task.info import (
+            next_info_id,
+            parse_info_to_list_with_status,
+            serialize_info_list,
+        )
 
         with self._get_connection() as conn:
             # SELECT ... FOR UPDATE 锁定行，防止并发修改
@@ -3254,7 +3298,17 @@ class TaskDatabase(metaclass=MetaSingleton):
                             return True  # 内容相同，跳过
                         break  # 只检查最后一条未读的
 
-            info_list.append({"content": info_content, "read": False})
+            # 分配唯一id（事务#2064：消费时按id精确标记已读，
+            # 修复消费瞬间新注入的info被 mode="all" 误标已读而丢失）
+            new_item: dict = {
+                "content": info_content,
+                "read": False,
+                "id": next_info_id(info_list),
+            }
+            # 事务#2089：记录发送者标识（可追踪info来源）
+            if sender:
+                new_item["sender"] = sender
+            info_list.append(new_item)
 
             # 限制info列表最大数量，避免无限累积（保留最新的50条）
             MAX_INFO_ITEMS = 50
@@ -3384,6 +3438,160 @@ class TaskDatabase(metaclass=MetaSingleton):
             )
 
         # 通知 WebUI
+        self._notify_webui("updated", task_id, {"info": new_value})
+        return True
+
+    def mark_info_items_read(self, task_id: int, items: list[dict], read: bool = True) -> bool:
+        """
+        精确标记**指定**info项为已读/未读（事务#2064核心修复）
+
+        与 set_task_info_status(mode="all") 的关键区别：只标记传入的项，
+        消费瞬间其他进程新注入的info**不受影响**（保持未读，等待下轮消费/
+        紧急中断检测）。修复场景：tool_engine._get_task_info 消费未读info
+        期间（读列表→标记已读之间），用户注入的感叹号紧急info被 mode="all"
+        误标已读导致内容丢失且永不打断。
+
+        匹配规则（FOR UPDATE锁内对最新列表）：
+        - 项有id → 按id精确匹配（add_task_info写入时分配，唯一）
+        - 项无id（旧数据）→ 按content匹配且当前未读的同内容项（语义等价）
+
+        Args:
+            task_id: 事务ID
+            items: 要标记的info项列表（get_task_info返回的元素，含content，可含id）
+            read: True=标记已读，False=标记未读
+
+        Returns:
+            是否成功（事务不存在返回False）
+        """
+        from peng.task.info import parse_info_to_list_with_status, serialize_info_list
+
+        if not items:
+            return True
+
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT info FROM tasks WHERE id = %s FOR UPDATE", (task_id,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return False
+
+            current_info = row.get("info", "[]") or "[]"
+            info_list = parse_info_to_list_with_status(current_info)
+
+            # 待标记项的id集合与内容集合
+            target_ids: set[int] = set()
+            target_contents: set[str] = set()
+            for item in items:
+                try:
+                    item_id = int(item.get("id", 0) or 0)
+                except (TypeError, ValueError):
+                    item_id = 0
+                if item_id > 0:
+                    target_ids.add(item_id)
+                else:
+                    target_contents.add(str(item.get("content", "")))
+
+            marked = 0
+            for entry in info_list:
+                try:
+                    entry_id = int(entry.get("id", 0) or 0)
+                except (TypeError, ValueError):
+                    entry_id = 0
+                if entry_id > 0 and entry_id in target_ids:
+                    entry["read"] = read
+                    marked += 1
+                elif entry_id == 0 and entry.get("content") in target_contents and not entry.get("read"):
+                    # 无id旧数据：按内容匹配（仅未读项，避免误改历史已读同内容项）
+                    entry["read"] = read
+                    marked += 1
+
+            if marked == 0:
+                return True  # 无匹配项（可能已被并发标记），无需写回
+
+            new_value = serialize_info_list(info_list)
+            conn.execute(
+                "UPDATE tasks SET info = %s WHERE id = %s", (new_value, task_id)
+            )
+
+        # 通知 WebUI
+        self._notify_webui("updated", task_id, {"info": new_value})
+        return True
+
+    def delete_task_info_item(self, task_id: int, index: int) -> dict | None:
+        """
+        原子删除指定索引的info项（事务#2064：WebUI单条删除端点原子化）
+
+        FOR UPDATE锁内基于最新列表按index删除，替换WebUI端旧的手工
+        read-pop-update覆盖写（旧实现并发时会回滚其他进程的注入/状态修改）。
+
+        Args:
+            task_id: 事务ID
+            index: info项索引（0-based）
+
+        Returns:
+            被删除的项（dict，含content/read/id），索引越界返回None；
+            返回{}表示事务不存在
+        """
+        from peng.task.info import parse_info_to_list_with_status, serialize_info_list
+
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT info FROM tasks WHERE id = %s FOR UPDATE", (task_id,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return {}
+
+            current_info = row.get("info", "[]") or "[]"
+            info_list = parse_info_to_list_with_status(current_info)
+
+            if index < 0 or index >= len(info_list):
+                return None
+
+            removed_item = info_list.pop(index)
+            new_value = serialize_info_list(info_list)
+            conn.execute(
+                "UPDATE tasks SET info = %s WHERE id = %s", (new_value, task_id)
+            )
+
+        self._notify_webui("updated", task_id, {"info": new_value})
+        return removed_item
+
+    def set_task_info_item_status(self, task_id: int, index: int, read: bool) -> bool | None:
+        """
+        原子设置指定索引info项的已读状态（事务#2064：WebUI单条标记端点原子化）
+
+        Args:
+            task_id: 事务ID
+            index: info项索引（0-based）
+            read: True=已读，False=未读
+
+        Returns:
+            True成功；False索引越界；None事务不存在
+        """
+        from peng.task.info import parse_info_to_list_with_status, serialize_info_list
+
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT info FROM tasks WHERE id = %s FOR UPDATE", (task_id,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            current_info = row.get("info", "[]") or "[]"
+            info_list = parse_info_to_list_with_status(current_info)
+
+            if index < 0 or index >= len(info_list):
+                return False
+
+            info_list[index]["read"] = read
+            new_value = serialize_info_list(info_list)
+            conn.execute(
+                "UPDATE tasks SET info = %s WHERE id = %s", (new_value, task_id)
+            )
+
         self._notify_webui("updated", task_id, {"info": new_value})
         return True
 

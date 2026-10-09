@@ -292,11 +292,18 @@ def _parse_alive_pids(stdout: str | None) -> set[int]:
     return alive
 
 
-def _http_nest_exec(nest_name: str, command: str) -> dict[str, Any] | None:
+def _http_nest_exec(
+    nest_name: str, command: str, timeout: int = 15
+) -> dict[str, Any] | None:
     """经本地fly service HTTP API在nest上执行命令（CLI独立进程场景）
 
     CLI本地模式下独立进程内无nest连接（连接在fly service进程内），
     经 /api/nest/exec 端点转发执行。
+
+    Args:
+        nest_name: nest名称
+        command: 要执行的bash命令
+        timeout: 命令超时秒数（HTTP超时为其+5）
 
     Returns:
         {"exit_code": int, "stdout": str, "stderr": str}；服务不可达/失败返回None
@@ -316,11 +323,11 @@ def _http_nest_exec(nest_name: str, command: str) -> dict[str, Any] | None:
         except Exception:
             pass
         params = urllib.parse.urlencode(
-            {"nest": nest_name, "command": command, "timeout": 15}
+            {"nest": nest_name, "command": command, "timeout": timeout}
         )
         url = f"http://localhost:{port}/api/nest/exec?{params}"
         req = urllib.request.Request(url, data=b"", method="POST")
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=timeout + 5) as resp:
             result = _json.loads(resp.read().decode("utf-8"))
         if result.get("success"):
             return result
@@ -539,27 +546,43 @@ def _run_async(coro):
 def _kill_remote_daemon_sync(
     nest_name: str, pid: int, platform: str | None = None
 ) -> tuple[bool, str]:
-    """通过nest bridge同步杀死远程daemon（CLI使用）"""
-    from peng.nest.bridge import NestBridgeManager
-    from peng.nest.protocol import NestRequest
+    """通过nest同步杀死远程daemon（CLI使用）
 
-    manager = NestBridgeManager.get_instance()
-    conn = manager.get_connection(nest_name)
-    if not conn:
-        return False, f"nest连接未找到: {nest_name}"
-
+    与_check_remote_alive_pids_sync同策略的两级通道：
+    1. 进程内nest连接（fly service/WebUI/CLI转发服务端进程内）
+    2. fallback: 本地fly service HTTP API（CLI独立进程场景，进程内无连接）
+    """
     cmd = _build_remote_kill_command(pid, platform)
-    request = NestRequest(
-        type="bash",
-        params={"command": cmd, "_skip_security": True},
-    )
+    result: dict[str, Any] | None = None
+
+    # 1) 进程内nest连接（fly service/WebUI/CLI转发服务端进程内）
     try:
-        response = _run_async(conn.send_request(request, timeout=30.0))
-        if response.error:
-            return False, str(response.error)
-        return _parse_remote_kill_result(response.data, platform)
+        from peng.nest.bridge import NestBridgeManager
+        from peng.nest.protocol import NestRequest
+
+        conn = NestBridgeManager.get_instance().get_connection(nest_name)
+        if conn:
+            request = NestRequest(
+                type="bash",
+                params={"command": cmd, "_skip_security": True},
+            )
+            response = _run_async(conn.send_request(request, timeout=30.0))
+            if not response.error:
+                result = response.data or {}
+            else:
+                logger.debug(f"进程内nest连接kill失败(nest={nest_name}): {response.error}")
+    except ImportError:
+        pass
     except Exception as e:
-        return False, str(e)
+        logger.debug(f"进程内nest连接异常(nest={nest_name}): {e}")
+
+    # 2) fallback: 本地fly service HTTP API（CLI独立进程场景）
+    if result is None:
+        result = _http_nest_exec(nest_name, cmd, timeout=30)
+
+    if result is None:
+        return False, f"nest连接未找到: {nest_name}"
+    return _parse_remote_kill_result(result, platform)
 
 
 def _stop_entry_sync(entry: dict[str, Any]) -> tuple[bool, str]:

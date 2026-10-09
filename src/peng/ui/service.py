@@ -37,6 +37,40 @@ AGENT_NAME = get_agent_name()
 STOP_SIGNAL_FILENAME = "fly_stop_service_signal_0x7f3d9c2a"
 
 
+def _open_nest_log_with_recovery(nest_log: str):
+    """打开 nest connect 日志文件，遇到属主异常的历史残留文件时自愈
+
+    自愈策略（逐级降级，保证 local nest 不因日志权限问题无法启动）：
+    1. 正常打开（root 时由 open_log_with_owner 顺带修复属主）
+    2. PermissionError：属主异常的残留文件（如曾被 root 命令创建）→
+       删除重建（项目属主对 logs 目录有写权限，可删除目录内任意文件）
+    3. 仍失败（目录权限也异常）：改用系统临时目录文件兜底
+
+    Args:
+        nest_log: 日志文件路径
+
+    Returns:
+        已打开的文件对象
+    """
+    from peng.common.paths import open_log_with_owner
+
+    try:
+        return open_log_with_owner(nest_log)
+    except PermissionError:
+        logger.warning(f"nest日志 {nest_log} 无写入权限，尝试删除重建...")
+
+    try:
+        os.unlink(nest_log)
+        return open_log_with_owner(nest_log)
+    except OSError as e:
+        logger.warning(f"nest日志 {nest_log} 删除重建失败({e})，改用临时文件兜底")
+
+    import tempfile
+
+    fallback = Path(tempfile.gettempdir()) / "peng_nest_connect_fallback.log"
+    return open(fallback, "a", encoding="utf-8", errors="replace")
+
+
 def _is_windows_service() -> bool:
     """检测当前进程是否运行在 Windows 服务会话（Session 0）中"""
     if sys.platform != "win32":
@@ -372,8 +406,7 @@ class BackgroundService:
                     _start_nest_in_user_session(nest_cmd, str(project_root), nest_log)
                 else:
                     # 非服务模式或Linux：正常启动子进程
-                    nest_log_f = open(nest_log, "a", encoding="utf-8", errors="replace")
-                    chown_to_project_owner(nest_log)
+                    nest_log_f = _open_nest_log_with_recovery(nest_log)
                     popen_kwargs = dict(
                         stdout=nest_log_f,
                         stderr=_sp.STDOUT,
@@ -914,10 +947,8 @@ class BackgroundService:
             log_dir = project_root / "logs"
             ensure_dir_with_owner(log_dir)
             nest_log = str(log_dir / "nest_connect.log")
-            chown_to_project_owner(nest_log)
 
-            nest_log_f = open(nest_log, "a", encoding="utf-8", errors="replace")
-            chown_to_project_owner(nest_log)
+            nest_log_f = _open_nest_log_with_recovery(nest_log)
             popen_kwargs = dict(
                 stdout=nest_log_f,
                 stderr=_sp.STDOUT,

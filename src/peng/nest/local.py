@@ -1152,24 +1152,43 @@ class LocalExecutor:
             norm_new = newString.replace("\r\n", "\n")
 
             if norm_old not in norm_content:
-                return NestResponse.make_error(
-                    params.get("_request_id", ""),
-                    "在文件中未找到 oldString。请精确指定空格、制表符、换行符等内容。或者使用line_edit行编辑工具。",
-                )
+                # 🔧 事务#2083：精确匹配失败时回退到容错匹配链（与本地
+                # EditTool._execute_local_edit 的 replace_content 同源），
+                # 自动修复 LLM 构造 oldString 时的缩进/空白类细微偏差。
+                # 事务#2080事故：51行oldString仅1行差1个前导空格，被此处
+                # 单次精确匹配直接拒绝；而本地路径的 line_trimmed 等4层
+                # 容错本可唯一匹配自动修复——远程路径此前完全没有容错。
+                try:
+                    from peng.tools.file import ToolError, replace_content
 
-            # 检查是否有多处匹配
-            count = norm_content.count(norm_old)
-            if count > 1 and not replace_all:
-                return NestResponse.make_error(
-                    params.get("_request_id", ""),
-                    f"oldString找到 {count} 处匹配，请提供更多上下文或使用 replaceAll。或者使用line_edit行编辑工具。",
-                )
-
-            # 执行替换（在规范化后的内容上）
-            if replace_all:
-                norm_content = norm_content.replace(norm_old, norm_new)
+                    norm_content = replace_content(
+                        norm_content, norm_old, norm_new, replace_all
+                    )
+                    count = 1  # 容错链匹配串动态变化，条数按单处替换上报
+                except ImportError:
+                    return NestResponse.make_error(
+                        params.get("_request_id", ""),
+                        "在文件中未找到 oldString。请精确指定空格、制表符、换行符等内容。或者使用line_edit行编辑工具。",
+                    )
+                except ToolError as e:
+                    return NestResponse.make_error(
+                        params.get("_request_id", ""),
+                        f"{e}。或者使用line_edit行编辑工具。",
+                    )
             else:
-                norm_content = norm_content.replace(norm_old, norm_new, 1)
+                # 检查是否有多处匹配
+                count = norm_content.count(norm_old)
+                if count > 1 and not replace_all:
+                    return NestResponse.make_error(
+                        params.get("_request_id", ""),
+                        f"oldString找到 {count} 处匹配，请提供更多上下文或使用 replaceAll。或者使用line_edit行编辑工具。",
+                    )
+
+                # 执行替换（在规范化后的内容上）
+                if replace_all:
+                    norm_content = norm_content.replace(norm_old, norm_new)
+                else:
+                    norm_content = norm_content.replace(norm_old, norm_new, 1)
 
             # 如果原文件是 CRLF，将结果转回 CRLF
             if file_has_crlf:

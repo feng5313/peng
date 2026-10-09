@@ -46,6 +46,13 @@ PDF_EXTENSIONS = frozenset({".pdf"})
 # 多模态文件最大字节数（base64前），超过则跳过并提示（避免撑爆上下文）
 MAX_MULTIMODAL_FILE_SIZE = 20 * 1024 * 1024
 
+# 🔧 事务#1959：非文本格式（音视频/PDF/无法本地解码的图片透传）最小字节数。
+# 图片有PIL全量解码校验、PDF有魔数校验，而音频/视频没有本地解码器，
+# 只能靠体积下限判断：<1KB 的音视频/PDF必然是空壳/截断/生成未完成的产物
+# （最小有效媒体/文档也远超1KB），直接拒绝防止坏附件污染上下文。
+# 单一事实源在 peng.tools.file.MIN_BINARY_ATTACHMENT_BYTES。
+from peng.tools.file import MIN_BINARY_ATTACHMENT_BYTES as MIN_MEDIA_FILE_BYTES  # noqa: E402
+
 # @file=<path> 提取正则（路径不含空白）
 _FILE_REF_PATTERN = re.compile(r"@file=([^\s\n，。,;；)）\]}】\"']+)")
 # webui 附件行提取正则："[附件]" 块内的 "name: path" 行
@@ -193,14 +200,27 @@ def build_content_part(
     400"图片输入格式/解析错误"拒绝（事务#1822反复报错根因之一）。
     规范化失败（PIL缺插件/数据异常）时降级保留原始数据交provider判断。
 
+    🔧 事务#1959：内容有效性硬校验——空数据（0字节文件）直接返回 None
+    （不构建附件part）；PIL 内建格式（png/jpeg/gif/webp/bmp/tiff/ico，
+    见 PIL_BUILTIN_IMAGE_MIMES）规范化失败（UnidentifiedImageError）必然
+    是空/损坏/非图片数据，同样返回 None 拒绝。仅 heic/avif 等依赖可选
+    插件的格式保留原始数据透传（provider端可能支持）。空 data URL 附件
+    一旦进入上下文，GLM 报 400 "file必须传入file_id、file_url、
+    file_data至少之一" 且无法自愈（事务#1959只能人工回滚救出）。
+
     Args:
         kind: classify_file 返回的类型（image/video/audio/pdf）
         path: 文件路径（用于 mime 判断）
         data: 文件字节内容
 
     Returns:
-        content part dict；失败返回 None
+        content part dict；空数据/内建格式损坏/音视频PDF过小/PDF魔数非法返回 None
     """
+    # 🔧 事务#1959：空数据（0字节文件）不是有效附件，任何类型一律拒绝
+    if not data:
+        logger.warning(f"[Multimodal] 文件为空(0字节)，拒绝构建附件part: {path}")
+        return None
+
     mime = guess_mime(path)
 
     if kind == "image":
@@ -209,13 +229,37 @@ def build_content_part(
 
             data, mime, _note = normalize_image_bytes(data, mime)
         except Exception as e:
-            # 降级：无法本地解码验证时保留原始数据（provider端可能支持）
+            from peng.tools.file import PIL_BUILTIN_IMAGE_MIMES
+
+            if mime.lower() in PIL_BUILTIN_IMAGE_MIMES:
+                # 内建格式无法识别 = 空数据/损坏/非图片，拒绝（0字节png漏洞）
+                logger.warning(
+                    f"[Multimodal] 图片数据无效(内建格式{mime}无法识别)，拒绝构建附件part: {path}: {e}"
+                )
+                return None
+            # 降级：无法本地解码验证的非内建格式（heic/avif等缺插件），
+            # 至少执行非文本格式体积下限（<1KB必然是空壳/截断/未完成）
+            if len(data) < MIN_MEDIA_FILE_BYTES:
+                logger.warning(
+                    f"[Multimodal] 图片文件过小({len(data)}字节<1KB，无法本地验证且疑损坏)，"
+                    f"拒绝构建附件part: {path}"
+                )
+                return None
             logger.warning(f"[Multimodal] 图片规范化失败，保留原始数据 {path}: {e}")
         b64 = base64.b64encode(data).decode("utf-8")
         return {
             "type": "image_url",
             "image_url": {"url": f"data:{mime};base64,{b64}"},
         }
+
+    # 🔧 事务#1959：音频/视频等本地无解码器的非文本格式——体积下限硬校验
+    # （<1KB必然是空壳/截断/生成未完成，provider无法处理且可能400）
+    if kind in ("video", "audio") and len(data) < MIN_MEDIA_FILE_BYTES:
+        logger.warning(
+            f"[Multimodal] {kind}文件过小({len(data)}字节<1KB，疑损坏/未完成)，"
+            f"拒绝构建附件part: {path}"
+        )
+        return None
 
     b64 = base64.b64encode(data).decode("utf-8")
     if kind == "video":
@@ -231,6 +275,16 @@ def build_content_part(
             "input_audio": {"data": b64, "format": fmt},
         }
     if kind == "pdf":
+        # 🔧 事务#1959：PDF 体积下限 + 魔数双重校验（非空已由顶部统一校验）
+        if len(data) < MIN_MEDIA_FILE_BYTES:
+            logger.warning(
+                f"[Multimodal] PDF文件过小({len(data)}字节<1KB，疑损坏/未完成)，"
+                f"拒绝构建附件part: {path}"
+            )
+            return None
+        if not data.startswith(b"%PDF"):
+            logger.warning(f"[Multimodal] PDF魔数校验失败，拒绝构建附件part: {path}")
+            return None
         return {
             "type": "file",
             "file": {"url": f"data:{mime};base64,{b64}"},
@@ -250,7 +304,9 @@ async def load_multimodal_parts(
 
     Returns:
         (绝对路径, content_part 或 None, 状态说明)
-        状态: "ok" | "not_found" | "unsupported" | "too_large" | "error"
+        状态: "ok" | "not_found" | "empty" | "invalid" | "unsupported"
+              | "too_large" | "error"
+        （🔧 事务#1959：empty=0字节文件；invalid=数据损坏/过小/格式校验失败）
     """
     abs_path = resolve_path(raw_path, workdir)
     kind = classify_file(abs_path)
@@ -269,12 +325,17 @@ async def load_multimodal_parts(
         data = _read_local(abs_path)
     if data is None:
         return abs_path, None, "not_found"
+    # 🔧 事务#1959：0字节文件单独反馈（生成/截图未完成的典型产物）
+    if not data:
+        logger.warning(f"[Multimodal] 文件为空(0字节): {abs_path}")
+        return abs_path, None, "empty"
     if len(data) > MAX_MULTIMODAL_FILE_SIZE:
         return abs_path, None, "too_large"
 
     part = build_content_part(kind, abs_path, data)
     if part is None:
-        return abs_path, None, "unsupported"
+        # kind 有效但构建失败 = 数据损坏/过小/校验不通过（非"不支持类型"）
+        return abs_path, None, "invalid"
     return abs_path, part, "ok"
 
 
@@ -375,3 +436,138 @@ def demote_messages_attachments(
         result.append(new_msg)
         changed = True
     return result if changed else messages
+
+
+# 🔧 事务#1959：附件数据无效（空payload）时替换part的文本提示
+INVALID_ATTACHMENT_NOTICE = (
+    "[系统提示：原此处的多模态附件（图片/视频/音频/PDF）数据为空(0字节)或无效，"
+    "已自动移除以防API请求失败。该文件可能生成/截图未完成或已损坏，"
+    "如需其内容请重新生成文件后重新读取。]"
+)
+
+
+def _part_payload_invalid(part: dict[str, Any]) -> bool:
+    """判断单个附件 content part 的 payload 是否缺失/为空（事务#1959）
+
+    覆盖 OpenAI/qwen/GLM 等各家的附件 part 形态：
+    - image_url/video_url: {"url": "data:...;base64,<b64>" 或 http(s) URL}
+    - input_audio: {"data": "<裸b64>", "format": ...}
+    - input_image/input_video: {"image_url"/"video_url": ...}（嵌套或平铺）
+    - input_file: {"file_url"/"file_data"/"url"/"data": ...}
+    - file: {"url"/"file_url"/"file_data": ...} 或平铺 url
+    - audio: {"data"/"url": ...}
+
+    判定规则：payload 字符串缺失/空白 → 无效；data URL 的 base64 段为空
+    或解码后0字节 → 无效；非法 base64 → 无效。http(s) URL 非空即有效。
+    """
+    ptype = part.get("type")
+
+    # 已知的 payload 字段名（按优先级）：只认这些键，防止把 format/mime 等
+    # 元数据字段（如 input_audio.format='mp3'）误判为有效payload
+    _PAYLOAD_KEYS = (
+        "url",
+        "data",
+        "file_url",
+        "file_data",
+        "b64",
+        "b64_json",
+        "image_url",
+        "video_url",
+    )
+
+    def _payload(*candidates: Any) -> str:
+        for c in candidates:
+            if isinstance(c, str) and c.strip():
+                return c.strip()
+            if isinstance(c, dict):
+                for k in _PAYLOAD_KEYS:
+                    v = c.get(k)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+                    if isinstance(v, dict):
+                        # 再嵌套一层（image_url: {url: ...} 等形态）
+                        v2 = v.get("url") or v.get("data")
+                        if isinstance(v2, str) and v2.strip():
+                            return v2.strip()
+        return ""
+
+    if ptype == "image_url":
+        payload = _payload(part.get("image_url"), part.get("url"))
+    elif ptype == "video_url":
+        payload = _payload(part.get("video_url"), part.get("url"))
+    elif ptype == "input_audio":
+        payload = _payload(part.get("input_audio"), part.get("audio"))
+    elif ptype == "input_image":
+        payload = _payload(part.get("image_url"), part.get("input_image"))
+    elif ptype == "input_video":
+        payload = _payload(part.get("video_url"), part.get("input_video"))
+    elif ptype == "input_file":
+        payload = _payload(part.get("input_file"), part.get("file_url"), part.get("file_data"))
+    elif ptype == "file":
+        f = part.get("file")
+        payload = _payload(f, part.get("file_url"), part.get("file_data"), part.get("url"))
+    elif ptype == "audio":
+        payload = _payload(part.get("audio"), part.get("data"), part.get("url"))
+    else:
+        return False
+
+    if not payload:
+        return True
+    if payload.startswith("data:"):
+        if "base64," not in payload:
+            return True  # 非base64的data URL（如data:,）无有效载荷
+        b64 = payload.split("base64,", 1)[1].strip()
+        if not b64:
+            return True
+        try:
+            return len(base64.b64decode(b64)) == 0
+        except Exception:
+            return True
+    return False
+
+
+def sanitize_messages_attachments(
+    messages: list[dict], notice: str = INVALID_ATTACHMENT_NOTICE
+) -> tuple[list[dict], int]:
+    """清除消息列表中数据为空的附件part，替换为文本提示（事务#1959）
+
+    发送前最后防线：空payload附件（0字节文件透传、历史中毒上下文、
+    旧版本入库的坏附件等）一旦发给 provider 必然 400
+    （GLM: "file必须传入file_id、file_url、file_data至少之一"）且
+    附件无法自动清除，导致事务无限重试只能人工回滚。本函数在发送前
+    把这类 part 替换为说明文本，保证请求永不携带空数据附件。
+
+    不修改原列表：含无效附件的消息构建浅拷贝替换，其余消息原样复用。
+
+    Args:
+        messages: OpenAI 格式消息列表
+        notice: 替换无效附件part的文本提示
+
+    Returns:
+        (净化后的消息列表, 移除的无效附件part数；无移除时返回原列表)
+    """
+    if not messages:
+        return messages, 0
+    result: list[dict] = []
+    removed = 0
+    for m in messages:
+        content = m.get("content") if isinstance(m, dict) else None
+        if not has_attachment_part(content):
+            result.append(m)
+            continue
+        new_parts: list[dict] = []
+        msg_removed = False
+        for p in content:
+            if isinstance(p, dict) and p.get("type") in ATTACHMENT_PART_TYPES:
+                if _part_payload_invalid(p):
+                    removed += 1
+                    msg_removed = True
+                    continue
+            new_parts.append(p)
+        if not msg_removed:
+            result.append(m)
+            continue
+        new_msg = dict(m)
+        new_msg["content"] = new_parts + [{"type": "text", "text": notice}]
+        result.append(new_msg)
+    return (result if removed else messages), removed

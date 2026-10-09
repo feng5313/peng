@@ -393,7 +393,11 @@ class MessageDatabase(metaclass=MetaSingleton):
             sender = AGENT_NAME
             receiver = MASTER_NAME
         elif receiver is None:
-            if sender == AGENT_NAME:
+            # 事务#2089：用 is_agent_side 兼容带事务标识的发送者（鹏🐣·事务#N），
+            # 禁止精确比较（会误判为风主侧，推导出错误的接收者）
+            from peng.message.names import is_agent_side
+
+            if is_agent_side(sender):
                 receiver = MASTER_NAME
             else:
                 receiver = AGENT_NAME

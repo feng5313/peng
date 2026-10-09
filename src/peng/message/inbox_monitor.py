@@ -241,7 +241,10 @@ class InboxMonitor:
 
                                     # 📱 飞书回复自动转发：鹏🐣的回复消息，如果链首来自飞书，自动通过飞书reply API回复
                                     # 注意：这个逻辑必须独立于 receiver 判断，因为鹏🐣回复消息的 receiver 是master
-                                    if sender == AGENT_NAME and chain_head:
+                                    # 事务#2089：is_agent_side 兼容 鹏🐣·事务#N 等带事务标识的发送者
+                                    from peng.message.names import is_agent_side
+
+                                    if is_agent_side(sender) and chain_head:
                                         await self._forward_to_feishu_if_needed(msg, chain_head)
                                         # 📱 微信回复自动转发：链首来自微信，自动通过iLink sendMessage API回复
                                         await self._forward_to_wechat_if_needed(msg, chain_head)

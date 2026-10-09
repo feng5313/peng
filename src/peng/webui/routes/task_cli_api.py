@@ -23,6 +23,7 @@ from pydantic import BaseModel
 
 from peng.task.manager import TaskManager
 from peng.task.info import parse_info_to_list_with_status, serialize_info_list
+from peng.config import get_master_name
 from peng.common.daemon_registry import (
     cleanup_dead_daemons,
     kill_all_daemons_sync,
@@ -787,17 +788,14 @@ async def add_task_info(task_id: int, request: InfoUpdateRequest) -> dict[str, A
         return {"success": success, "action": "clear", "task_id": task_id}
 
     if request.unread or request.read:
-        current_info = task.get("info", "[]") or "[]"
-        info_list = parse_info_to_list_with_status(current_info)
-        for item in info_list:
-            item["read"] = request.read
-        new_value = serialize_info_list(info_list)
-        success = tm.db.update_task(task_id, info=new_value)
+        # 🔧 事务#2064：改用db原子操作（FOR UPDATE），替换手工read-modify-write
+        # 覆盖写——旧实现用请求开始时的task快照整体覆盖info字段，并发期间
+        # 其他进程注入的info会被旧快照吞掉/状态回滚
+        success = tm.db.set_task_info_status(task_id, mode="all", read=request.read)
         return {
             "success": success,
             "action": "mark_all_" + ("read" if request.read else "unread"),
             "task_id": task_id,
-            "count": len(info_list),
         }
 
     # 添加新信息
@@ -806,27 +804,29 @@ async def add_task_info(task_id: int, request: InfoUpdateRequest) -> dict[str, A
         info_value = _read_file_content(request.file)
 
     if info_value:
-        current_info = task.get("info", "[]") or "[]"
-        info_list = parse_info_to_list_with_status(current_info)
-        info_list.append({"content": info_value, "read": False})
-        new_value = serialize_info_list(info_list)
-        success = tm.db.update_task(task_id, info=new_value)
+        # 🔧 事务#2064：改用db.add_task_info原子追加（FOR UPDATE + 唯一id分配），
+        # 替换手工read-append-update_task覆盖写（旧实现并发时会丢失其他
+        # 进程同时注入的info，且覆盖写会回滚read状态）
+        # 事务#2089：WebUI注入者=风主，记录发送者标识
+        success = tm.db.add_task_info(task_id, info_value, sender=get_master_name())
         if success:
             # 🔧 Task#1449：只有当事务不在running状态时才插入resume控制信号
             # 如果事务已在running，info会在下一个迭代自动被检测到并注入
             # 避免running状态下强制重启导致多进程竞态调用LLM API（引发HTTP 400错误）
+            task = tm.db.get_task(task_id) or {}
             current_status = task.get("status", "")
             if current_status != "running":
                 tm.db.insert_task_control(task_id, "resume")
-        return {
-            "success": success,
-            "action": "add",
-            "task_id": task_id,
-            "added": info_value,
-            "count": len(info_list),
-            "unread_count": sum(1 for item in info_list if not item["read"]),
-            "task_running": current_status == "running",
-        }
+            info_list = tm.db.get_task_info(task_id, mode="all") or []
+            return {
+                "success": success,
+                "action": "add",
+                "task_id": task_id,
+                "added": info_value,
+                "count": len(info_list),
+                "unread_count": sum(1 for item in info_list if not item["read"]),
+                "task_running": current_status == "running",
+            }
 
     return {"success": False, "action": "none", "task_id": task_id}
 
@@ -848,26 +848,22 @@ class InfoItemDeleteRequest(BaseModel):
 @router.delete("/{task_id}/info/item")
 async def delete_task_info_item(task_id: int, request: InfoItemDeleteRequest) -> dict[str, Any]:
     """删除事务信息中的单条记录"""
-    task = _get_task_or_404(task_id)
+    _get_task_or_404(task_id)
     tm = _get_task_manager()
 
-    current_info = task.get("info", "[]") or "[]"
-    info_list = parse_info_to_list_with_status(current_info)
+    # 🔧 事务#2064：db原子删除（FOR UPDATE），替换手工read-pop-update覆盖写
+    removed_item = tm.db.delete_task_info_item(task_id, request.index)
+    if removed_item is None:
+        raise HTTPException(status_code=400, detail=f"info索引 {request.index} 超出范围")
+    if not removed_item:
+        raise HTTPException(status_code=404, detail=f"事务 {task_id} 不存在")
 
-    idx = request.index
-    if idx < 0 or idx >= len(info_list):
-        raise HTTPException(status_code=400, detail=f"info索引 {idx} 超出范围(0-{len(info_list)-1})")
-
-    # 删除指定索引的项
-    removed_item = info_list.pop(idx)
-    new_value = serialize_info_list(info_list)
-    success = tm.db.update_task(task_id, info=new_value)
-
+    remaining = tm.db.get_task_info(task_id, mode="all") or []
     return {
-        "success": success,
+        "success": True,
         "task_id": task_id,
         "removed_content": removed_item.get("content", ""),
-        "remaining_count": len(info_list),
+        "remaining_count": len(remaining),
     }
 
 
@@ -880,24 +876,20 @@ class InfoItemReadRequest(BaseModel):
 @router.put("/{task_id}/info/item/read")
 async def set_task_info_item_read(task_id: int, request: InfoItemReadRequest) -> dict[str, Any]:
     """修改事务信息中单条记录的已读状态"""
-    task = _get_task_or_404(task_id)
+    _get_task_or_404(task_id)
     tm = _get_task_manager()
 
-    current_info = task.get("info", "[]") or "[]"
-    info_list = parse_info_to_list_with_status(current_info)
-
-    idx = request.index
-    if idx < 0 or idx >= len(info_list):
-        raise HTTPException(status_code=400, detail=f"info索引 {idx} 超出范围(0-{len(info_list)-1})")
-
-    info_list[idx]["read"] = request.read
-    new_value = serialize_info_list(info_list)
-    success = tm.db.update_task(task_id, info=new_value)
+    # 🔧 事务#2064：db原子设置（FOR UPDATE），替换手工read-modify-update覆盖写
+    result = tm.db.set_task_info_item_status(task_id, request.index, request.read)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"事务 {task_id} 不存在")
+    if result is False:
+        raise HTTPException(status_code=400, detail=f"info索引 {request.index} 超出范围")
 
     return {
-        "success": success,
+        "success": True,
         "task_id": task_id,
-        "index": idx,
+        "index": request.index,
         "read": request.read,
     }
 

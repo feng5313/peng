@@ -31,7 +31,7 @@ from typing import Any
 
 from peng.common.paths import get_working_directory
 from peng.common import MetaSingleton
-from peng.config.loader import load_config
+from peng.config.loader import get_project_root, load_config
 
 from .database import TaskDatabase
 from .executor import run_task_process
@@ -151,7 +151,13 @@ class TaskManager(metaclass=MetaSingleton):
 
             process = subprocess.Popen(
                 [sys.executable, Path(__file__).parent / f"runner.py", "--task_id", f"{task_id}"],
-                cwd=None,
+                # 🔧 事务#2105：runner子进程CWD确定化——显式指定项目根目录。
+                # 原cwd=None继承服务进程CWD，而WebUI工作区切换（set_workdir→
+                # os.chdir）会改变服务进程CWD，导致runner携带任意工作目录
+                # 启动（如huizi），回退_load_agent_md()的相对路径读取会注入
+                # 其他项目的AGENTS.md（含@provider!锁定标记），跨工作目录污染
+                # 事务系统提示词。runner.py入口处亦有同源兜底chdir。
+                cwd=str(get_project_root()),
                 env=child_env,
             )
             pid = process.pid

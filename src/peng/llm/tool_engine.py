@@ -54,6 +54,128 @@ _COMPLETION_SIGNALS = frozenset({"ANALYSIS_DONE", "TASK_DONE", "ACCEPTANCE_DONE"
 # 例如未转义的字符类 [STOP LOOP] 会匹配任意S/T/O/P/空格/L字符，导致几乎每行都命中
 _SAFE_THINKING_LINE = "This is a normal thinking line about the current task."
 
+# 🔧 事务#1959 提取为模块级常量（原为HTTP 400处理分支内的局部变量，
+# 单元测试只能维护副本、无法感知真实代码漂移）。分类命中后接入逐级清除
+# 自愈策略（多模态附件→user消息→尾部轮次），避免换provider必然重复失败。
+# 内容审核拦截类关键词（优先于解析类判定）
+CONTENT_FILTER_KEYWORDS = [
+    "不安全或敏感内容",
+    "敏感内容",
+    "内容审核",
+    "内容可能包含不安全",
+    "content_filter",
+    "sensitive content",
+    "安全审核",
+    "违规内容",
+]
+# 内容解析失败类关键词 —— 上下文中的图片/附件损坏或provider不支持该内容
+# 类型时，换provider必然同样失败（事务#1818：损坏BMP导致3个provider全部
+# 400无限轮换2.5小时），正确做法：接入逐级清除策略（级1清附件）。
+CONTENT_PARSE_ERROR_KEYWORDS = [
+    "could not decode image",
+    "loading image",
+    "imagedata",
+    "image data",
+    "image_url",
+    "invalid image",
+    "image parse",
+    "failed to load image",
+    # 🔧 事务#2119：provider 读不出附件图片（本地 Strata 引擎对无法按声明解码的
+    # 附件返回 400 "the image could not be read: cannot read the image <path>"；
+    # 外部 API 对不支持格式亦有同类文案）。这是**请求内容问题**（附件字节与其
+    # 声明格式不符/该 provider 读不了该图），换 provider 必然同样失败——此前
+    # 不匹配任何关键词被当普通 4xx：重试2次→切换 provider→5轮全部失败→等待
+    # 循环，事务卡死（事务#2081 实测）。必须归入内容解析类：不冷却不切换
+    # provider，清附件并把 provider 报错**返回给大模型**（提示其重新读取/转码）。
+    "could not be read",
+    "cannot read the image",
+    "cannot read image",
+    "could not read the image",
+    "could not read image",
+    "failed to read the image",
+    "failed to read image",
+    "unable to read the image",
+    "unable to read image",
+    "图片无法读取",
+    "无法读取图片",
+    "无法读取该图片",
+    "无法解析图片",
+    "图片格式",
+    "图片解析",
+    "图片输入格式",
+    "base64",
+    "b64_",
+    "content.type",
+    # 🔧 事务#1959：GLM对空payload附件的报错"messages[0].content[0].file
+    # 必须传入file_id、file_url、file_data至少之一"——0字节图片透传触发，
+    # 此前不匹配任何关键词被当普通4xx无限重试（事务#1955），必须接入
+    # 逐级清除自愈
+    "file_id",
+    "file_url",
+    "file_data",
+]
+# 🔧 事务#2002：上下文长度超标类关键词 —— 请求token数超过provider模型
+# 最大上下文长度时，换provider必然同样失败（上下文是provider无关的），
+# 正确做法：compact压缩上下文后重试，而非切换provider。
+# 此前不匹配任何关键词被当普通4xx处理（事务#1993：glm额度耗尽→切换
+# s-qwen3.8→400上下文长度超标→按普通4xx重试2次→跳出→全provider不可用
+# →等待循环），必须接入compact自愈策略。
+CONTEXT_LENGTH_KEYWORDS = [
+    "context length",
+    "context_length",
+    "maximum context",
+    "exceeds the model",
+    "exceeds the maximum",
+    "token count exceeds",
+    "requested token count",
+    "reduce the number of!",
+    "reduce the number of tokens",
+    "上下文长度",
+    "上下文超限",
+    "超出上下文",
+    "上下文长度超标",
+    "token limit",
+    "max tokens",
+    "too many tokens",
+]
+
+# 🔧 事务#2084：从错误消息中提取服务端声称的上下文窗口大小（tokens）。
+# 用于识别"伪上下文超标"：自研推理服务（如epyc的Strata server）在引擎
+# 未就绪/重载中时返回 "prompt (X tokens) + max tokens (Y) exceeds the
+# context (0); requests are never truncated"——声称的context为0，与
+# /v1/models报告的n_ctx=262144矛盾。此类错误被"max tokens"关键词误匹配
+# 为上下文超标，导致compact无效→restart死循环（事务#2080实测93次）。
+_SERVER_CONTEXT_LIMIT_PATTERNS = [
+    # Strata格式：exceeds the context (0) / exceeds the context (262144)
+    re.compile(r"exceeds\s+the\s+context\s*\((\d+)\)", re.IGNORECASE),
+    # 通用格式：context length is 8192 / context_size: 4096 / context = 32768
+    re.compile(r"context[\s_-]*(?:length|size|limit)?[\s_-]*(?:is|=|:)\s*(\d+)", re.IGNORECASE),
+    # vllm/ollama格式：maximum context length is 8192 / maximum context of 32768
+    re.compile(r"maximum\s+context(?:\s*length)?(?:\s+is|\s+of)\s*(\d+)", re.IGNORECASE),
+]
+# 任何LLM的上下文窗口都≥2048；声称值低于此下限必然是服务端状态异常
+# （引擎未就绪/配置损坏），绝非真实上下文容量。
+SERVER_CONTEXT_LIMIT_SANITY_FLOOR = 1024
+
+
+def extract_server_context_limit(err_msg: str) -> int | None:
+    """从错误消息提取服务端声称的上下文窗口大小。
+
+    Returns:
+        int: 成功提取的context值（tokens）
+        None: 消息中无context数值信息
+    """
+    if not err_msg:
+        return None
+    for pattern in _SERVER_CONTEXT_LIMIT_PATTERNS:
+        m = pattern.search(err_msg)
+        if m:
+            try:
+                return int(m.group(1))
+            except (TypeError, ValueError):
+                continue
+    return None
+
 
 # ==================== 事件类型 ====================
 
@@ -139,6 +261,10 @@ class MessageHistory:
         ] = {}  # 按provider分别记录费用 {name: {cost, input_hit, input_miss, output, calls}}
         self._last_usage: dict = {}  # 最近一次API返回的usage（用于费用校验）
         self._user_merge_floor: int = 0  # 迭代边界：只允许合并此索引之后的user消息
+        # 🔧 事务#2114：迭代边界索引记录（每次mark_iteration_start记录len(_messages)，
+        # 保留最近8条）。供drop工具定位"上一轮迭代"（最近一批工具结果所在迭代），
+        # 禁止跨多个迭代清理，只修改上下文尾部区域以保护前缀缓存
+        self._iteration_marks: list[int] = []
 
     def size(self):
         return len(self._messages) + 1
@@ -150,9 +276,21 @@ class MessageHistory:
         else:
             self._system_message["content"] += "\n" + content
 
+    def get_system(self) -> str:
+        if self._system_message and self._system_message["content"]:
+            return self._system_message["content"]
+        return ""
+
     def mark_iteration_start(self) -> None:
-        """标记新迭代开始，防止跨迭代合并user消息破坏上下文前缀缓存"""
+        """标记新迭代开始，防止跨迭代合并user消息破坏上下文前缀缓存
+
+        同时记录迭代边界索引（事务#2114），供drop工具限定只能清理
+        上一轮迭代的工具结果（禁止跨迭代，且只修改上下文尾部区域以保护前缀缓存）
+        """
         self._user_merge_floor = len(self._messages)
+        self._iteration_marks.append(len(self._messages))
+        if len(self._iteration_marks) > 8:
+            self._iteration_marks = self._iteration_marks[-8:]
 
     def add_user(self, content: Any, merge: bool = True) -> None:
         """添加用户消息
@@ -286,6 +424,111 @@ class MessageHistory:
                 i += 1
         return -1
 
+    # drop工具清理后的替换文案（事务#2114，单一事实源）
+    _DROPPED_PLACEHOLDER = "垃圾信息，已被drop工具清理。"
+
+    @staticmethod
+    def _content_text(content) -> str:
+        """提取消息content的纯文本（多模态列表取text part拼接）"""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(
+                str(p.get("text", ""))
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        return str(content) if content else ""
+
+    def get_drop_window(self) -> tuple[int, int] | None:
+        """获取"上一轮迭代"（最近一批工具结果所在迭代）的消息索引窗口 [start, end)（事务#2114）
+
+        end = 最后一次mark（当前迭代的消息——含正在执行的工具批次——全部在其后，
+        天然被排除）；start = 最近一条 tool 消息所在迭代的起始边界。
+
+        从模型视角，"上一轮迭代"= 它看到的最近一批工具结果：中间隔着的无工具
+        空转迭代（空响应重试/纯文本轮/中断跳过等）不产生工具结果，不应把窗口
+        顶到错过最近一批结果；而更早批次的工具结果（隔着真实工具迭代）不允许
+        清理（"不得跨多个迭代drop"，同时保护上下文前缀缓存）。
+
+        Returns:
+            (start, end)：可清理的消息索引范围（已按当前消息数钳制）；
+            None：无迭代边界或历史中尚无工具结果
+        """
+        if not self._iteration_marks:
+            return None
+        end = min(self._iteration_marks[-1], len(self._messages))
+        if end <= 0:
+            return None
+        # 定位最近一条 tool 消息（最近一批工具结果的尾部）
+        last_tool = -1
+        for i in range(end - 1, -1, -1):
+            if self._messages[i].get("role") == "tool":
+                last_tool = i
+                break
+        if last_tool < 0:
+            return None  # 历史中尚无工具结果
+        # 窗口起点 = 该消息所在迭代的起始边界（≤last_tool 的最大mark，无则0）
+        start = 0
+        for m in self._iteration_marks:
+            if m <= last_tool:
+                start = m
+            else:
+                break
+        return (start, end)
+
+    def drop_tool_result(self, drop_id: str) -> tuple[bool, str]:
+        """按id清理上一轮迭代的工具返回结果（事务#2114）
+
+        只允许清理上一轮迭代（最近一批工具结果所在迭代，见get_drop_window）：
+        命中的 tool 消息 content 整体替换为占位文案（同时清除多模态附件part，
+        节省视觉token），不改动 assistant 消息中的 tool_calls 与参数。
+        中间隔着真实工具迭代的更早批次结果禁止清理（不得跨多个迭代drop）。
+
+        Args:
+            drop_id: 4位数字ID（来自工具结果末尾drop提示中的 "id xxxx"）
+
+        Returns:
+            (是否成功, 说明文本)
+        """
+        drop_id = str(drop_id).strip()
+        if not re.fullmatch(r"\d{4}", drop_id):
+            return False, f"错误：id必须为4位数字（收到 '{drop_id}'）。"
+        marker = f"id {drop_id}"
+        window = self.get_drop_window()
+        if window is None:
+            return False, "错误：当前不存在可清理的上一轮迭代工具结果。"
+        start, end = window
+
+        for i in range(start, end):
+            msg = self._messages[i]
+            if msg.get("role") != "tool":
+                continue
+            if marker in self._content_text(msg.get("content")):
+                original_len = len(self._content_text(msg.get("content")))
+                msg["content"] = self._DROPPED_PLACEHOLDER
+                logger.info(
+                    f"[MessageHistory] drop工具已清理上一轮迭代工具结果 "
+                    f"id={drop_id} (消息#{i}, 原{original_len}字符)"
+                )
+                return (
+                    True,
+                    f"已清理：id {drop_id} 对应的工具返回结果"
+                    f"（原{original_len}字符）已替换为「{self._DROPPED_PLACEHOLDER}」",
+                )
+        # 窗口内未命中：区分"id不存在"与"存在但不在上一轮迭代"两种情况，给出精确报错
+        for i, msg in enumerate(self._messages):
+            if msg.get("role") == "tool" and marker in self._content_text(msg.get("content")):
+                return (
+                    False,
+                    f"错误：id {drop_id} 对应的工具结果不属于上一轮迭代（消息#{i}），"
+                    f"禁止跨迭代清理。只能清理上一轮迭代中带drop提示的工具结果。",
+                )
+        return (
+            False,
+            f"错误：未找到 id {drop_id} 对应的工具结果。请核对工具结果末尾提示中的4位数字ID。",
+        )
+
     def from_api_format(self, messages):
         """从 API 格式加载消息，兼容旧格式（@思考记录：前缀）和标准格式（reasoning_content）"""
         self.clear()
@@ -341,7 +584,12 @@ class MessageHistory:
                     msg.get("tool_call_id", ""), msg.get("name", ""), content, add_timestamp=False
                 )
 
-    def to_api_format(self, thinking_type: str | None = None, vision: bool = False) -> list[dict]:
+    def to_api_format(
+        self,
+        thinking_type: str | None = None,
+        vision: bool = False,
+        preserve_thinking: bool = False,
+    ) -> list[dict]:
         """转换为 API 格式
 
         Args:
@@ -353,19 +601,30 @@ class MessageHistory:
             vision: 当前 provider 是否支持多模态（vision）
                 - True: 保留 user 消息中的多模态 content part 列表
                 - False: 将多模态列表降级为纯文本（提取 text part，保留提示文字）
+            preserve_thinking: 是否保留思考内容（事务#2111，qwen 系列可选）
+                - True: 非 "thinking" 风格（如 qwen/chat_template_kwargs）也保留
+                  reasoning_content。实机验证 swift/llama.cpp 后端会把 assistant
+                  消息中的 reasoning_content 渲染回 prompt（模型可复用上轮思考），
+                  代价是消耗额外输入 token，故默认 False 剥离以节省 token
 
         输出规则：
         1. 纯 thinking 消息（_thinking_only=True）：
-           - thinking_type="thinking" 时，如果下一条是带 tool_calls 的 assistant，则合并
-           - thinking_type != "thinking" 时：跳过（GLM 等不复用 thinking）
-           - 否则输出为 {"role": "assistant", "content": "", "reasoning_content": "..."}
-        2. 带 reasoning_content 的 assistant + tool_calls 消息：直接输出
-        3. 普通 assistant 消息：直接输出
+            - 保留模式（thinking_type="thinking" 或 preserve_thinking=True）时，
+              如果下一条是 assistant 消息则合并（后端对独立空 content 的 thinking
+              消息读不到，合并形式实测有效）；否则独立输出
+            - 非保留模式时：跳过（GLM 等不复用 thinking）
+        2. 带 reasoning_content 的 assistant + tool_calls 消息：保留模式直接输出，
+           非保留模式去掉 reasoning_content
+        3. 普通 assistant 消息：直接输出（"thinking" 风格补空串满足 DeepSeek 要求）
         4. user 消息 content 为多模态列表时：按 vision 参数保留或降级
         """
         result = []
         if self._system_message:
             result.append(self._system_message)
+
+        # 是否在序列化中保留思考内容（事务#2111：qwen 系列 preserve_thinking 可选，
+        # 默认 False；DeepSeek 风格 "thinking" 因 API 强制要求始终保留）
+        keep_reasoning = thinking_type == "thinking" or bool(preserve_thinking)
 
         # 跟踪最近一次带 tool_calls 的 assistant 在 result 中的索引
         pending_tc_idx = -1
@@ -415,31 +674,34 @@ class MessageHistory:
             is_thinking_only = msg.get("role") == "assistant" and msg.get(self._THINKING_ONLY)
 
             if is_thinking_only:
-                if thinking_type != "thinking":
-                    # 非 thinking 模式：跳过纯 thinking 消息
+                if not keep_reasoning:
+                    # 非保留模式：跳过纯 thinking 消息
                     # 实测 GLM5.2 等不会复用转换的 thinking 内容，总是重新思考
                     i += 1
                     continue
-                # thinking_type == "thinking"：检查是否可以合并到下一个 assistant 消息
+                # 保留模式（"thinking" 或 preserve_thinking）：检查是否可以合并到
+                # 下一条 assistant 消息（事务#2111实机验证：qwen 后端对独立空
+                # content 的 thinking 消息读不到，合并进相邻 assistant 才有效）
                 next_msg = self._messages[i + 1] if i + 1 < len(self._messages) else None
                 if (
                     next_msg
                     and next_msg.get("role") == "assistant"
-                    and "tool_calls" in next_msg
                     and not next_msg.get(self._THINKING_ONLY)
                     and "reasoning_content" not in next_msg
                 ):
-                    # 合并到下一条带 tool_calls 的 assistant 消息
+                    # 合并到下一条 assistant 消息（带 tool_calls 或普通消息均合并，
+                    # 避免产生两条连续 assistant 消息——DeepSeek 等后端不支持）
                     # 先清理前一条 assistant 的未响应 tool_calls
                     _flush_pending_cleanup()
                     merged = _clean_output(next_msg)
                     merged["reasoning_content"] = msg.get("reasoning_content", "")
                     result.append(merged)
-                    pending_tc_idx = len(result) - 1
+                    if "tool_calls" in next_msg:
+                        pending_tc_idx = len(result) - 1
                     i += 2
                     continue
                 else:
-                    # 独立输出
+                    # 独立输出（后面没有可合并的 assistant 消息）
                     _flush_pending_cleanup()
                     out = _clean_output(msg)
                     # 纯 thinking 消息需要 content 字段（DeepSeek 要求）
@@ -452,11 +714,11 @@ class MessageHistory:
             # 带 reasoning_content 的 assistant 消息
             if msg.get("role") == "assistant" and "reasoning_content" in msg:
                 _flush_pending_cleanup()
-                if thinking_type == "thinking":
+                if keep_reasoning:
                     out = _clean_output(msg)
                     result.append(out)
                 else:
-                    # 非 thinking 模式：去掉 reasoning_content
+                    # 非保留模式：去掉 reasoning_content
                     out = _clean_output(msg)
                     out.pop("reasoning_content", None)
                     result.append(out)
@@ -498,11 +760,22 @@ class MessageHistory:
 
                 out["content"] = strip_multimodal_content(out["content"])
 
-            # DeepSeek thinking mode 要求：带 tool_calls 的 assistant 必须有 reasoning_content
+            # 🔧 事务#2002：DeepSeek thinking mode 要求 —— 带 tools 参数的请求中，
+            # **所有** assistant 消息（含无 tool_calls 的普通消息）都必须携带
+            # reasoning_content（空串 "" 可接受，缺失则 400）。官方文档（Tool Calls）：
+            # "for requests carrying the tools parameter, the reasoning_content must
+            # be fully passed back to the API in all subsequent requests — even for
+            # turns where the model did not perform a tool call. If your code does not
+            # correctly pass back reasoning_content, the API will return a 400 error."
+            # 实测（deepseek-flash）：tool_calls 消息与普通 assistant 消息只要有一个
+            # 缺失 reasoning_content 即报 400 "The `reasoning_content` in the thinking
+            # mode must be passed back to the API."；补空串 "" 后 200。
+            # 事务#1997 事故：report 钩子注入的普通 assistant 消息（"🪝 我需要确认…"）
+            # 无 reasoning_content → 下一轮 400 → 换 provider 无法自愈 → 全 provider
+            # 失败死循环（20:08~20:19 连续 7 轮）。
             if (
                 thinking_type == "thinking"
                 and msg.get("role") == "assistant"
-                and "tool_calls" in msg
                 and "reasoning_content" not in msg
                 and "reasoning_content" not in out
             ):
@@ -514,12 +787,12 @@ class MessageHistory:
                     and not result[-1].get("content")
                     and "tool_calls" not in result[-1]
                 ):
-                    # 回溯合并：将 reasoning_content 合并到当前 tool_calls 消息
+                    # 回溯合并：将 reasoning_content 合并到当前 assistant 消息
                     out["reasoning_content"] = result[-1].pop("reasoning_content", "")
                     result.pop()  # 移除独立的 thinking 消息
                 else:
-                    # 无前置 thinking 可合并（如模型直接输出 tool_calls 无 thinking）
-                    # 添加空 reasoning_content 满足 DeepSeek API 要求
+                    # 无前置 thinking 可合并（模型直接输出 tool_calls/普通消息无 thinking，
+                    # 或钩子注入的 assistant 消息）：补空串满足 DeepSeek API 要求
                     out["reasoning_content"] = ""
 
             result.append(out)
@@ -532,19 +805,29 @@ class MessageHistory:
 
         return result
 
-    def to_context(self, thinking_type: str | None = None, vision: bool = True) -> list | dict:
+    def to_context(
+        self,
+        thinking_type: str | None = None,
+        vision: bool = True,
+        preserve_thinking: bool = False,
+    ) -> list | dict:
         """转换为可持久化的context格式（包含元数据）
 
         Args:
             thinking_type: 当前 provider 的 thinking 处理类型
             vision: 持久化默认保留多模态内容（True），上下文恢复后再按
                     当前 provider 决定是否降级
+            preserve_thinking: 是否保留思考内容（事务#2111）。持久化与请求
+                    序列化使用同一开关：开启时 DB context 中保留 reasoning_content
+                    （重启/恢复后模型仍可复用），关闭时剥离节省存储与token
 
         Returns:
             新格式 dict: {"messages": [...], "_prompt_tokens": N, "_total_tokens_consumed": N}
         """
         return {
-            "messages": self.to_api_format(thinking_type=thinking_type, vision=vision),
+            "messages": self.to_api_format(
+                thinking_type=thinking_type, vision=vision, preserve_thinking=preserve_thinking
+            ),
             "_prompt_tokens": self._prompt_tokens,
             "_total_tokens_consumed": self._total_tokens_consumed,
             "_total_cost": self._total_cost,
@@ -631,7 +914,24 @@ class MessageHistory:
 
         return any(has_attachment_part(m.get("content")) for m in self._messages)
 
-    def strip_sent_attachments(self) -> int:
+    # 🔧 事务#2119：附件被 provider **拒绝读取**（400 图片读不出/解析失败）时的
+    # 占位说明。与上方"已发送"说明语义完全不同：附件从未成功送达，模型从未
+    # 看到内容，绝不能沿用"已随上一轮请求发送给你、基于已查看内容继续"的提示
+    # （会诱导模型臆测图片内容）。此处把 provider 的报错**返回给大模型**，
+    # 并给出可执行的补救方向（重新读取/转码），实现错误反馈闭环。
+    _ATTACHMENT_REJECTED_NOTICE_TEMPLATE = (
+        "[系统提示：本消息附带的多模态附件（图片/视频/音频/PDF）无法被大模型"
+        "provider 读取，已被 provider 拒绝并从此请求中移除（provider 报错：{error}）。"
+        "你尚未看到该附件内容，禁止臆测其内容。如需该信息，请重新调用 read 工具"
+        "读取该文件（必要时先转换为 PNG/JPEG 等通用格式再读取），或改用文字方式获取。]"
+    )
+
+    @classmethod
+    def attachment_rejected_notice(cls, error: str = "") -> str:
+        """构建"附件被 provider 拒绝读取"的说明（把报错返回给大模型）"""
+        return cls._ATTACHMENT_REJECTED_NOTICE_TEMPLATE.format(error=error or "未知错误")
+
+    def strip_sent_attachments(self, notice: str | None = None) -> int:
         """清除history中已发送的多模态附件part（只发送一次机制）
 
         多模态附件（base64图片/视频/音频/PDF）体积大且多数provider的视觉token
@@ -643,9 +943,16 @@ class MessageHistory:
         2. 只剩单个text part时content简化为str（与普通消息格式一致）
         3. 纯附件消息content替换为清除说明（防御性，正常总有text part）
 
+        Args:
+            notice: 附件清除说明文案（None=默认"已随上一轮请求发送给你"说明）。
+                🔧 事务#2119：附件被 provider **拒绝读取**（400 图片读不出）时
+                必须传 attachment_rejected_notice(...) —— 把 provider 报错
+                返回给大模型，而不是谎称附件已送达。
+
         Returns:
             清除的附件part总数（0表示无附件被清除）
         """
+        _notice = notice or self._ATTACHMENT_REMOVED_NOTICE
         removed = 0
         for msg in self._messages:
             content = msg.get("content")
@@ -668,7 +975,7 @@ class MessageHistory:
             # 替换注入时的"已直接注入"提示：附件已清除，原提示会误导模型幻觉图片内容
             if self._INJECT_NOTICE_PREFIX in text:
                 text = text.split(self._INJECT_NOTICE_PREFIX, 1)[0].rstrip()
-            text = (text + "\n" if text else "") + self._ATTACHMENT_REMOVED_NOTICE
+            text = (text + "\n" if text else "") + _notice
             msg["content"] = text
         return removed
 
@@ -676,14 +983,31 @@ class MessageHistory:
     # base64字符长度/3.5 会严重高估，按每附件固定值估算）
     _MULTIMODAL_PART_ESTIMATED_TOKENS = 1000
 
-    def estimate_tokens(self, begin=0, end=-1) -> int:
+    def estimate_tokens(
+        self,
+        begin=0,
+        end=-1,
+        thinking_type: str | None = None,
+        preserve_thinking: bool = False,
+    ) -> int:
         """估算 token 数量（基于实际 API payload 大小）
 
         使用消息的 JSON 序列化大小来估算，确保与 API 发送内容一致。
         估算规则：JSON 字符长度 / 3.5（混合中英文的平均 token 比率）
         多模态 content part（image_url/video_url/input_audio/file）按固定
         附件 token 数估算（provider 按视觉token计费，非文本字符数）。
+
+        🔧 事务#2114：与 to_api_format 序列化语义对齐——preserve_thinking=false
+        且 thinking_type 非 "thinking" 时，实际请求会剥离 assistant 消息的
+        reasoning_content 并跳过纯thinking消息，估算同样不计入，否则会系统性
+        高估上下文长度，导致"上下文紧张"误报（催促compact/restart提前触发）。
+        同时剔除 `_` 前缀内部字段（实际请求不发送）。
+
+        Args:
+            thinking_type: 当前provider的thinking处理类型（None/其他=剥离思考）
+            preserve_thinking: 是否保留思考内容（与to_api_format同义）
         """
+        keep_reasoning = thinking_type == "thinking" or bool(preserve_thinking)
         all_msgs = ([self._system_message] if self._system_message else []) + self._messages
         if end == -1:
             sliced = all_msgs[begin:]
@@ -695,7 +1019,18 @@ class MessageHistory:
         for msg in sliced:
             if not msg:
                 continue
-            content = msg.get("content") if isinstance(msg, dict) else None
+            # 对齐to_api_format：非保留模式跳过纯thinking消息（实际请求不发送）
+            if (
+                not keep_reasoning
+                and msg.get("role") == "assistant"
+                and msg.get(self._THINKING_ONLY)
+            ):
+                continue
+            # 只估算实际发送内容：剔除内部字段与非保留模式的reasoning_content
+            est_msg = {k: v for k, v in msg.items() if not k.startswith("_")}
+            if not keep_reasoning and "reasoning_content" in est_msg:
+                est_msg.pop("reasoning_content", None)
+            content = est_msg.get("content") if isinstance(est_msg, dict) else None
             if isinstance(content, list):
                 # 多模态消息：text part 按字符估算，附件 part 按固定 token 估算
                 text_chars = 0
@@ -707,9 +1042,9 @@ class MessageHistory:
                 total_chars += text_chars + 100  # 100: 消息结构开销
                 continue
             try:
-                msg_str = json.dumps(msg, ensure_ascii=False)
+                msg_str = json.dumps(est_msg, ensure_ascii=False)
             except (TypeError, ValueError):
-                msg_str = str(msg)
+                msg_str = str(est_msg)
             total_chars += len(msg_str)
 
         # 混合中英文：平均约 3.5 字符/token；附件按固定 token 数累加
@@ -831,7 +1166,14 @@ class MessageHistory:
                     f"累计消耗={self._total_tokens_consumed}, 累计费用={self._total_cost:.4f}元"
                 )
 
-    def get_token_count(self, begin=0, end=-1, estimate=True) -> int:
+    def get_token_count(
+        self,
+        begin=0,
+        end=-1,
+        estimate=True,
+        thinking_type: str | None = None,
+        preserve_thinking: bool = False,
+    ) -> int:
         """获取当前上下文的token数量
 
         优先使用API返回的真实prompt_tokens（反映完整上下文长度），
@@ -846,10 +1188,15 @@ class MessageHistory:
         Args:
             begin: 起始消息索引（仅用于fallback估算）
             end: 结束消息索引（仅用于fallback估算）
+            thinking_type: 当前provider的thinking处理类型（fallback估算用，
+                默认None=按剥离思考估算，与主流provider实际请求一致）
+            preserve_thinking: 是否保留思考内容（fallback估算用，默认False）
         """
         if self._prompt_tokens > 0 or not estimate:
             return self._prompt_tokens
-        return self.estimate_tokens(begin, end)
+        return self.estimate_tokens(
+            begin, end, thinking_type=thinking_type, preserve_thinking=preserve_thinking
+        )
 
     def get_total_tokens_consumed(self) -> int:
         """获取事务累计总token消耗（所有LLM调用的total_tokens之和）"""
@@ -891,6 +1238,8 @@ class MessageHistory:
         """清空历史"""
         self._messages.clear()
         self._system_message = None
+        # 迭代边界随之失效（事务#2114）
+        self._iteration_marks = []
 
     def reset_messages_keep_stats(self) -> dict:
         """清空对话消息但保留累计统计（费用、token用量），返回新的context字典。
@@ -904,6 +1253,8 @@ class MessageHistory:
         self._messages.clear()
         self._system_message = None
         self._prompt_tokens = 0  # 重置当前上下文token数（统计是累计的）
+        # 迭代边界随之失效（事务#2114）
+        self._iteration_marks = []
         return self.to_context()
 
     # compact 时截断长参数的工具名称
@@ -1125,6 +1476,11 @@ class ToolExecutionEngine:
         # 系统报错去重：追踪最近的系统报错签名，避免重复报告撑爆上下文
         self._recent_system_errors: list[str] = []
 
+        # 🔧 事务#2061续：上次注入"上下文紧张"提示的迭代号（-极大值保证首轮注入）。
+        # context_too_large是持续状态型告警，用迭代节流（每3轮一次）替代报错去重，
+        # 防止单一签名永久卡死去重窗口导致一次注入后永久静默（task#2077事故）
+        self._last_context_tight_iter: int = -1_000_000
+
         # 思考过载检测：跨迭代累积thinking字节数，超阈值且无有效编辑工作时强制关闭思考模式
         self._thinking_overload_bytes: int = 0  # 累积thinking字节数
         self._force_thinking_disabled: bool = False  # 是否强制关闭思考模式（仅影响当前事务）
@@ -1132,6 +1488,13 @@ class ToolExecutionEngine:
         # thinking回顾扫描游标：上次已消费的输出文件行号（提醒时从游标后扫描thinking行，
         # run_stream 每轮开始重置为当前文件行数以跳过历史内容）
         self._thinking_scan_line: int = 0
+
+        # 🔧 事务#2114：drop清理提示的唯一4位数字ID分配器（1000-9999顺序分配，
+        # 跳过已用ID；用尽后重新扫描复用最旧ID——由于drop只允许清理上一轮迭代的
+        # 结果，相隔9000次分配的同ID提示不可能同处一个窗口，无冲突风险）。
+        # 注意：不随 run_stream 重入重置，避免resume后与history中已存提示ID撞车
+        self._drop_id_seq: int = 9999
+        self._used_drop_ids: set[int] = set()
 
     @property
     def _error_dedup_rounds(self) -> int:
@@ -1895,11 +2258,18 @@ class ToolExecutionEngine:
         data:image/* base64 URL（image_url嵌套/平铺两种格式均兼容）。
         转码失败的附件（数据损坏等）跳过，留待级1清除策略处理。
 
+        🔧 事务#2119：是否转码以**实际内容**（PIL识别）判断，而非附件自称的
+        mime——文件被误命名时（截图 BMP 存成 .png，事务#2081 实测 w_R1.png
+        魔数为 'BM'）附件自称 image/png 而字节是 BMP，provider 按声明解码必然
+        失败（400 "the image could not be read"），只看声明会漏判为"安全格式"。
+
         Returns:
             成功转码的附件数（0=无可转码附件）
         """
         import base64 as _b64
         import io as _io
+
+        from peng.tools.file import PIL_FORMAT_TO_MIME
 
         reencoded = 0
         for msg in getattr(history, "_messages", []):
@@ -1907,9 +2277,9 @@ class ToolExecutionEngine:
             if not isinstance(content, list):
                 continue
             for part in content:
-                if (
-                    not isinstance(part, dict)
-                    or part.get("type") not in ("image_url", "input_image")
+                if not isinstance(part, dict) or part.get("type") not in (
+                    "image_url",
+                    "input_image",
                 ):
                     continue
                 # 提取 url：image_url嵌套dict/平铺str/part顶层 三种格式
@@ -1924,13 +2294,24 @@ class ToolExecutionEngine:
                     continue
                 header, _sep, b64_payload = url.partition(";base64,")
                 mime = header.removeprefix("data:").split(";", 1)[0]
-                if mime in self._REENCODE_SAFE_IMAGE_MIMES or not b64_payload:
+                if not b64_payload:
                     continue
                 try:
                     from PIL import Image
 
                     img = Image.open(_io.BytesIO(_b64.b64decode(b64_payload)))
                     img.load()
+                    # 🔧 事务#2119：是否转码以**实际内容**（PIL识别）判断，而非
+                    # 附件自称的 mime。文件被误命名时（截图 BMP 存成 .png，事务
+                    # #2081 实测 w_R1.png 魔数为 'BM'）附件自称 image/png 而字节
+                    # 是 BMP，provider 按声明解码必然失败（本地引擎 400
+                    # "the image could not be read: cannot read the image"）；
+                    # 只看声明会漏判为"安全格式"而跳过救援。按内容转码修复，
+                    # 既解决 400 又不丢失视觉信息。
+                    _actual_mime = PIL_FORMAT_TO_MIME.get((img.format or "").upper())
+                    if _actual_mime == mime and mime in self._REENCODE_SAFE_IMAGE_MIMES:
+                        # 实际格式与声明一致且属安全格式：无需转码
+                        continue
                     # JPEG不支持alpha/CMYK：RGBA/LA/P白底合成，CMYK转RGB
                     if img.mode in ("RGBA", "LA", "P"):
                         img = img.convert("RGBA")
@@ -1942,8 +2323,7 @@ class ToolExecutionEngine:
                     buf = _io.BytesIO()
                     img.save(buf, format="JPEG", quality=90)
                     new_url = (
-                        "data:image/jpeg;base64,"
-                        f"{_b64.b64encode(buf.getvalue()).decode('utf-8')}"
+                        f"data:image/jpeg;base64,{_b64.b64encode(buf.getvalue()).decode('utf-8')}"
                     )
                     if isinstance(holder, dict):
                         holder["url"] = new_url
@@ -1954,8 +2334,7 @@ class ToolExecutionEngine:
                     reencoded += 1
                 except Exception as e:
                     logger.warning(
-                        f"[ToolEngine] 图片附件转码救援失败(留待级1清除): "
-                        f"mime={mime}: {e}"
+                        f"[ToolEngine] 图片附件转码救援失败(留待级1清除): mime={mime}: {e}"
                     )
         return reencoded
 
@@ -2000,9 +2379,8 @@ class ToolExecutionEngine:
         # 的图片格式（如修复前入库的BMP，事务#1822）时，转码为通用JPEG
         # 后重试可完整保留视觉信息。转码后再失败则无可转附件（返回0），
         # 自然落入下方级1清除逻辑，级别序列保持不变。
-        if (
-            self._content_filter_deletions == 0
-            and "内容解析失败" in (getattr(self, "_content_filter_kind", "") or "")
+        if self._content_filter_deletions == 0 and "内容解析失败" in (
+            getattr(self, "_content_filter_kind", "") or ""
         ):
             reencoded = self._reencode_history_images(history)
             if reencoded > 0:
@@ -2012,7 +2390,14 @@ class ToolExecutionEngine:
             if stage == 0:
                 # 级1：清除多模态附件（审核拦截最常见触发源，含tool消息中的附件）
                 stage += 1
-                removed = history.strip_sent_attachments()
+                # 🔧 事务#2119：解析失败类错误（provider 读不出附件/附件字节与声明
+                # 不符）用**错误反馈文案**替换附件——把 provider 报错返回给大模型，
+                # 让它知道该附件从未送达并自行重新读取/转码；"已随上一轮请求发送
+                # 给你"的默认说明在此语义下是假的（会诱导模型臆测图片内容）。
+                _notice = None
+                if "内容解析失败" in (getattr(self, "_content_filter_kind", "") or ""):
+                    _notice = history.attachment_rejected_notice(self.llm.error or "")
+                removed = history.strip_sent_attachments(notice=_notice)
                 if removed > 0:
                     self._content_filter_deletions = stage
                     return f"清除多模态附件 {removed} 个（图片/音视频/PDF）"
@@ -2343,7 +2728,7 @@ class ToolExecutionEngine:
             self_info = (
                 f"⚠️ 冲突警告：检测到以下运行中的事务与本事务使用相同的 nest({my_nest}) 和 workdir({my_workdir})："
                 f"事务{conflict_list}。"
-                f"请特别注意避免编辑同一文件，避免使用git reset/checkout/revert等危险操作，多用git diff核对变更，切勿覆盖对方有效代码！必要时用task工具info子命令沟通！"
+                f"请特别注意避免编辑同一文件，避免使用git reset/checkout/revert等危险操作，多用git diff核对变更，切勿覆盖对方有效代码！必要时用info工具沟通！"
             )
             self._workdir_conflict_warnings.append(f"\n{self_info}\n")
 
@@ -2355,8 +2740,12 @@ class ToolExecutionEngine:
                     f"请特别注意避免编辑同一文件，避免使用git reset/checkout/revert等危险操作，多用git diff核对变更，切勿覆盖对方有效代码！必要时用task工具info子命令沟通！"
                 )
                 try:
+                    # 事务#2089：记录发送者，接收方知道是哪个事务的冲突警告
                     self.task_manager.db.add_task_info(
-                        task_id=tid, info_content=other_info, dedup=True
+                        task_id=tid,
+                        info_content=other_info,
+                        sender=f"事务#{my_task_id}",
+                        dedup=True,
                     )
                 except Exception as e:
                     logger.debug(f"[ToolEngine] 向冲突事务#{tid} 注入info失败: {e}")
@@ -2484,13 +2873,19 @@ class ToolExecutionEngine:
             )
             deduped_items = deduped_items[-MAX_INFO_INJECT:]
 
-        # 提取内容
-        contents = [item["content"] for item in deduped_items]
+        # 提取内容（事务#2089：带发送者标识 [来自 事务#N/风主🍃]，旧数据无sender不显示）
+        # 注意：紧急检测（is_urgent_content）必须用原始内容，前缀会破坏首字符判断
+        raw_contents = [item["content"].replace("\\n", "\n") for item in deduped_items]
+        contents = []
+        for item, raw in zip(deduped_items, raw_contents):
+            sender = item.get("sender")
+            contents.append(f"[来自 {sender}] {raw}" if sender else raw)
         info_text = "\n".join(contents)
-        info_text = info_text.replace("\\n", "\n")
 
-        # 标记所有未读info为已读（包括被截断的，避免下次重复）
-        success = db.set_task_info_status(self._task_id, mode="all", read=True)
+        # 标记**本次读到的未读info**为已读（事务#2064：精确按项标记，
+        # 不再用 mode="all"——消费瞬间用户/其他进程新注入的info（含感叹号
+        # 紧急指示）会被 all 误标已读导致内容丢失且紧急中断检测永远查不到）
+        success = db.mark_info_items_read(self._task_id, items_to_mark, read=True)
         if not success:
             logger.error(
                 f"❌[ToolEngine] 严重错误！！！info已读状态更新错误 task_id={self._task_id}"
@@ -2503,14 +2898,42 @@ class ToolExecutionEngine:
             self._task["info"] = serialize_info_list(updated_info_list)
 
         if info_text:
-            history.add_user(f"\n关于本事务#{self._task_id}的最新指示：{info_text}\n")
+            # 🔧 事务#2064：紧急info（感叹号开头）注入用强制性文案——
+            # 实测#2077事故：普通"最新指示"文案被模型当成背景噪声无视，
+            # 打断4次仍继续死循环（同一脚本写到第31版）。紧急指示必须
+            # 以最高优先级措辞注入，明确要求停止当前行为模式。
+            # 事务#2089：紧急检测用原始内容（无[来自]前缀），指示人用真实发送者
+            _has_urgent = any(is_urgent_content(c) for c in raw_contents)
+            if _has_urgent:
+                # 紧急指示人：优先取紧急项的发送者（事务#N/风主🍃），旧数据回退master名
+                urgent_sender = next(
+                    (
+                        item.get("sender")
+                        for item, raw in zip(deduped_items, raw_contents)
+                        if is_urgent_content(raw) and item.get("sender")
+                    ),
+                    get_master_name(),
+                )
+                history.add_user(
+                    f"\n⛔⛔⛔ 紧急指示（最高优先级）⛔⛔⛔\n"
+                    f"{info_text}\n\n"
+                    f"你正在执行的操作已被强制打断。上述指示以感叹号标记=最高优先级"
+                    f"（来源见各条[来自]前缀），"
+                    f"你之前的行为方向已被{urgent_sender}否定！"
+                    f"立刻停止当前重复性/同类操作，认真理解上述指示，"
+                    f"从根本上改变处理方向后再行动。继续原模式=无视指示。\n"
+                )
+            else:
+                history.add_user(f"\n关于本事务#{self._task_id}的最新指示：{info_text}\n")
         logger.debug(
             f"[ToolEngine] Info字段处理: {len(items_to_mark)}个未读info（去重后{len(deduped_items)}个）已标记为已读"
         )
         get_output_manager().write_output(
             task_id=self._task_id,
             source="task",
-            content=f"🏷️  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {ANSI_COLORS.get('bold')}{ANSI_COLORS.get('bright_blue')}{get_master_name()} ：{ANSI_COLORS.get('bright_green')}{info_text}{ANSI_COLORS.get('reset')}\n",
+            # 事务#2089续：来源由各条[来自]前缀表达（风主反馈"风主🍃 ：[来自 风主🍃]"重复）；
+            # 无sender的系统消息不显示来源（此前误标为风主）
+            content=f"🏷️  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {ANSI_COLORS.get('bold')}{ANSI_COLORS.get('bright_green')}{info_text}{ANSI_COLORS.get('reset')}\n",
         )
 
     def _get_nest_platform(self, nest_name: str) -> str:
@@ -2550,7 +2973,9 @@ class ToolExecutionEngine:
                 task = self._task or {}
                 content = task.get("content") or ""
                 cfg = load_config().llm
-                fetch_result = cfg.fetch_providers(content)
+                fetch_result = cfg.fetch_providers(content) or cfg.fetch_providers(
+                    self._history.get_system()
+                )
                 favorites = fetch_result[0] if fetch_result else None
                 prefer_vision = False
                 if content:
@@ -2676,6 +3101,9 @@ class ToolExecutionEngine:
                         "unsupported": "非多模态文件类型",
                         "too_large": "文件超过大小限制",
                         "error": "读取失败",
+                        # 🔧 事务#1959：0字节/损坏文件明确反馈（生成未完成的截图等）
+                        "empty": "文件为空(0字节)，可能生成/截图未完成",
+                        "invalid": "文件数据无效（损坏/过小/格式校验失败），请重新生成",
                     }.get(status, status)
                     notes.append(f"@file={ref} 无法注入: {reason}")
 
@@ -2694,10 +3122,174 @@ class ToolExecutionEngine:
 
         self._mm_scan_cursor = cursor
 
+    def _engine_restart_with_breaker(self, task_id: int, detail: str) -> bool:
+        """🔧 事务#2084 Fix3：引擎自触发restart死循环熔断。
+
+        背景：事务#2080因服务端推理引擎未就绪（返回context(0)被误判为上下文
+        超标），引擎反复插入restart控制——每次restart清空历史重新请求，服务端
+        问题依旧，20分钟内死循环93次，烧钱且刷屏。restart只适用于"上下文
+        确实装不下"的自愈场景；若连续多次restart后仍走到本处，说明根因在
+        服务端/配置层面，restart永远解决不了，必须停下等待恢复或人工介入。
+
+        熔断规则：15分钟窗口内该事务已有≥2条restart控制记录时，本次不再
+        restart，改为插入pause控制并输出明确诊断。服务恢复/人工检查后
+        resume即可继续（历史未破坏）。
+
+        Args:
+            task_id: 事务ID
+            detail: 触发restart的原因描述（写入诊断信息）
+
+        Returns:
+            True: 已插入restart控制（事务将被重启）
+            False: 已熔断改为pause（事务将被暂停）
+        """
+        _recent = 0
+        try:
+            _recent = int(
+                self.task_manager.db.count_recent_task_controls(task_id, "restart", minutes=15)
+            )
+        except Exception as _cnt_err:
+            logger.warning(
+                f"[ToolEngine] 统计事务#{task_id}近期restart次数失败(按0处理): {_cnt_err}"
+            )
+        if _recent >= 2:
+            _bk_msg = (
+                f"⛔  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+                f"{ANSI_COLORS.get('bright_red')}"
+                f"事务#{task_id}触发restart熔断：15分钟内已是第{_recent + 1}次restart"
+                f"仍失败（{detail}）。继续restart只会清空历史死循环，已自动暂停。"
+                f"疑似服务端异常（如推理引擎未就绪/配置错误），请检查provider服务状态，"
+                f"恢复后resume即可继续。"
+                f"{ANSI_COLORS.get('reset')}\n"
+            )
+            logger.error(f"⛔ [ToolEngine] 事务#{task_id} {_bk_msg}")
+            get_output_manager().write_output(task_id=task_id, content=_bk_msg, source="system")
+            try:
+                self.task_manager.db.insert_task_control(task_id, "pause")
+            except Exception as _ins_err:
+                logger.error(f"[ToolEngine] 熔断插入pause控制失败: {_ins_err}")
+            return False
+        try:
+            self.task_manager.db.insert_task_control(task_id, "restart")
+        except Exception as _ins_err:
+            logger.error(f"[ToolEngine] 插入restart控制失败: {_ins_err}")
+        return True
+
+    def _provider_preserve_thinking(self) -> bool:
+        """读取当前 provider 的 preserve_thinking 配置（事务#2111）
+
+        provider_config 由 refresh_provider_vars/chat_stream 在选中 provider 后
+        同步；缺失时（尚未连接任何 provider）返回 False（默认剥离思考内容省token）。
+        """
+        cfg = getattr(self.llm, "provider_config", None)
+        return bool(cfg.get("preserve_thinking", False)) if isinstance(cfg, dict) else False
+
+    # ==================== 上下文长度优化（事务#2114） ====================
+
+    def _get_drop_hint_threshold(self) -> int:
+        """当前provider的drop清理提示阈值（字节，事务#2114）
+
+        优先级：provider级 drop_hint_threshold（peng.json llm.providers.<name>）
+        > 全局 llm.drop_hint_threshold（默认1024）。<=0 表示禁用。
+        """
+        cfg = getattr(self.llm, "provider_config", None)
+        if isinstance(cfg, dict) and cfg.get("drop_hint_threshold") is not None:
+            try:
+                return int(cfg["drop_hint_threshold"])
+            except (TypeError, ValueError):
+                pass
+        try:
+            return int(getattr(self.llm.config, "drop_hint_threshold", 1024))
+        except (TypeError, ValueError):
+            return 1024
+
+    def _allocate_drop_id(self) -> str:
+        """分配唯一的4位数字ID（1000-9999，事务#2114）
+
+        顺序递增并跳过已用ID；全部用尽时清空已用集重新分配（相隔9000次
+        分配的同ID提示不可能同处一个drop窗口，无跨迭代误清理风险）。
+        """
+        for _ in range(9000):
+            self._drop_id_seq += 1
+            if self._drop_id_seq > 9999:
+                self._drop_id_seq = 1000
+            if self._drop_id_seq not in self._used_drop_ids:
+                self._used_drop_ids.add(self._drop_id_seq)
+                return f"{self._drop_id_seq:04d}"
+        # 9000个ID全部在用（理论不可能）：重置已用集重新分配
+        self._used_drop_ids = {self._drop_id_seq}
+        return f"{self._drop_id_seq:04d}"
+
+    def _append_drop_hint(self, history_content):
+        """超长工具结果末尾追加drop清理提示（事务#2114）
+
+        结果字节数超过阈值（provider级可配，默认1024）时追加带唯一4位数字ID的
+        清理提示，模型确认结果毫无用处时可调用drop工具清理以节省上下文空间。
+
+        - 多模态列表content：按text part字节数判断并追加到首个text part
+          （附件part不计入——附件发送一次后即剥离，非持久上下文负担）
+        - 任何异常都静默返回原内容，绝不影响工具结果入history
+
+        Args:
+            history_content: 即将进入history的工具结果（str或多模态content part列表）
+
+        Returns:
+            追加提示后的内容（未超阈值或禁用时原样返回）
+        """
+        threshold = self._get_drop_hint_threshold()
+        if threshold <= 0:
+            return history_content
+        try:
+            if isinstance(history_content, str):
+                if len(history_content.encode("utf-8")) <= threshold:
+                    return history_content
+                hint = self._prompts.drop_hint.format(drop_id=self._allocate_drop_id())
+                return history_content + hint
+            if isinstance(history_content, list):
+                text_parts = [
+                    p
+                    for p in history_content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ]
+                size = sum(
+                    len(str(p.get("text", "")).encode("utf-8")) for p in text_parts
+                )
+                if size <= threshold or not text_parts:
+                    return history_content
+                hint = self._prompts.drop_hint.format(drop_id=self._allocate_drop_id())
+                text_parts[0]["text"] = str(text_parts[0].get("text", "")) + hint
+                return history_content
+        except Exception as e:
+            logger.debug(f"[ToolEngine] 追加drop清理提示失败(忽略): {e}")
+        return history_content
+
+    def _remind_thinking_only(
+        self, history: MessageHistory, thinking: str, content: str, tool_calls: list
+    ) -> bool:
+        """思考后无正式内容提醒（事务#2114）
+
+        模型只输出了思考内容（无content无tool_calls）时，思考成果不会保留在
+        后续上下文中（to_api_format默认剥离reasoning_content），注入user提醒
+        模型补输出正式内容总结，避免思考成果丢失。
+
+        注意：有tool_calls时是正常工具迭代（思考已转化为行动），不提醒；
+        且此时注入user消息会破坏 assistant(tool_calls)→tool 的API格式。
+
+        Returns:
+            是否注入了提醒
+        """
+        if thinking and thinking.strip() and not content.strip() and not tool_calls:
+            history.add_user(self._prompts.thinking_only_reminder)
+            return True
+        return False
+
     def _save_history(self, history):
         try:
             context = json.dumps(
-                history.to_context(thinking_type=self.llm.thinking_type),
+                history.to_context(
+                    thinking_type=self.llm.thinking_type,
+                    preserve_thinking=self._provider_preserve_thinking(),
+                ),
                 ensure_ascii=False,
                 indent=2,
             )
@@ -2742,7 +3334,10 @@ class ToolExecutionEngine:
                 pass
 
             history_context = json.dumps(
-                history.to_context(thinking_type=self.llm.thinking_type),
+                history.to_context(
+                    thinking_type=self.llm.thinking_type,
+                    preserve_thinking=self._provider_preserve_thinking(),
+                ),
                 ensure_ascii=False,
             )
 
@@ -2776,15 +3371,50 @@ class ToolExecutionEngine:
 
             iteration = self._iteration + 1  # self._iteration 在工具执行后才自增
 
-            meta = await asyncio.to_thread(
-                ToolBackupManager.create_iteration_snapshot,
-                task_id=task_id,
-                history_context=history_context,
-                checklist=checklist,
-                iteration=iteration,
-                workdir=task_workdir,
-                nest_name=task_nest,
-            )
+            # 🔧 事务#2087：迭代快照同样受总预算约束——大仓库 add -A 分钟级
+            # 耗时会卡住整轮迭代（LLM 调用前静默）。超预算跳过本轮快照
+            # （to_thread 线程后台自然完成），无回滚链接为安全降级。
+            from peng.config.loader import get_snapshot_budget_seconds
+
+            _iter_budget = get_snapshot_budget_seconds()
+            try:
+                if _iter_budget > 0:
+                    meta = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            ToolBackupManager.create_iteration_snapshot,
+                            task_id=task_id,
+                            history_context=history_context,
+                            checklist=checklist,
+                            iteration=iteration,
+                            workdir=task_workdir,
+                            nest_name=task_nest,
+                        ),
+                        timeout=_iter_budget,
+                    )
+                else:
+                    meta = await asyncio.to_thread(
+                        ToolBackupManager.create_iteration_snapshot,
+                        task_id=task_id,
+                        history_context=history_context,
+                        checklist=checklist,
+                        iteration=iteration,
+                        workdir=task_workdir,
+                        nest_name=task_nest,
+                    )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"迭代快照超预算{_iter_budget}s(task#{task_id}, iter#{iteration})，跳过本轮快照"
+                )
+                _iter_warn = (
+                    f"⚠️ 迭代备份快照超过 {_iter_budget}s 预算已跳过"
+                    f"（本轮无回滚点，上一轮快照仍可用）。\n"
+                )
+                get_output_manager().write_output(
+                    task_id=task_id,
+                    content=f"{ANSI_COLORS.get('bright_yellow')}{_iter_warn}{ANSI_COLORS.get('reset')}",
+                    source="system",
+                )
+                return
             if not meta:
                 logger.debug(f"迭代备份未生成(task#{task_id}, iter#{iteration})")
                 return
@@ -2914,6 +3544,100 @@ class ToolExecutionEngine:
             value *= 1024 * 1024
         return int(value)
 
+    @staticmethod
+    def _parse_think_override(text: str) -> str | None:
+        """从文本中解析 @think=<value> 指令（临时改变当前事务思考模式/推理强度）
+
+        支持格式（不区分大小写）：
+        - @think=no / off / disable / disabled → 禁用思考（"disabled"）
+        - @think=yes / on / enable / enabled   → 开启思考（"enabled"）
+        - @think=auto                          → 模型自动决定（"auto"）
+        - @think=low / medium / high / xhigh / max → 开启思考并设置对应推理档位
+
+        如果有多个匹配，取最后一个（最新的）。
+
+        Returns:
+            解析出的思考模式，无匹配则返回 None
+        """
+        import re
+
+        matches = re.findall(r"@think\s*=\s*([A-Za-z]+)", text, re.IGNORECASE)
+        if not matches:
+            return None
+        value = matches[-1].lower()  # 取最后一个匹配
+        mapping = {
+            "no": "disabled",
+            "off": "disabled",
+            "disable": "disabled",
+            "disabled": "disabled",
+            "yes": "enabled",
+            "on": "enabled",
+            "enable": "enabled",
+            "enabled": "enabled",
+            "auto": "auto",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max",
+        }
+        result = mapping.get(value)
+        if result is None:
+            logger.warning(
+                f"[ToolEngine] @think 指令值无效: '{value}'，合法值: {', '.join(mapping)}"
+            )
+        return result
+
+    def _get_effective_thinking_mode(self) -> str | None:
+        """获取 @think 指令的思考模式覆盖（与 @compact 覆盖机制一致）
+
+        每轮迭代 LLM 调用前调用。查询事务最新 content 和所有 info（已读+未读）文本，
+        如果包含 @think=<value> 则以此值临时覆盖 provider 的 thinking_mode。
+
+        优先级：info 中最新的 > content 中的 > 无覆盖（None，走 provider 默认+自动干预）
+
+        Returns:
+            覆盖的思考模式（disabled/enabled/auto/low/medium/high/xhigh/max），
+            无 @think 指令则返回 None
+        """
+        if not self._task_id:
+            return None
+
+        texts_to_check: list[str] = []
+
+        # 1. 事务 content
+        try:
+            task = self.task_manager.get_task(self._task_id)
+            if task:
+                content = task.get("content") or ""
+                if content:
+                    texts_to_check.append(content)
+        except Exception:
+            pass
+
+        # 2. 所有 info（已读 + 未读）
+        try:
+            info_items = self.task_manager.db.get_task_info(self._task_id, mode="all")
+            if info_items:
+                for item in info_items:
+                    c = item.get("content", "")
+                    if c:
+                        texts_to_check.append(c)
+        except Exception:
+            pass
+
+        # 从所有文本中查找 @think 指令，取最后一个匹配
+        for text in reversed(texts_to_check):
+            override = self._parse_think_override(text)
+            if override is not None:
+                logger.info(
+                    f"[ToolEngine] 事务#{self._task_id} 检测到 @think 指令覆盖: "
+                    f"{override} (provider默认: {self.llm.thinking_mode})"
+                )
+                return override
+
+        return None
+
     def _get_effective_compact_threshold(self) -> int:
         """获取有效的 compact_threshold：检查 @compact 指令覆盖
 
@@ -2965,27 +3689,53 @@ class ToolExecutionEngine:
         return default
 
     def check_progress_and_compact(self, threshold: int, history: MessageHistory):
-        current = history.get_token_count(estimate=False)
+        # 🔧 事务#2061：上下文紧张检测取「API真实值」与「估算值」的较大者。
+        # 事务#2002曾从 get_token_count(estimate=False) 改为纯 estimate_tokens()
+        # （JSON字符/3.5），但该估算对中文内容严重低估（GLM实测约2.6字符/token，
+        # task#2060：真实393K token的上下文估算仅288K，低估27%），且估算不含每次
+        # 请求都携带的tools schema，导致真实上下文远超阈值时估算值仍低于阈值，
+        # "上下文紧张"提示永不触发。
+        # _prompt_tokens 是当前provider最近一次成功响应报告的精确prompt token数
+        # （含system prompt与tools schema，由update_usage每轮迭代后更新），常态下
+        # 是权威值；仅provider切换后首轮短暂过期（旧provider计数，事务#2002要
+        # 解决的场景），由estimate_tokens兜底。取max双向保证不漏检：真实值准而
+        # 估算低时用真实值，切换期真实值过期时用估算。
+        # 🔧 事务#2114：估算按当前provider的thinking_type/preserve_thinking对齐
+        # 实际请求序列化语义（剥离思考时不计入思考内容），避免系统性高估
+        current = max(
+            history.get_token_count(estimate=False),
+            history.estimate_tokens(
+                thinking_type=self.llm.thinking_type,
+                preserve_thinking=self._provider_preserve_thinking(),
+            ),
+        )
         task = self.task_manager.get_task(self._task_id)
         progress = task.get("progress", 0) or 0
         if current > threshold:
-            content = colorize(
-                self._prompts.context_too_large.format(
-                    timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    task_id=self._task_id,
-                    current_kb=current // 1024,
-                    threshold_kb=threshold // 1024,
-                    progress=progress,
-                ),
-                get_colors().message("warning"),
-            )
-            if self._should_report_system_error(content):
+            # 🔧 事务#2061续：context_too_large是持续状态型告警（模型执行restart
+            # 前每轮迭代都超标），绝不能走_should_report_system_error去重——该机制
+            # 跳过时不追加签名，单一签名会永久卡在去重窗口内，一次注入后永久静默
+            # （task#2077实测：14:22进程重启首轮注入后，上下文涨到560K+三小时零提示，
+            # 模型从未被催促更新checklist重启）。改为迭代节流：每3轮注入一次持续
+            # 催促，直至模型restart（上下文清空状态消失）或降回阈值下。
+            if self._iteration - self._last_context_tight_iter >= 3:
+                content = colorize(
+                    self._prompts.context_too_large.format(
+                        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        task_id=self._task_id,
+                        current_kb=current // 1024,
+                        threshold_kb=threshold // 1024,
+                        progress=progress,
+                    ),
+                    get_colors().message("warning"),
+                )
                 history.add_user(content)
                 get_output_manager().write_output(
                     task_id=self._task_id,
                     content=content,
                     source="system",
                 )
+                self._last_context_tight_iter = self._iteration
 
     async def run_stream(
         self,
@@ -3014,6 +3764,8 @@ class ToolExecutionEngine:
         self._task_id = task_id
         self._task = self.task_manager.get_task(task_id)
         self._iteration = 0
+        # 🔧 事务#2061续：重置上下文紧张节流游标（run_stream重入/resume恢复时首轮即注入）
+        self._last_context_tight_iter = -1_000_000
         self._consecutive_blocks = 0
         self._consecutive_empty = 0  # 连续空响应计数
         self._max_consecutive_empty = 2  # 连续空响应上限，超过则强制结束
@@ -3035,6 +3787,10 @@ class ToolExecutionEngine:
         self._content_filter_deletions: int = 0
         # 内容类错误类型描述（"内容审核拦截"/"内容解析失败..."），用于系统消息文案
         self._content_filter_kind: str = ""
+        # 🔧 事务#2002：上下文长度超标连续compact轮次计数（LLM调用成功时重置）。
+        # 每轮400上下文长度超标执行一次compact，连续3轮compact后仍超标说明
+        # 上下文无法压缩到provider能力内，拒绝处理（重启事务），绝不破坏上下文。
+        self._context_overflow_rounds: int = 0
         # 全provider失败等待重试的连续轮次计数（仅用于警告提示，不暂停事务）
         self._all_failed_rounds: int = 0
         # 有tool_call的迭代计数（用于PUA注入间隔判断）
@@ -3049,12 +3805,21 @@ class ToolExecutionEngine:
         # _has_urgent_interrupts 思考流每chunk调用，DB查询限频1秒；
         # 迭代边界消费消息/info后重置，避免过期缓存导致重复跳迭代
         self._last_urgent_check_ts: float = 0.0
+        # 🔧 事务#2064：工具批次死循环检测——最近批次签名队列与连续重复计数
+        # （#2077事故：同一脚本连写31版仅文件名递增，参数不同模式相同）
+        self._tool_batch_sigs: list[str] = []
+        self._tool_batch_sig_repeat: int = 0
         self._last_urgent_interrupt_reason: str | None = None
         # 多模态注入游标：记录已扫描过的 history 消息索引（run_stream 重入时重置）
         self._mm_scan_cursor: int = 0
         # thinking回顾扫描游标：重置为当前输出文件行数，跳过历史迭代内容，
         # 本轮提醒只扫描游标之后的 thinking 行（_remind_thinking_in_output 消费后推进）
         self._thinking_scan_line: int = self._count_output_lines(task_id)
+        # 🔧 事务#2002：to_api_format序列化键跟踪（provider/vision/thinking_type）。
+        # provider切换时thinking_type变化（如glm→qwen）会改变to_api_format输出
+        # （reasoning_content被strip/保留），导致"上下文增量异常"前缀比较误报。
+        # 序列化键变化时重置history_list基线，避免合法格式变化被误报为上下文破坏。
+        self._api_format_key: tuple | None = None
         # 检测 nest+workdir 冲突并向冲突事务发送 info 提示（start/restart/resume 时均触发）
         self._check_workdir_conflicts()
         if len(self._history._messages) == 0:
@@ -3071,7 +3836,7 @@ class ToolExecutionEngine:
                 # 自动选择会污染self.provider，导致chat_stream锁定语法失效）
                 warmup_task = self.task_manager.get_task(task_id)
                 warmup_content = warmup_task.get("content") if warmup_task else None
-                self.llm.refresh_provider_vars(content=warmup_content)
+                self.llm.refresh_provider_vars(content=warmup_content + history.get_system())
             except Exception as e:
                 logger.debug(f"[ToolEngine] provider临时变量预热失败(忽略): {e}")
         history_list = []  # 增量异常检测用
@@ -3152,10 +3917,35 @@ class ToolExecutionEngine:
             _vision_provider = self._is_multimodal_provider() or (
                 history.has_pending_attachments() and self._has_vision_provider_available()
             )
+            # 🔧 事务#2111：qwen 系列 preserve_thinking=True 时请求中保留
+            # reasoning_content（模型可复用上轮思考，代价是额外输入token）
+            _preserve_thinking = self._provider_preserve_thinking()
             current_messages = history.to_api_format(
-                thinking_type=self.llm.thinking_type, vision=_vision_provider
+                thinking_type=self.llm.thinking_type,
+                vision=_vision_provider,
+                preserve_thinking=_preserve_thinking,
             )
             if history.size() > 5:
+                # 🔧 事务#2002：序列化键（provider+thinking_type+vision+preserve_thinking）
+                # 变化时重置增量检测基线。provider切换（如glm→qwen）会改变thinking_type，
+                # to_api_format输出格式随之变化（reasoning_content被strip/保留），
+                # 前缀比较必然失败，误报"上下文增量异常"并输出大段history diff。
+                # 格式变化是合法的provider适配行为，不是上下文破坏，不应告警。
+                # （事务#2111：preserve_thinking 热改配置同样改变序列化格式，纳入键）
+                _fmt_key = (
+                    self.llm.provider,
+                    self.llm.thinking_type,
+                    _vision_provider,
+                    _preserve_thinking,
+                )
+                if self._api_format_key is not None and _fmt_key != self._api_format_key:
+                    logger.info(
+                        f"[ToolEngine] 事务#{task_id} to_api_format序列化键变化"
+                        f"({self._api_format_key} → {_fmt_key})，重置增量检测基线"
+                        f"（provider切换导致格式变化，非上下文破坏）"
+                    )
+                    history_list.clear()
+                self._api_format_key = _fmt_key
                 history_list.append(json.dumps(current_messages, ensure_ascii=False, indent=2))
                 if len(history_list) > 2:
                     history_list.pop(0)
@@ -3182,6 +3972,10 @@ class ToolExecutionEngine:
             )
             is_transient_error = (
                 False  # 网络瞬时错误标志(ReadError等)：禁止切换provider，同provider重试
+            )
+            is_context_overflow = (
+                False  # 🔧 事务#2002：400上下文长度超标标志：禁止切换provider，
+                # compact压缩上下文后重试（上下文是provider无关的，换provider必然同样失败）
             )
             should_skip_iteration = False  # 中断标志：检测到新消息/info/控制信号时跳过本次迭代
             thinking_duplicate_count = 0  # 重复计数
@@ -3216,7 +4010,8 @@ class ToolExecutionEngine:
                     # 纯符号计数在重试时不重置：跨重试累积，尽早检测垃圾流
                     # （重试时模型可能继续输出符号垃圾，重置计数会推迟检测）
 
-                    # 重试时 provider 可能已切换（thinking_type/vision 变化），需重建消息
+                    # 重试时 provider 可能已切换（thinking_type/vision/preserve_thinking
+                    # 变化），需重建消息
                     if retry > 0:
                         current_messages = history.to_api_format(
                             thinking_type=self.llm.thinking_type,
@@ -3225,14 +4020,19 @@ class ToolExecutionEngine:
                                 history.has_pending_attachments()
                                 and self._has_vision_provider_available()
                             ),
+                            preserve_thinking=self._provider_preserve_thinking(),
                         )
 
-                    # 思考过载检测：强制关闭思考模式时传入 disabled
-                    # 注意：仅 auto 模式允许干预（auto=自动管理思考模式，发现过度思考时禁用/降级）
-                    # 固定模式（enabled/low/high/max/disabled）尊重用户显式配置，不做强制干预
-                    effective_thinking_override = None
-                    if self._force_thinking_disabled and self.llm.thinking_mode == "auto":
-                        effective_thinking_override = "disabled"
+                    # 思考模式确定（优先级从高到低）：
+                    # 1. @think=<value> 指令覆盖：用户显式指定（事务content/info中），
+                    #    与固定模式一样尊重用户显式配置，不做自动干预
+                    # 2. 思考过载检测：强制关闭思考模式时传入 disabled
+                    #    注意：仅 auto 模式允许干预（auto=自动管理思考模式，发现过度思考时禁用/降级）
+                    #    固定模式（enabled/low/high/max/disabled）尊重用户显式配置，不做强制干预
+                    effective_thinking_override = self._get_effective_thinking_mode()
+                    if effective_thinking_override is None:
+                        if self._force_thinking_disabled and self.llm.thinking_mode == "auto":
+                            effective_thinking_override = "disabled"
 
                     stream = self.llm.chat_stream(
                         message_id=message_id,
@@ -3387,9 +4187,7 @@ class ToolExecutionEngine:
                             # 以及感叹号开头的紧急新回复消息/info（打断思考立刻处理，事务#1860）。
                             # 普通新回复消息/info不打断思考，由迭代边界自然处理
                             _interrupt = self._has_pending_interrupts()
-                            _urgent_reason = (
-                                None if _interrupt else self._has_urgent_interrupts()
-                            )
+                            _urgent_reason = None if _interrupt else self._has_urgent_interrupts()
                             if _interrupt or _urgent_reason:
                                 self.exit_on_unexpected_status()
                                 if _interrupt:
@@ -3500,9 +4298,7 @@ class ToolExecutionEngine:
                         # _get_unread_reply/_get_task_info 在迭代边界自然注入处理
                         if chunk_count % 32 == 0:
                             _interrupt = self._has_pending_interrupts()
-                            _urgent_reason = (
-                                None if _interrupt else self._has_urgent_interrupts()
-                            )
+                            _urgent_reason = None if _interrupt else self._has_urgent_interrupts()
                             if _interrupt or _urgent_reason:
                                 self.exit_on_unexpected_status()
                                 if _interrupt:
@@ -3512,6 +4308,26 @@ class ToolExecutionEngine:
                                 else:
                                     logger.info(
                                         f"⚡ [ToolEngine] 事务#{task_id}检测到紧急中断，停止思考立刻处理：{_urgent_reason}"
+                                    )
+                                should_skip_iteration = True
+                                break
+                        # 🔧 事务#2064：每chunk兜底检测（复用_has_urgent_interrupts
+                        # 内置1秒节流，DB开销可控）——补齐两个盲区：①短响应
+                        # （chunk数<32）整轮零检测；②非thinking响应（无thinking
+                        # chunk不触发上方检测）。检测到紧急info/消息立刻打断，
+                        # 不留到下一轮迭代边界
+                        if not should_skip_iteration:
+                            _interrupt = self._has_pending_interrupts()
+                            _urgent_reason = None if _interrupt else self._has_urgent_interrupts()
+                            if _interrupt or _urgent_reason:
+                                self.exit_on_unexpected_status()
+                                if _interrupt:
+                                    logger.info(
+                                        f"⚡ [ToolEngine] 事务#{task_id}流chunk检测到中断信号，停止思考跳过本次迭代"
+                                    )
+                                else:
+                                    logger.info(
+                                        f"⚡ [ToolEngine] 事务#{task_id}流chunk检测到紧急中断，停止思考立刻处理：{_urgent_reason}"
                                     )
                                 should_skip_iteration = True
                                 break
@@ -3655,51 +4471,64 @@ class ToolExecutionEngine:
                             )
                     else:
                         is_rate_limited = False
+                        # 🔧 事务#2002：检测400上下文长度超标：请求token数超过provider
+                        # 模型最大上下文长度。上下文是provider无关的，换provider必然
+                        # 同样失败（事务#1993：glm额度耗尽→切换s-qwen3.8→400上下文
+                        # 长度超标→按普通4xx重试2次→跳出→全provider不可用→等待循环，
+                        # 且误报"上下文增量异常"输出大段history diff）。正确做法：
+                        # 不切换provider，compact压缩上下文后重试；compact无效则拒绝
+                        # 处理（重启事务），绝不破坏上下文。
+                        _matched_ctx_overflow = status_code == 400 and any(
+                            kw.lower() in err_msg.lower() for kw in CONTEXT_LENGTH_KEYWORDS
+                        )
+                        # 🔧 事务#2084 Fix1：伪上下文超标识别——服务端声称的context值
+                        # 荒谬（<1024，如Strata引擎未就绪时返回context(0)）时，说明
+                        # 是服务端状态异常而非请求真实超标。此时走普通4xx路径
+                        # （provider切换+冷却等待，事务保活不清历史不restart），
+                        # 服务恢复后自动继续；绝不能进compact/restart分支（事务#2080
+                        # 曾因context(0)误判陷入93次restart死循环）。
+                        if _matched_ctx_overflow:
+                            _srv_ctx_limit = extract_server_context_limit(err_msg)
+                            if (
+                                _srv_ctx_limit is not None
+                                and _srv_ctx_limit < SERVER_CONTEXT_LIMIT_SANITY_FLOOR
+                            ):
+                                _matched_ctx_overflow = False
+                                logger.warning(
+                                    f"{icon} {self.llm.provider} 事务#{task_id}大模型API"
+                                    f"400错误声称context={_srv_ctx_limit}（低于合理下限"
+                                    f"{SERVER_CONTEXT_LIMIT_SANITY_FLOOR}），判定为服务端"
+                                    f"引擎未就绪/状态异常而非真实上下文超标。按普通错误"
+                                    f"处理（切换provider/冷却等待，不清历史）。"
+                                    f"详情: {err_msg[:200]}\n"
+                                )
+                        if _matched_ctx_overflow:
+                            is_context_overflow = True
+                            is_content_filtered = False
+                            logger.warning(
+                                f"{icon} {self.llm.provider} 事务#{task_id}大模型API"
+                                f"上下文长度超标(400)。不冷却不切换，compact压缩上下文"
+                                f"后重试。详情: {err_msg[:200]}\n"
+                            )
+                        else:
+                            is_context_overflow = False
                         # 检测400内容类错误：特殊处理
                         # 这类错误不应冷却或切换provider，而是接入逐级清除策略
                         # （多模态附件→user消息→尾部轮次）后重试，见 is_content_filtered
-                        _content_filter_keywords = [
-                            "不安全或敏感内容",
-                            "敏感内容",
-                            "内容审核",
-                            "内容可能包含不安全",
-                            "content_filter",
-                            "sensitive content",
-                            "安全审核",
-                            "违规内容",
-                        ]
-                        # 🔧 事务#1819：内容解析类错误 —— 上下文中的图片/附件损坏
-                        # 或provider不支持该内容类型时，换provider必然同样失败
-                        # （事务#1818：损坏BMP导致3个provider全部400，无限轮换
-                        # 重试2.5小时）。正确做法：接入逐级清除策略（级1清附件）。
-                        _content_parse_error_keywords = [
-                            "could not decode image",
-                            "loading image",
-                            "imagedata",
-                            "image data",
-                            "image_url",
-                            "invalid image",
-                            "image parse",
-                            "failed to load image",
-                            "无法解析图片",
-                            "图片格式",
-                            "图片解析",
-                            "图片输入格式",
-                            "base64",
-                            "b64_",
-                            "content.type",
-                        ]
+                        # 🔧 事务#1959：关键词列表提取为模块级常量（单一事实源）
                         _matched_filter = status_code == 400 and any(
-                            kw.lower() in err_msg.lower() for kw in _content_filter_keywords
+                            kw.lower() in err_msg.lower() for kw in CONTENT_FILTER_KEYWORDS
                         )
                         _matched_parse = status_code == 400 and any(
-                            kw.lower() in err_msg.lower() for kw in _content_parse_error_keywords
+                            kw.lower() in err_msg.lower() for kw in CONTENT_PARSE_ERROR_KEYWORDS
                         )
                         if _matched_filter or _matched_parse:
                             is_content_filtered = True
                             # 记录内容错误类型，用于外层清除重试时的系统消息文案
                             self._content_filter_kind = (
-                                "内容审核拦截" if _matched_filter else "内容解析失败(疑似损坏附件/内容类型不支持)"
+                                "内容审核拦截"
+                                if _matched_filter
+                                else "内容解析失败(疑似损坏附件/内容类型不支持)"
                             )
                             # 🔧 事务#1819：content.type参数非法 = provider后端实际
                             # 不支持多模态（如配置vision=true但vLLM/sglang未启用视觉，
@@ -3710,13 +4539,17 @@ class ToolExecutionEngine:
                                 try:
                                     from peng.config.loader import disable_provider_vision
 
-                                    disable_provider_vision(self.llm.provider or "", ttl_seconds=600)
+                                    disable_provider_vision(
+                                        self.llm.provider or "", ttl_seconds=600
+                                    )
                                     logger.warning(
                                         f"[ToolEngine] 已运行期禁用 {self.llm.provider} 的vision能力"
                                         f"(10分钟)：后端不支持多模态content"
                                     )
                                 except Exception as _dv_err:
-                                    logger.debug(f"[ToolEngine] 运行期禁用vision失败(忽略): {_dv_err}")
+                                    logger.debug(
+                                        f"[ToolEngine] 运行期禁用vision失败(忽略): {_dv_err}"
+                                    )
                             logger.warning(
                                 f"{icon} {self.llm.provider} 事务#{task_id}大模型API"
                                 f"{self._content_filter_kind}(400)。不冷却不切换，"
@@ -3733,10 +4566,19 @@ class ToolExecutionEngine:
                     # 429临时限流特殊处理：大幅增加重试次数（抢流量策略）
                     # 429配额耗尽：按普通错误处理（2次后切换provider）
                     # 400内容审核：重试1次（_max_retry=2），之后由外层删除user输入继续
+                    # 🔧 事务#2002：400上下文长度超标：不切换provider，compact压缩
+                    # 上下文后重试（最多3次，外层每轮compact一次），仍失败则拒绝处理
                     if status_code == 429 and is_rate_limited:
                         _max_retry = 30
                     elif status_code == 429 and not is_rate_limited:
                         _max_retry = 2  # 配额耗尽：快速切换
+                    elif status_code == 400 and is_context_overflow:
+                        # 上下文长度超标：错误是确定性的（非瞬时），重试必然同样
+                        # 失败，只有compact压缩上下文才能解决。_max_retry=0使首次
+                        # 超标即跳出内层循环（retry=0>=0），由外层执行compact
+                        # （外层每轮压缩一次，连续3轮compact后仍超标则拒绝处理
+                        # 重启事务），避免浪费无效重试调用。
+                        _max_retry = 0
                     elif status_code == 400 and is_content_filtered:
                         _max_retry = 2  # 内容审核：重试1次，之后删user输入
                     elif 400 <= status_code < 500:
@@ -3763,29 +4605,59 @@ class ToolExecutionEngine:
                     self.exit_on_unexpected_status()
                     continue
                 except httpx.TransportError as e:
-                    # 网络瞬时错误（ReadError/ReadTimeout/ConnectError/RemoteProtocolError等）
-                    # 这些是网络层临时故障，不切换provider，同provider重试
+                    # 网络传输错误分层处理（事务#2016）：
+                    # - ConnectError/RemoteProtocolError：无法建立连接/对端异常断开，
+                    #   是服务进程崩溃或重启中的明确信号（如本地sglang段错误自动重启）。
+                    #   同provider快速重试2次抗网络闪断，仍失败则不标记瞬时错误，
+                    #   由外层"所有provider失败"分支按冷却等待后重新选择provider
+                    #   （mark_failed自适应冷却+按优先级切换），绝不无限死磕已崩溃的服务。
+                    #   （原行为：无限重试同一provider直到服务自行恢复，导致事务
+                    #   在服务重启期间长时间卡在prefill状态）
+                    # - 其他传输错误（ReadTimeout/ReadError/WriteError等）：多为网络
+                    #   抖动，保持原策略：同provider重试5次，标记瞬时错误不切换provider。
                     retry += 1
                     is_rate_limited = False
                     is_content_filtered = False
-                    is_transient_error = True  # 标记瞬时错误，阻止provider切换
                     icon = self.llm.config.get_icon(self.llm.provider)
                     err_str = str(e).strip()
                     if err_str:
                         self.llm.error = f"{type(e).__name__}: {err_str}"
                     else:
                         self.llm.error = f"{type(e).__name__}"
-                    logger.info(
-                        f"{icon} {self.llm.provider} 事务#{task_id}大模型网络瞬时错误"
-                        f"({type(e).__name__})，不切换provider，0.5秒后同provider重试(第{retry}次)。\n"
-                        f"堆栈: {traceback.format_exc()}"
+                    service_unavailable = isinstance(
+                        e, (httpx.ConnectError, httpx.RemoteProtocolError)
                     )
-                    if retry >= 5:
-                        logger.error(
-                            f"{icon} {self.llm.provider} 事务#{task_id}大模型网络瞬时错误"
-                            f"已重试{retry}次仍失败，跳出重试循环。"
-                            f"最后错误: {self.llm.error}"
+                    max_retry = 2 if service_unavailable else 5
+                    if service_unavailable:
+                        # 关键：清除可能残留的瞬时错误标记（如前一轮ReadTimeout），
+                        # 确保耗尽后走"所有provider失败"分支实现provider切换
+                        is_transient_error = False
+                        logger.info(
+                            f"{icon} {self.llm.provider} 事务#{task_id}大模型服务不可用"
+                            f"({type(e).__name__})，0.5秒后同provider重试"
+                            f"(第{retry}/{max_retry}次)，重试耗尽将切换其他provider。"
                         )
+                    else:
+                        is_transient_error = True  # 标记瞬时错误，阻止provider切换
+                        logger.info(
+                            f"{icon} {self.llm.provider} 事务#{task_id}大模型网络瞬时错误"
+                            f"({type(e).__name__})，不切换provider，0.5秒后同provider重试(第{retry}次)。\n"
+                            f"堆栈: {traceback.format_exc()}"
+                        )
+                    if retry >= max_retry:
+                        if service_unavailable:
+                            logger.warning(
+                                f"{icon} {self.llm.provider} 事务#{task_id}大模型服务不可用"
+                                f"({type(e).__name__})已重试{retry}次仍失败，"
+                                f"按冷却等待后自动切换其他provider。"
+                                f"最后错误: {self.llm.error}"
+                            )
+                        else:
+                            logger.error(
+                                f"{icon} {self.llm.provider} 事务#{task_id}大模型网络瞬时错误"
+                                f"已重试{retry}次仍失败，跳出重试循环。"
+                                f"最后错误: {self.llm.error}"
+                            )
                         break
                     await asyncio.sleep(0.5)  # 网络瞬时错误：短暂等待后重试
                     self.exit_on_unexpected_status()
@@ -3823,6 +4695,8 @@ class ToolExecutionEngine:
                 self._content_filter_kind = ""
                 # LLM调用成功，重置全provider失败连续轮次计数
                 self._all_failed_rounds = 0
+                # 🔧 事务#2002：LLM调用成功，重置上下文长度超标compact轮次计数
+                self._context_overflow_rounds = 0
 
             # 如果重试循环因错误耗尽而break退出（llm_finish仍为False），
             # 说明所有provider都不可用（如全部被限流/冷却中）。
@@ -3844,6 +4718,89 @@ class ToolExecutionEngine:
                     )
                     await asyncio.sleep(5)
                     continue  # 回到外层 while True 循环，重试同一provider（未被标记失败）
+                if is_context_overflow:
+                    # 🔧 事务#2002：400上下文长度超标：上下文是provider无关的，
+                    # 换provider必然同样失败。正确做法：compact压缩上下文后重试。
+                    # 连续3轮compact后仍超标说明上下文无法压缩到provider能力内，
+                    # 拒绝处理（重启事务），绝不破坏上下文。
+                    self._context_overflow_rounds += 1
+                    # 用当前provider的compact_threshold作为compact目标
+                    _co_threshold = self.llm.compact_threshold
+                    # 每轮逐步收紧compact目标（0.6→0.48→0.36），加速压缩
+                    _co_ratio = max(0.36, 0.6 - (self._context_overflow_rounds - 1) * 0.12)
+                    _co_orig, _co_after = history.compact(_co_threshold * _co_ratio, 0.6)
+                    if _co_orig > _co_after:
+                        # compact改变了history，重置增量检测基线，避免误报
+                        history_list.clear()
+                        self._save_history(history)
+                    # 🔧 事务#2084 Fix2：矛盾判定（第二道防线，覆盖Fix1未解析出
+                    # context数值的错误格式）。compact毫无效果（orig==after）且
+                    # 当前上下文+输出预留仍在已知provider能力（compact_threshold）
+                    # 之内，服务端却报"超标"——数学上自相矛盾，说明服务端状态异常
+                    # （引擎未就绪/配置与实际不符），compact/restart都解决不了。
+                    # 走公共provider失败等待路径（事务保活、历史保留），服务恢复
+                    # 后自动继续。绝不restart（事务#2080曾因此陷入93次restart死循环）。
+                    # 注：max_tokens取全局配置（≥provider级值），使矛盾判定更保守。
+                    if (
+                        _co_orig == _co_after
+                        and _co_after + int(getattr(self.llm.config, "max_tokens", 0) or 0)
+                        < _co_threshold
+                    ):
+                        self._context_overflow_rounds = 0  # 非真实超标，重置轮次
+                        _co_msg = (
+                            f"⚠️  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+                            f"{ANSI_COLORS.get('bright_yellow')}"
+                            f"事务#{task_id}报上下文超标，但compact后上下文({_co_after})远小于"
+                            f"provider能力({_co_threshold})——服务端声称的容量与已知配置矛盾，"
+                            f"判定为服务端引擎未就绪/状态异常。不重启不清历史，等待服务恢复后重试..."
+                            f"{ANSI_COLORS.get('reset')}\n"
+                        )
+                        logger.warning(f"⚠️ [ToolEngine] 事务#{task_id} {_co_msg}")
+                        get_output_manager().write_output(
+                            task_id=task_id,
+                            content=_co_msg,
+                            source="system",
+                        )
+                        # 落入下方公共provider失败等待路径（不continue不break）
+                    else:
+                        if self._context_overflow_rounds >= 3:
+                            # 连续3轮compact后仍超标：拒绝处理，重启事务
+                            # （🔧 事务#2084 Fix3：经熔断器防死循环——15分钟内
+                            # 第3次restart改为pause等待人工/服务恢复）
+                            _co_msg = (
+                                f"⛔  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+                                f"{ANSI_COLORS.get('bright_red')}"
+                                f"事务#{task_id}上下文长度超标，连续{self._context_overflow_rounds}轮"
+                                f"compact后仍无法压缩到provider能力内"
+                                f"（compact: {_co_orig} → {_co_after}, 阈值{_co_threshold}）。"
+                                f"拒绝处理，重启事务。"
+                                f"{ANSI_COLORS.get('reset')}\n"
+                            )
+                            logger.error(f"⛔ [ToolEngine] {_co_msg}")
+                            get_output_manager().write_output(
+                                task_id=task_id,
+                                content=_co_msg,
+                                source="system",
+                            )
+                            self._engine_restart_with_breaker(
+                                task_id, detail=f"上下文超标compact无效({_co_orig}→{_co_after})"
+                            )
+                            should_complete = True
+                            break
+                        _co_msg = (
+                            f"⚠️  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+                            f"{ANSI_COLORS.get('bright_yellow')}"
+                            f"事务#{task_id}上下文长度超标，compact: {_co_orig} → {_co_after}"
+                            f"（第{self._context_overflow_rounds}/3轮），继续重试..."
+                            f"{ANSI_COLORS.get('reset')}\n"
+                        )
+                        logger.warning(f"⚠️ [ToolEngine] {_co_msg}")
+                        get_output_manager().write_output(
+                            task_id=task_id,
+                            content=_co_msg,
+                            source="system",
+                        )
+                        continue  # 回到外层 while True 循环，重试（已执行compact）
                 if is_content_filtered:
                     # 400内容类错误（内容审核拦截/内容解析失败）：上下文中存在
                     # 触发错误的内容，重试相同内容必然再次失败。采用逐级升级
@@ -3931,6 +4888,27 @@ class ToolExecutionEngine:
                 deadline = time.monotonic() + wait_time
                 while time.monotonic() < deadline:
                     self.exit_on_unexpected_status()
+                    # 🔧 事务#2064：重试等待期间同样检测紧急中断/控制信号——
+                    # 此前该等待循环（429限流最长300秒）是检测真空期，用户发的
+                    # 感叹号紧急info/消息完全无法打断。检测到则立刻跳出等待，
+                    # 经下方continue回到外层迭代边界消费处理（与思考流打断同语义）
+                    _wait_interrupt = self._has_pending_interrupts()
+                    _wait_urgent = None if _wait_interrupt else self._has_urgent_interrupts()
+                    if _wait_interrupt or _wait_urgent:
+                        if _wait_interrupt:
+                            logger.info(
+                                f"⚡ [ToolEngine] 事务#{task_id}provider重试等待期间"
+                                f"检测到控制信号，立刻中断等待处理"
+                            )
+                        else:
+                            logger.info(
+                                f"⚡ [ToolEngine] 事务#{task_id}provider重试等待期间"
+                                f"检测到紧急中断，立刻中断等待处理：{_wait_urgent}"
+                            )
+                        # 复位紧急检测节流缓存，确保迭代边界消费后重新检测
+                        self._last_urgent_check_ts = 0.0
+                        self._last_urgent_interrupt_reason = None
+                        break
                     remaining = deadline - time.monotonic()
                     if remaining > 0:
                         await asyncio.sleep(min(1, remaining))
@@ -4105,9 +5083,16 @@ class ToolExecutionEngine:
                 ):
                     self._remind_thinking_in_output(history)
                 continue
+            # 🔧 事务#2114：思考后无正式内容——注入user提醒（思考成果不会保留在
+            # 后续上下文中）。必须注入在 add_assistant **之前**：本轮空 assistant
+            # 随后会被空响应处理按 messages[-1]=="assistant" 移除，若提醒在其后
+            # 会阻止该移除（连续空响应时空assistant+提醒对不断累积）；
+            # 前置注入后空assistant被正常pop，提醒保留为history尾部
+            self._remind_thinking_only(history, thinking, content, tool_calls)
+
             # 6. 更新历史：添加助手消息
             # 当有 tool_calls 时，将 reasoning_content 合并到同一个 assistant 消息中
-            # 避免产生两个连续 assistant 消息（DeepSeek 不支持）
+            # 避免产生两条连续 assistant 消息（DeepSeek 不支持）
             _is_deepseek = "deepseek" in (self.llm.provider or "")
             if thinking and tool_calls:
                 # 合并模式：一条消息同时包含 reasoning_content + tool_calls
@@ -4248,34 +5233,280 @@ class ToolExecutionEngine:
             except Exception:
                 pass
 
-            rollback_metas: list[dict | None] = []
-            for tc in tool_calls:
-                tool_name_sn = (
+            # 🔧 事务#2064：工具批次（备份快照+并行执行）全程紧急监控。
+            # 真空期事故实锤：#2081在E:/aigc/Strata大仓库快照耗时156秒
+            # （tool_call事件01:05:10 → bash监控01:07:46才启动），期间用户
+            # 感叹号info无任何机制响应——bash内嵌监控在execute内才创建，
+            # 管不到快照段。本监控与整个工具批次并行，检测到紧急中断/
+            # 控制信号立刻cancel工具批次（to_thread的git快照线程自然跑完
+            # 不受影响；工具内同步写段原子不受cancel劈裂），跳到迭代边界
+            # 消费处理。
+            # 🔧 事务#2087：快照总预算——远程大仓库快照链（git批量快照+外部
+            # 文件备份串行堆叠）可达分钟级（#2081实锤152秒：tool_call 02:02:19
+            # → bash监控02:05:11才启动），bash 的 timeout 从 execute() 才开始
+            # 计时，被快照静默绕过。超预算跳过快照直接执行工具（0=禁用预算）
+            from peng.config.loader import get_snapshot_budget_seconds
+
+            _snap_budget = get_snapshot_budget_seconds()
+            # 快照提示共享状态（watchdog 写"进行中"，batch 写"已完成"）：
+            # 🔧 事务#2088四续：出现"进行中"必须有对应"已完成"收尾，且带
+            # 耗时数字让用户能判断慢在哪（快照本身 vs 网络波动）
+            _snap_flags: dict = {"notified": False, "t0": time.monotonic()}
+            _snap_needed = any(
+                ToolBackupManager.should_backup(
                     tc.name if hasattr(tc, "name") else tc.get("function", {}).get("name", "")
                 )
-                tool_args_sn = (
-                    tc.arguments
-                    if hasattr(tc, "arguments")
-                    else json.loads(tc.get("function", {}).get("arguments", "{}"))
-                )
-                if ToolBackupManager.should_backup(tool_name_sn):
-                    try:
-                        meta = await asyncio.to_thread(
-                            ToolBackupManager.create_snapshot,
-                            task_id=task_id,
-                            tool_name=tool_name_sn,
-                            tool_args=tool_args_sn,
-                            workdir=task_workdir,
-                            nest_name=task_nest,
-                        )
-                        rollback_metas.append(meta)
-                    except Exception as e:
-                        logger.debug(f"创建快照失败({tool_name_sn}): {e}")
-                        rollback_metas.append(None)
-                else:
-                    rollback_metas.append(None)
+                for tc in tool_calls
+            )
 
-            tool_exec_results = await self._execute_tools_parallel(tool_calls)
+            async def _run_tool_batch() -> tuple[list, list]:
+                """快照+并行执行工具（返回 rollback_metas, tool_exec_results）
+
+                🔧 事务#2087：快照段受 _snap_budget 总预算约束——超时放弃等待
+                剩余快照（to_thread 的 git 线程后台自然完成，至多多一个无害
+                备份点），未快照的工具 rollback meta 置 None（无回滚链接，
+                降级安全：回滚可用本轮迭代开始快照）。
+                """
+                rollback_metas_inner: list[dict | None] = []
+
+                async def _snapshots() -> None:
+                    for tc in tool_calls:
+                        tool_name_sn = (
+                            tc.name
+                            if hasattr(tc, "name")
+                            else tc.get("function", {}).get("name", "")
+                        )
+                        tool_args_sn = (
+                            tc.arguments
+                            if hasattr(tc, "arguments")
+                            else json.loads(tc.get("function", {}).get("arguments", "{}"))
+                        )
+                        if ToolBackupManager.should_backup(tool_name_sn):
+                            try:
+                                meta = await asyncio.to_thread(
+                                    ToolBackupManager.create_snapshot,
+                                    task_id=task_id,
+                                    tool_name=tool_name_sn,
+                                    tool_args=tool_args_sn,
+                                    workdir=task_workdir,
+                                    nest_name=task_nest,
+                                )
+                                rollback_metas_inner.append(meta)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as e:
+                                logger.debug(f"创建快照失败({tool_name_sn}): {e}")
+                                rollback_metas_inner.append(None)
+                        else:
+                            rollback_metas_inner.append(None)
+
+                if _snap_budget > 0:
+                    try:
+                        await asyncio.wait_for(_snapshots(), timeout=_snap_budget)
+                    except asyncio.TimeoutError:
+                        _snap_flags["timeout"] = True
+                        _skipped = len(tool_calls) - len(rollback_metas_inner)
+                        rollback_metas_inner.extend([None] * _skipped)
+                        _warn = (
+                            f"⚠️ 备份快照超过 {_snap_budget}s 预算已跳过"
+                            f"（{_skipped} 个工具无快照），直接执行工具。"
+                            f"回滚请使用本轮迭代开始快照。\n"
+                        )
+                        get_output_manager().write_output(
+                            task_id=task_id,
+                            content=f"{ANSI_COLORS.get('bright_yellow')}{_warn}{ANSI_COLORS.get('reset')}",
+                            source="system",
+                        )
+                        logger.warning(
+                            f"⚡ [ToolEngine] 事务#{task_id}快照超预算{_snap_budget}s，跳过剩余快照"
+                        )
+                else:
+                    await _snapshots()
+
+                # 🔧 事务#2088六续：快照段结束。竞态修复——watchdog 1s 节流
+                # 可能在快照完成后才写"进行中"（#2104 快照10.x秒完成，
+                # batch 检查时 notified=False 不写"已完成"，watchdog 11s 才
+                # 写"进行中"→ 永远没有收尾）。此处快照结束时自主判断：
+                # 已通知过 或 距批次开始>10s（watchdog 可能晚写）都算慢快照
+                _snap_flags["snap_done"] = True
+                _snap_elapsed = time.monotonic() - _snap_flags["t0"]
+                if not _snap_flags.get("timeout") and (
+                    _snap_flags["notified"] or _snap_elapsed > 10
+                ):
+                    _snap_flags["notified"] = True  # 阻止 watchdog 迟到补写"进行中"
+                    _n_snaps = sum(1 for m in rollback_metas_inner if m)
+                    _snap_done_msg = (
+                        f"✅ 备份快照已完成"
+                        f"（耗时 {_snap_elapsed:.1f}s，"
+                        f"{_n_snaps}/{len(tool_calls)} 个快照），开始执行工具...\n"
+                    )
+                    get_output_manager().write_output(
+                        task_id=task_id,
+                        content=f"{ANSI_COLORS.get('bright_green')}{_snap_done_msg}{ANSI_COLORS.get('reset')}",
+                        source="system",
+                    )
+
+                results = await self._execute_tools_parallel(tool_calls)
+                return rollback_metas_inner, results
+
+            async def _urgent_watchdog() -> str | None:
+                """工具批次期间的紧急中断看门狗（1秒节流，与思考流检测同源）
+
+                🔧 事务#2087：兼任批次心跳保活（30s节流）+慢快照一次性提示——
+                快照/工具执行期间 executor 无 chunk 流（_execute_llm 只在收到
+                chunk 时更新心跳），长快照静默期心跳停摆有超时误杀风险；同时
+                >10s 的快照向输出写提示，消除"工具已调用却毫无动静"的困惑。
+                """
+                _batch_start = _snap_flags["t0"]
+                _last_hb = _batch_start
+                while True:
+                    await asyncio.sleep(1)
+                    _now = time.monotonic()
+                    # 心跳保活：覆盖快照+工具执行全程静默期
+                    if _now - _last_hb >= 30:
+                        try:
+                            self.task_manager.update_heartbeat(task_id)
+                        except Exception:
+                            pass
+                        _last_hb = _now
+                    # 慢快照提示（一次性，>10s 且本批次确有快照需求；
+                    # 快照段已结束时不再写"进行中"——收尾"已完成"由
+                    # _run_tool_batch 在快照结束时自主判断写入（竞态修复））
+                    if (
+                        not _snap_flags["notified"]
+                        and not _snap_flags.get("snap_done")
+                        and _snap_needed
+                        and _now - _batch_start > 10
+                    ):
+                        _snap_flags["notified"] = True
+                        _slow_msg = (
+                            f"⏳ 备份快照进行中（已 {int(_now - _batch_start)}s），"
+                            f"快照完成后工具才会执行...\n"
+                        )
+                        get_output_manager().write_output(
+                            task_id=task_id,
+                            content=f"{ANSI_COLORS.get('bright_yellow')}{_slow_msg}{ANSI_COLORS.get('reset')}",
+                            source="system",
+                        )
+                    if self._has_pending_interrupts():
+                        return "CONTROL"
+                    reason = self._has_urgent_interrupts()
+                    if reason:
+                        return reason
+
+            _batch_task = asyncio.ensure_future(_run_tool_batch())
+            _watchdog_task = asyncio.ensure_future(_urgent_watchdog())
+            _wd_done, _wd_pending = await asyncio.wait(
+                [_batch_task, _watchdog_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            _wd_reason = None
+            if _watchdog_task in _wd_done:
+                try:
+                    _wd_reason = _watchdog_task.result()
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if _wd_reason is not None:
+                # 紧急中断/控制信号：cancel工具批次，注入提示，跳迭代消费
+                for _t in (_batch_task, _watchdog_task):
+                    _t.cancel()
+                for _t in (_batch_task, _watchdog_task):
+                    try:
+                        await _t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                if _wd_reason == "CONTROL":
+                    logger.info(
+                        f"⚡ [ToolEngine] 事务#{task_id}工具批次期间检测到控制信号，"
+                        f"终止快照/工具执行跳迭代处理"
+                    )
+                    _wd_msg = "⚠️ 检测到事务控制信号，工具执行已终止。请立刻处理。"
+                else:
+                    logger.info(
+                        f"⚡ [ToolEngine] 事务#{task_id}工具批次期间检测到紧急中断，"
+                        f"终止快照/工具执行立刻处理：{_wd_reason}"
+                    )
+                    _wd_msg = (
+                        f"⛔ 紧急中断：{_wd_reason}\n"
+                        f"（工具批次已强制终止。该指示以感叹号标记=最高优先级，"
+                        f"立刻停止当前行为模式，按上述指示从根本上改变处理方向，"
+                        f"禁止继续重复同类操作）"
+                    )
+                get_output_manager().write_output(
+                    task_id=task_id,
+                    content=f"{ANSI_COLORS.get('bright_yellow')}{_wd_msg}{ANSI_COLORS.get('reset')}\n",
+                    source="system",
+                )
+                history.add_user(_wd_msg)
+                self._save_history(history)
+                self._iteration += 1
+                continue
+            # 正常路径：看门狗cancel，取批次结果
+            _watchdog_task.cancel()
+            try:
+                await _watchdog_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            try:
+                rollback_metas, tool_exec_results = _batch_task.result()
+            except (asyncio.CancelledError, Exception) as _batch_err:
+                # 批次异常（非看门狗触发）：维持原异常语义
+                raise _batch_err
+
+            # === 🔧 事务#2064：工具调用死循环检测（保守：连续15轮完全同签名） ===
+            # 实测#2077事故：模型对同一4行脚本连写31版（r17_go30.py→r17_go31.py…），
+            # 每轮文件名递增参数不同但模式完全相同，打断4次仍继续——思考流/
+            # content死循环检测管不到工具调用层。签名规范化：路径中数字序列
+            # 归一（r17_go30→r17_go<N>）。⚠️阈值必须保守（15轮）：正常批量
+            # 文件处理/等待外部结果的轮询也会产生同签名，只在极端重复时
+            # 注入【提示性】干预（不跳迭代不打断，由模型自行判断）。
+            def _tool_sig(tc_item) -> str:
+                """工具调用签名：名称+参数规范化JSON（数字序列→#N，截断300字符）"""
+                _name = (
+                    tc_item.name
+                    if hasattr(tc_item, "name")
+                    else tc_item.get("function", {}).get("name", "")
+                )
+                _args = (
+                    tc_item.arguments
+                    if hasattr(tc_item, "arguments")
+                    else tc_item.get("function", {}).get("arguments", "{}")
+                )
+                _sig = (
+                    f"{_name}:{json.dumps(_args, ensure_ascii=False, default=str, sort_keys=True)}"
+                )
+                return re.sub(r"\d+", "#N", _sig)[:300]
+
+            _batch_sig = "|".join(sorted(_tool_sig(_tc) for _tc in tool_calls))[:600]
+            _loop_count = 0
+            if self._tool_batch_sigs and self._tool_batch_sigs[-1] == _batch_sig:
+                self._tool_batch_sig_repeat += 1
+                _loop_count = self._tool_batch_sig_repeat
+            else:
+                self._tool_batch_sig_repeat = 0
+            self._tool_batch_sigs.append(_batch_sig)
+            if len(self._tool_batch_sigs) > 16:
+                self._tool_batch_sigs = self._tool_batch_sigs[-16:]
+            if _loop_count >= 14:
+                self._tool_batch_sig_repeat = 0  # 提示后重置，避免每轮重复注入
+                _tl_intervention = (
+                    f"ℹ️ 提示：已连续{_loop_count + 1}轮执行完全相同的工具调用组合"
+                    f"（参数仅数字/版本号变化）。若你在等待外部结果（daemon/编译/测试）"
+                    f"属正常可忽略；若你在反复尝试同类操作且始终无进展，请立刻停止——"
+                    f"该方法已被证明无效，换一个根本不同的处理路径，或用report汇报"
+                    f"当前状态与卡点。\n"
+                )
+                logger.warning(
+                    f"⚡ [ToolEngine] 事务#{task_id}工具调用高度重复"
+                    f"(连续{_loop_count + 1}轮同签名)，注入提示"
+                )
+                get_output_manager().write_output(
+                    task_id=task_id,
+                    content=f"{ANSI_COLORS.get('bright_yellow')}{_tl_intervention}{ANSI_COLORS.get('reset')}\n",
+                    source="system",
+                )
+                history.add_user(_tl_intervention)
+                self._save_history(history)
 
             # === 思考过载检测：有效编辑工具调用后重置计数器并恢复思考模式 ===
             _EDIT_TOOLS = frozenset({"write", "edit", "line_edit"})
@@ -4322,7 +5553,10 @@ class ToolExecutionEngine:
                         from peng.service.tool_backup import HistoryBackupManager
 
                         history_context = json.dumps(
-                            history.to_context(thinking_type=self.llm.thinking_type),
+                            history.to_context(
+                                thinking_type=self.llm.thinking_type,
+                                preserve_thinking=self._provider_preserve_thinking(),
+                            ),
                             ensure_ascii=False,
                         )
 
@@ -4420,6 +5654,10 @@ class ToolExecutionEngine:
                         logger.info(
                             f"[ToolEngine] 工具 {tool_name} 结果含 {len(parts) - 1} 个多模态附件，已注入LLM上下文"
                         )
+                # 🔧 事务#2114：超长工具结果（超过provider级drop_hint_threshold，
+                # 默认1024字节）末尾追加带唯一4位数字id的drop清理提示，
+                # 模型确认结果毫无用处时可用drop工具清理以节省上下文空间
+                history_content = self._append_drop_hint(history_content)
                 history.add_tool_result(tool_call_id, tool_name, history_content)
 
                 tool_args = (
@@ -4562,7 +5800,9 @@ class ToolExecutionEngine:
                         f"（{self._consecutive_empty}/5）"
                     )
                     logger.warning(warn_msg)
-                    _sys_err = f"{ANSI_COLORS.get('bright_yellow')}{warn_msg}{ANSI_COLORS.get('reset')}\n"
+                    _sys_err = (
+                        f"{ANSI_COLORS.get('bright_yellow')}{warn_msg}{ANSI_COLORS.get('reset')}\n"
+                    )
                     if self._should_report_system_error(_sys_err):
                         get_output_manager().write_output(
                             task_id=task_id,
@@ -4572,6 +5812,8 @@ class ToolExecutionEngine:
                     should_complete = False
                 else:
                     # 清空上下文重启事务处理
+                    # （🔧 事务#2084 Fix3：经熔断器防死循环——反复空响应restart
+                    # 无效时15分钟内第3次起改为pause，避免死循环烧钱）
                     warn_msg = (
                         f"⚠️ [toolengine] 事务#{task_id} 空响应(tokens={est_tokens})，"
                         f"compact处理无效，清空上下文重启事务处理"
@@ -4582,7 +5824,9 @@ class ToolExecutionEngine:
                         content=f"{ANSI_COLORS.get('bright_yellow')}{warn_msg}{ANSI_COLORS.get('reset')}\n",
                         source="system",
                     )
-                    self.task_manager.db.insert_task_control(task_id, "restart")
+                    self._engine_restart_with_breaker(
+                        task_id, detail=f"空响应compact无效(tokens={est_tokens})"
+                    )
                     should_complete = True
             elif content.strip() or tool_calls:
                 # 有有效内容或工具调用，重置空响应计数
@@ -4706,6 +5950,17 @@ class ToolExecutionEngine:
         """
         file_path = tool_args.get("filePath", "")
         operation = tool_args.get("operation", "")
+
+        # 🔧 事务#2083：filePath 缺失时先给出根因明确的报错（区分"参数缺失"与
+        # "未先read"），避免误报"未检测到read调用"误导大模型反复无效重试
+        # （事务#2080事故：3次line_edit均漏传filePath，被误导为read范围/
+        # 路径格式问题，浪费3轮重试后才改用edit工具脱困）
+        if not file_path or not str(file_path).strip():
+            return (
+                "❌ line_edit 拒绝执行：缺少必填参数 filePath（要编辑文件的绝对路径）。"
+                "请检查本次工具调用参数，补上 filePath 后重试；"
+                "这不是 read 未覆盖问题，无需重复 read。"
+            )
 
         # 计算 line_edit 操作影响的行号范围
         start_line = None

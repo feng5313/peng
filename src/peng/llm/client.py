@@ -60,6 +60,11 @@ _THINKING_TAG_PATTERN = re.compile(r"<think\>(.*?)\</think\>", re.DOTALL)
 # 多模态附件part估算token数（与MessageHistory.estimate_tokens保持一致）
 _MULTIMODAL_PART_ESTIMATED_TOKENS = 1000
 
+# 🔧 事务#1959：附件触发的vision provider切换最多服务的迭代数（含附件轮
+# 本身）。切换后第2个非附件迭代开始强制切回原provider，防止"没有出错就
+# 不切换"原则让事务长期滞留在flash等轻量vision模型上。
+VISION_SWITCH_MAX_ROUNDS = 2
+
 
 def estimate_messages_tokens(messages: list[dict] | None) -> int:
     """估算消息列表的输入token数（事务#1807）
@@ -142,7 +147,12 @@ def _read_agents_md_local(workdir: str) -> str | None:
 # 子进程转发路径（_forward_via_server）会把 nest 业务错误也包装成 NestError
 # 抛出（与连接错误同形态），需按关键词识别为"候选文件不存在"→继续尝试下一候选，
 # 而非"nest 连接故障"→放弃。主进程路径正常返回 resp.error 不会进入该分支。
-_AGENTS_MD_NOT_FOUND_PATTERNS = ("文件未找到", "文件不存在", "路径访问被安全策略拒绝", "获取文件信息失败")
+_AGENTS_MD_NOT_FOUND_PATTERNS = (
+    "文件未找到",
+    "文件不存在",
+    "路径访问被安全策略拒绝",
+    "获取文件信息失败",
+)
 
 
 def _is_agents_md_not_found(exc: Exception) -> bool:
@@ -165,8 +175,10 @@ async def _read_agents_md_remote(nest_name: str, workdir: str) -> str | None:
             # 1. stat 获取 mtime/size（用于缓存判断）
             stat_resp = await asyncio.wait_for(
                 send_request(
-                    "stat", {"path": remote_path},
-                    timeout=_AGENTS_MD_READ_TIMEOUT, nest_name=nest_name,
+                    "stat",
+                    {"path": remote_path},
+                    timeout=_AGENTS_MD_READ_TIMEOUT,
+                    nest_name=nest_name,
                 ),
                 timeout=_AGENTS_MD_READ_TIMEOUT + 5,
             )
@@ -189,8 +201,10 @@ async def _read_agents_md_remote(nest_name: str, workdir: str) -> str | None:
             # 3. read 读取内容（lines 带行号前缀需剥离）
             read_resp = await asyncio.wait_for(
                 send_request(
-                    "read", {"path": remote_path, "offset": 1, "limit": 2000},
-                    timeout=_AGENTS_MD_READ_TIMEOUT, nest_name=nest_name,
+                    "read",
+                    {"path": remote_path, "offset": 1, "limit": 2000},
+                    timeout=_AGENTS_MD_READ_TIMEOUT,
+                    nest_name=nest_name,
                 ),
                 timeout=_AGENTS_MD_READ_TIMEOUT + 5,
             )
@@ -202,9 +216,7 @@ async def _read_agents_md_remote(nest_name: str, workdir: str) -> str | None:
             content_lines = []
             for i, line in enumerate(lines):
                 prefix = f"{i + 1}: "  # 请求 offset=1，前缀即 "1: "、"2: "... 与行号一致递增
-                content_lines.append(
-                    line[len(prefix):] if line.startswith(prefix) else line
-                )
+                content_lines.append(line[len(prefix) :] if line.startswith(prefix) else line)
             content = "\n".join(content_lines)
             # splitlines 丢失文件末尾换行，与本地 read_text 行为对齐补回，
             # 避免注入后与后续 system 消息（如 skills 提示词）首行粘连
@@ -225,14 +237,12 @@ async def _read_agents_md_remote(nest_name: str, workdir: str) -> str | None:
                 continue  # nest端文件不存在（子进程转发包装形态）→ 尝试下一候选
             # 连接层错误：AGENTS.md 读取失败不阻塞事务，记录警告后放弃
             logger.warning(
-                f"[LLM Client] 读取远程nest AGENTS.md 失败(忽略): "
-                f"{nest_name}:{remote_path}: {e}"
+                f"[LLM Client] 读取远程nest AGENTS.md 失败(忽略): {nest_name}:{remote_path}: {e}"
             )
             return None
         except Exception as e:
             logger.warning(
-                f"[LLM Client] 读取远程nest AGENTS.md 异常(忽略): "
-                f"{nest_name}:{remote_path}: {e}"
+                f"[LLM Client] 读取远程nest AGENTS.md 异常(忽略): {nest_name}:{remote_path}: {e}"
             )
             return None
     return None
@@ -279,7 +289,7 @@ def _strip_line_prefix(lines: list[str], offset: int = 1) -> str:
     out = []
     for i, line in enumerate(lines):
         prefix = f"{i + offset}: "
-        out.append(line[len(prefix):] if line.startswith(prefix) else line)
+        out.append(line[len(prefix) :] if line.startswith(prefix) else line)
     return "\n".join(out)
 
 
@@ -295,8 +305,10 @@ async def list_remote_skill_dirs(nest_name: str, workdir: str) -> list[str]:
     try:
         read_resp = await asyncio.wait_for(
             send_request(
-                "read", {"path": skills_dir, "offset": 1, "limit": 1000},
-                timeout=_AGENTS_MD_READ_TIMEOUT, nest_name=nest_name,
+                "read",
+                {"path": skills_dir, "offset": 1, "limit": 1000},
+                timeout=_AGENTS_MD_READ_TIMEOUT,
+                nest_name=nest_name,
             ),
             timeout=_AGENTS_MD_READ_TIMEOUT + 5,
         )
@@ -310,10 +322,14 @@ async def list_remote_skill_dirs(nest_name: str, workdir: str) -> list[str]:
         names = [e.get("name") for e in entries if e.get("is_dir") and e.get("name")]
         return [n for n in names if n]
     except (NestError, asyncio.TimeoutError) as e:
-        logger.warning(f"[LLM Client] 列出远程nest skills目录失败(忽略): {nest_name}:{skills_dir}: {e}")
+        logger.warning(
+            f"[LLM Client] 列出远程nest skills目录失败(忽略): {nest_name}:{skills_dir}: {e}"
+        )
         return []
     except Exception as e:
-        logger.warning(f"[LLM Client] 列出远程nest skills目录异常(忽略): {nest_name}:{skills_dir}: {e}")
+        logger.warning(
+            f"[LLM Client] 列出远程nest skills目录异常(忽略): {nest_name}:{skills_dir}: {e}"
+        )
         return []
 
 
@@ -328,6 +344,7 @@ async def read_remote_skill_md(nest_name: str, workdir: str, name: str) -> str |
     skill_md_name = "SKILL.md"
     try:
         from peng.config import load_config
+
         skill_md_name = load_config().paths.skill_md_name
     except Exception:
         pass
@@ -337,8 +354,10 @@ async def read_remote_skill_md(nest_name: str, workdir: str, name: str) -> str |
         # 1. stat 获取 mtime/size（用于缓存判断）
         stat_resp = await asyncio.wait_for(
             send_request(
-                "stat", {"path": remote_path},
-                timeout=_AGENTS_MD_READ_TIMEOUT, nest_name=nest_name,
+                "stat",
+                {"path": remote_path},
+                timeout=_AGENTS_MD_READ_TIMEOUT,
+                nest_name=nest_name,
             ),
             timeout=_AGENTS_MD_READ_TIMEOUT + 5,
         )
@@ -360,8 +379,10 @@ async def read_remote_skill_md(nest_name: str, workdir: str, name: str) -> str |
         # 3. read 读取内容（lines 带行号前缀需剥离）
         read_resp = await asyncio.wait_for(
             send_request(
-                "read", {"path": remote_path, "offset": 1, "limit": 2000},
-                timeout=_AGENTS_MD_READ_TIMEOUT, nest_name=nest_name,
+                "read",
+                {"path": remote_path, "offset": 1, "limit": 2000},
+                timeout=_AGENTS_MD_READ_TIMEOUT,
+                nest_name=nest_name,
             ),
             timeout=_AGENTS_MD_READ_TIMEOUT + 5,
         )
@@ -374,17 +395,22 @@ async def read_remote_skill_md(nest_name: str, workdir: str, name: str) -> str |
         if read_resp.data.get("total_lines", 0) > len(lines):
             logger.warning(f"[LLM Client] SKILL.md 超过2000行已截断: {nest_name}:{remote_path}")
         _skill_md_cache[cache_key] = (mtime_ns, size, content)
-        logger.info(f"[LLM Client] 已读取远程nest SKILL.md: {nest_name}:{remote_path} ({len(content)}字符)")
+        logger.info(
+            f"[LLM Client] 已读取远程nest SKILL.md: {nest_name}:{remote_path} ({len(content)}字符)"
+        )
         return content
     except (NestError, asyncio.TimeoutError) as e:
         if _is_agents_md_not_found(e):
             return None  # nest端文件不存在 → None（调用方跳过）
-        logger.warning(f"[LLM Client] 读取远程nest SKILL.md失败(忽略): {nest_name}:{remote_path}: {e}")
+        logger.warning(
+            f"[LLM Client] 读取远程nest SKILL.md失败(忽略): {nest_name}:{remote_path}: {e}"
+        )
         return None
     except Exception as e:
-        logger.warning(f"[LLM Client] 读取远程nest SKILL.md异常(忽略): {nest_name}:{remote_path}: {e}")
+        logger.warning(
+            f"[LLM Client] 读取远程nest SKILL.md异常(忽略): {nest_name}:{remote_path}: {e}"
+        )
         return None
-
 
 
 @dataclass
@@ -477,6 +503,12 @@ class GLMClient:
         self._recent_error_sigs: dict[int, list[str]] = {}  # task_id -> [signatures]
         self._error_dedup_rounds: int = getattr(self.config, "error_dedup_rounds", 5)
 
+        # 🔧 事务#1959：vision切换回退窗口——附件触发的vision provider切换跟踪
+        # _vision_switch_from: 切换前的原provider名（None=窗口关闭）
+        # _vision_switch_used: 窗口开启以来的非附件迭代计数
+        self._vision_switch_from: str | None = None
+        self._vision_switch_used: int = 0
+
         # 并发控制信号量
         self._llm_semaphore = asyncio.Semaphore(self.config.max_concurrent)
         self._small_model_semaphore = asyncio.Semaphore(self.config.small_model_max_concurrent)
@@ -495,6 +527,54 @@ class GLMClient:
             except Exception as e:
                 llm_logger = setup_llm_logging()
                 logger.warning(f"加载 LLM 日志配置失败：{e}\n{traceback.format_exc()}")
+
+    def _vision_window_advance(self, prefer_vision: bool) -> str | None:
+        """vision切换回退窗口每轮推进（事务#1959）
+
+        窗口开启（附件触发过vision切换）时按迭代计数推进：
+        - 本轮仍有附件（prefer_vision）：刷新预算（图片必须发给vision
+          provider，不能为回切而丢附件），不强制回切
+        - 本轮无附件：计数+1；达到 VISION_SWITCH_MAX_ROUNDS 后返回需强制
+          回切的原provider名
+
+        Returns:
+            需强制回切的原provider名；None=无需强制回切
+        """
+        if not self._vision_switch_from:
+            return None
+        if prefer_vision:
+            self._vision_switch_used = 0
+            return None
+        self._vision_switch_used += 1
+        if self._vision_switch_used >= VISION_SWITCH_MAX_ROUNDS:
+            logger.info(
+                f"[LLM Client] vision切换窗口已满{VISION_SWITCH_MAX_ROUNDS}轮，"
+                f"强制切回原provider: {self._vision_switch_from}"
+            )
+            return self._vision_switch_from
+        return None
+
+    def _vision_window_on_selected(
+        self, prefer_vision: bool, prev_provider: str | None, selected: str
+    ) -> None:
+        """vision切换回退窗口开合维护（事务#1959）
+
+        - 附件触发provider切换（prefer_vision且切换发生）且窗口未开：
+          记住切换前原provider开窗
+        - 选中的provider即原provider（强制回切成功/优先级自然回切）：关窗
+        """
+        if prefer_vision and selected != prev_provider and not self._vision_switch_from:
+            if prev_provider:
+                self._vision_switch_from = prev_provider
+                self._vision_switch_used = 0
+                logger.info(
+                    f"[LLM Client] 附件触发vision切换 {prev_provider} → {selected}，"
+                    f"{VISION_SWITCH_MAX_ROUNDS}个迭代后将切回原provider"
+                )
+        elif self._vision_switch_from and selected == self._vision_switch_from:
+            self._vision_switch_from = None
+            self._vision_switch_used = 0
+            logger.info("[LLM Client] 已切回原provider，vision切换窗口关闭")
 
     def _init_provider_semaphores(self) -> None:
         """为每个配置了 max_concurrent 的 provider 初始化独立信号量"""
@@ -591,6 +671,12 @@ class GLMClient:
         """关闭客户端"""
         await self._client.aclose()
 
+    def get_system_prompt(self, messages: list[dict]) -> str:
+        if messages:
+            if "role" in messages[0] and messages[0]["role"] == "system":
+                return messages[0]["content"]
+        return ""
+
     def refresh_provider_vars(self, content: str | None = None) -> None:
         """按当前有效 provider 解析配置并更新临时变量（不发起请求）
 
@@ -669,7 +755,7 @@ class GLMClient:
         if self.config:
             task = self.task_manager.get_task(task_id=task_id)
             content = task.get("content")
-            fetch_result = self.config.fetch_providers(content)
+            fetch_result = self.config.fetch_providers(content + self.get_system_prompt(messages))
             favorite_providers = fetch_result[0] if fetch_result else None
             provider_locked = fetch_result[1] if fetch_result else False
             forbidden_providers = fetch_result[2] if fetch_result else None
@@ -727,8 +813,20 @@ class GLMClient:
                     min_context_tokens = int(est * 1.05)
             except Exception as e:
                 logger.debug(f"[LLM Client] 请求token估算失败(忽略，不限制provider选择): {e}")
+            # 🔧 事务#1959：vision切换回退窗口——附件触发的vision provider切换
+            # 最多服务 VISION_SWITCH_MAX_ROUNDS 个迭代，之后必须切回原provider
+            # （get_provider"没有出错就不切换"原则会让current一直复用vision
+            # provider，事务长期滞留flash等轻量模型）。本轮仍有附件时刷新预算
+            # （图片必须发给vision provider，不能为回切而丢附件）。
+            _vision_return_target = self._vision_window_advance(prefer_vision)
+            prev_provider = self.provider
+            # failed标记语义作用于"当前实际provider"，强制回切仅在成功路径
+            # 覆盖current（失败路径按优先级重选即可达到回切效果）
+            _provider_current = self.provider
+            if _vision_return_target and not should_mark_failed:
+                _provider_current = _vision_return_target
             provider_data = self.config.get_provider(
-                current=self.provider,
+                current=_provider_current,
                 favorites=favorite_providers,
                 failed=should_mark_failed,
                 task_id=task_id,
@@ -779,6 +877,8 @@ class GLMClient:
 
             self.provider = provider
             self.compact_threshold = provider_data["compact_threshold"]
+            # 🔧 事务#1959：vision切换窗口开合维护
+            self._vision_window_on_selected(prefer_vision, prev_provider, provider)
             self.thinking_mode = provider_data["thinking_mode"]
             self.thinking_type = provider_data.get("thinking_type")
             self.provider_config = provider_data  # 保存完整配置（含 price_* 字段）
@@ -880,6 +980,27 @@ class GLMClient:
                         messages = demote_messages_attachments(messages)
                 except Exception as e:
                     logger.debug(f"[LLM Client] 附件降级检查失败(忽略): {e}")
+
+            # 🔧 事务#1959：空附件净化最后防线——请求携带附件part时校验
+            # payload非空（data URL base64段非空且解码非0字节）。空payload附件
+            # （0字节文件透传/历史中毒上下文/旧版本入库坏附件）发给provider
+            # 必然400（GLM: file必须传入file_id/file_url/file_data至少之一），
+            # 且换provider无法自愈，曾致事务#1955无限重试只能人工回滚。
+            try:
+                from peng.llm.multimodal import (
+                    messages_have_attachment_parts,
+                    sanitize_messages_attachments,
+                )
+
+                if messages_have_attachment_parts(messages):
+                    messages, _invalid_removed = sanitize_messages_attachments(messages)
+                    if _invalid_removed:
+                        logger.warning(
+                            f"[LLM Client] 已移除{_invalid_removed}个空数据附件part"
+                            f"(0字节/无效payload)，防止API 400"
+                        )
+            except Exception as e:
+                logger.debug(f"[LLM Client] 空附件净化检查失败(忽略): {e}")
 
             payload: dict[str, Any] = {
                 "model": effective_model,
@@ -1491,6 +1612,14 @@ class GLMClient:
                     from peng.llm.prefill_tracker import get_prefill_tracker
 
                     get_prefill_tracker().finish_request(task_id)
+                except Exception:
+                    pass
+                # 🔧 事务#1941：流结束（正常/异常/中断）配对结束吞吐率追踪，
+                # 活跃请求归零时速率清0，消除空闲进程的幽灵速率残留
+                try:
+                    from peng.llm.throughput_tracker import get_throughput_tracker
+
+                    get_throughput_tracker().end_request(self.provider)
                 except Exception:
                     pass
                 # 手动退出上下文管理器，确保 HTTP 连接被关闭

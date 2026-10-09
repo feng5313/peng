@@ -583,9 +583,11 @@ class MessageTree:
         Returns:
             发送者显示名称（{AGENT_NAME} 或 {MASTER_NAME_EMOJI}）
         """
+        from peng.message.names import is_agent_side
+
         sender = msg.sender or MASTER_NAME
-        # 根据发送者名称判断
-        if "鹏" in sender or sender == "peng":
+        # 根据发送者名称判断（is_agent_side 兼容 鹏🐣·事务#N 等带事务标识形态）
+        if is_agent_side(sender):
             return AGENT_NAME
         return MASTER_NAME_EMOJI
 

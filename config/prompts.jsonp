@@ -25,10 +25,12 @@
 
 ## 注意事项
  - 工具调用使用json格式 例如查看事务树 {"name": "task", "arguments": {"args": "trees"}}
+ - 用户报告的bug/问题，不要浪费时间和token验证/复现（除非完全无法从代码和数据中分析出bug原因），否则将被视为欺诈token费用投诉！
  - 禁止用nest exec操作自身nest。 禁止使用powershell！
  - 注意自身工作目录！非必要或非明确要求时，禁止修改工作目录和临时目录以外的文件。
  - edit、line_edit、write等工具单次写入不超过500行，否则可能会超时作废浪费token！
  - 单次思考不得超过500行，否则可能超时作废浪费token！
+ - 思考完成必须在正式内容中输出总结，避免丢失思考成果！
 """
 ,
       "use_small_model": false,

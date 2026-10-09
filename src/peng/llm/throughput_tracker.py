@@ -1,19 +1,34 @@
 """
 Provider 吞吐率追踪器（跨进程方案）
 
-实时统计每个 Provider 的输出吞吐率（tokens/s），用于前端显示和动画帧率调节。
+实时统计每个 Provider 的**模型生成速率**（tokens/s），用于前端显示和动画帧率调节。
 
-核心算法：累计计数 + 周期采样 + EWMA 平滑
-- 与 Linux 内核网络流量统计原理一致：
-  1. 持续累计接收的 token 数（类似网络驱动的字节计数器）
-  2. 每隔 CALC_INTERVAL 秒采样一次，计算区间速率 = 累计 token / 采样间隔
-  3. 用 EWMA 平滑区间速率，消除抖动
-- 比逐 chunk 计算瞬时速率更准确、噪声更低、收敛更快
+算法：指数加权速率估计 + usage 校准钳制（事务#1941 重构）
+
+背景（旧算法缺陷）：旧实现按"区间采样"计算 interval_rate = accumulated/dt 并用 EWMA 平滑。
+GLM 等 thinking 模型的输出到达客户端并非匀速——思考停顿/服务器缓冲后会在 ~1s 内
+涌出数千 token（burst）。burst 的 token 挂在极短的 dt 采样窗口上导致 interval_rate
+虚高至数千 tok/s（实测生产环境单进程尖峰 5663/4771 tok/s），EWMA(τ=3s) 又让尖峰
+残留数秒。这不是真实生成速率，而是被缓冲扭曲的"接收速率"。
+
+新算法（指数加权速率估计器，O(1) 增量）：
+1. weighted = weighted·e^(-Δt/τ) + tokens（RATE_TAU=2.5s）
+2. rate = weighted / min(τ, max(自首chunk起的墙钟时间, MIN_ELAPSED))
+   - 请求初期分母用实际时长 → 无冷启动欠冲（首秒即接近真实速率）
+   - 稳态分母固定 τ → 匀速流的无偏估计（rate ≈ 真实速率）
+   - burst 涌入 N tokens → raw_rate 瞬间 N/τ，被钳制；随后按 e^(-t/τ)
+     连续衰减，约 3~4τ（8~10s）回落到真实速率
+3. usage 校准钳制：每个请求结束时 record_usage() 记录精确速率
+   （completion_tokens/duration），跨请求维护校准速率 EWMA(τ=90s)；
+   流式估计钳制到 cap = max(MIN_CAP, CALIB_FACTOR×校准速率)，
+   冷启动（无校准数据）时使用硬上限 HARD_CAP。
+   - 效果：glm 校准 ~60 tok/s → burst 显示 ≤150，~8 秒回落到真值
+4. 请求结束（active 归零）时速率清 0：无活跃请求不显示，消除幽灵残留
 
 跨进程共享：
-- runner 进程通过 record() 写入 EWMA 吞吐率到文件
+- runner 进程通过 record()/record_usage() 写入速率到文件
 - 每个 runner 子进程写独立文件（含PID），避免多进程互相覆盖
-- webui 进程通过 get_snapshot() 读取同 provider 的所有进程文件并合并
+- webui 进程通过 get_snapshot() 读取同 provider 的所有进程文件并求和
 - 数据文件：data/throughput_{provider}_{pid}.json
 """
 
@@ -35,18 +50,38 @@ logger = logging.getLogger(__name__)
 
 # ============ 核心算法参数 ============
 
-# 速率计算采样间隔（秒）
-# 每隔这么多秒，计算一次 "累计token数/时间间隔" 作为区间速率
-CALC_INTERVAL = 1.0
-
-# EWMA 时间常数（秒）：平滑区间速率的抖动
-# τ 越大越平滑但响应越慢，τ=3 意味着约 9 秒达到 95% 稳态
-EWMA_TIME_CONSTANT = 3.0
-
 # 字符到 token 的估算比例
 # LLM tokenization 规则：中文约 1.5 字符/token，英文约 4 字符/token
 # 混合文本取约 2 字符/token 作为合理估算
 CHARS_PER_TOKEN = 2.0
+
+# 指数加权时间常数（秒）：速率估计器的滑动窗口尺度
+# rate = 指数加权和 / min(τ, max(自首chunk起的墙钟时间, 1s))
+# - τ 越小平滑越弱但 burst 回落越快；τ=2.5s 时 burst 尖峰 ~8 秒衰减完毕
+# - 匀速流稳态：rate = 真实速率（指数加权窗口的无偏估计）
+RATE_TAU = 2.5
+
+# 归一化分母下限（秒）：防止请求刚开始时（首 chunk 后极短时间内）比值剧烈抖动
+MIN_ELAPSED = 1.0
+
+# 校准速率 EWMA 时间常数（秒）：跨请求平滑真实 usage 速率
+# τ=90s 意味着几十个请求后收敛到该 provider 的典型速率
+CALIB_EWMA_TAU = 90.0
+
+# 流式估计钳制下限（tokens/s）：保证较慢模型不被钳得过低
+MIN_CAP = 150.0
+
+# 流式估计钳制系数：cap = max(MIN_CAP, CALIB_FACTOR × 校准速率)
+# 校准速率是真实生成速率，burst 估计值不应显著超过它的若干倍
+CALIB_FACTOR = 2.5
+
+# 冷启动硬上限（tokens/s）：尚无校准数据时的绝对上限
+# 覆盖本地 vLLM/sglang 等高速后端（可达数百 tok/s），同时压制 burst 尖峰
+HARD_CAP = 800.0
+
+# 窗口空闲重置间隔（秒）：record() 间隔超过此值时重置指数加权状态。
+# （指数衰减本身在 4τ≈10s 后残留<2%，此处显式重置保证状态干净）
+WINDOW_RESET_GAP = 10.0
 
 # ============ 文件管理参数 ============
 
@@ -131,16 +166,18 @@ def _calc_animation_duration(throughput: float) -> float:
 
 class ThroughputTracker:
     """
-    Provider 吞吐率追踪器（累计计数 + 周期采样 + EWMA）
+    Provider 吞吐率追踪器（请求级积分速率 + usage 校准钳制）
 
-    算法原理（与 Linux 内核网络流量统计一致）：
-    1. record() 持续累计 token 数（类似驱动的字节计数器）
-    2. 每 CALC_INTERVAL 秒采样一次：区间速率 = 累计 token / 间隔时间
-    3. 用 EWMA 平滑区间速率，消除采样间的抖动
-    4. 首次采样直接使用区间速率（不从0平滑），确保快速响应
+    算法原理：
+    1. start_request()/end_request() 维护活跃请求计数，界定积分窗口
+    2. record() 累计输出字符并计算请求级积分速率（burst 免疫）：
+       rate = 窗口累计tokens / max(自首chunk起的墙钟时间, MIN_ELAPSED)
+    3. rate 钳制到 cap = max(MIN_CAP, CALIB_FACTOR×校准速率)（或 HARD_CAP）
+    4. record_usage() 用真实 usage（completion_tokens/duration）更新校准速率
 
     跨进程通过文件共享数据：
     - record(): 在 runner 进程中调用，记录 SSE chunk 字符数
+    - record_usage(): 在 runner 进程中请求结束时调用，校准速率
     - get_snapshot(): 在 webui 进程中调用，读取最新吞吐率数据
     - cleanup(): 清理过期文件和无效进程文件
     - 进程退出时自动清理本进程的文件
@@ -162,10 +199,13 @@ class ThroughputTracker:
         self._initialized = True
         self._data_lock = threading.Lock()
         # 每个 provider 的状态：
-        #   rate: 当前 EWMA 平滑后的吞吐率（tokens/s）
-        #   accumulated_tokens: 自上次采样以来累计的 token 数
-        #   last_calc_time: 上次采样（计算区间速率）的时间戳
-        #   first_sample: 是否还在等待首次采样（首次不做EWMA平滑）
+        #   rate: 当前显示速率（tokens/s，钳制后）
+        #   active_requests: 活跃请求数（0 表示空闲，速率清 0）
+        #   weighted: 指数加权和 Σ tokens_i·e^(-(now-t_i)/RATE_TAU)（O(1)增量维护）
+        #   window_start: 活跃周期首 chunk 时刻（None 表示尚未有数据）
+        #   last_record_time: 上次 record() 时刻（加权衰减与空闲重置用）
+        #   calibrated: usage 校准速率 EWMA（tokens/s，None 表示尚无校准）
+        #   last_calib_time: 上次校准更新时刻（计算 EWMA 的 dt 用）
         self._provider_state: dict[str, dict] = {}
         # 上次写入文件的时间（每个provider独立）
         self._last_file_write: dict[str, float] = {}
@@ -174,8 +214,32 @@ class ThroughputTracker:
         # 上次清理时间
         self._last_cleanup = 0.0
 
+    def _get_state(self, provider: str, now: float) -> dict:
+        """获取或创建 provider 状态（须持有 self._data_lock）"""
+        state = self._provider_state.get(provider)
+        if state is None:
+            state = {
+                "rate": 0.0,
+                "active_requests": 0,
+                "weighted": 0.0,
+                "window_start": None,
+                "calibrated": None,
+                "last_calib_time": None,
+                "last_record_time": None,
+            }
+
+            self._provider_state[provider] = state
+        return state
+
+    def _calc_cap(self, state: dict) -> float:
+        """计算流式估计的钳制上限（须持有 self._data_lock）"""
+        calibrated = state.get("calibrated")
+        if calibrated is None or calibrated <= 0:
+            return HARD_CAP
+        return max(MIN_CAP, CALIB_FACTOR * calibrated)
+
     def start_request(self, provider: str) -> None:
-        """标记一个请求开始（用于计算真实响应时间）
+        """标记一个请求开始（活跃计数 +1，首个请求开启速率窗口）
 
         Args:
             provider: Provider 名称
@@ -184,12 +248,49 @@ class ThroughputTracker:
             return
         now = time.time()
         with self._data_lock:
+            state = self._get_state(provider, now)
+            state["active_requests"] += 1
+            if state["active_requests"] == 1:
+                # 新的活跃周期：重置速率窗口
+                state["weighted"] = 0.0
+                state["window_start"] = None
+                state["last_record_time"] = None
+
+    def end_request(self, provider: str) -> None:
+        """标记一个请求结束（活跃计数 -1，归零时速率清 0 并立即写文件）
+
+        在 runner 请求的 finally 中调用（正常/异常/中断路径均覆盖）。
+
+        Args:
+            provider: Provider 名称
+        """
+        if not provider:
+            return
+        write_zero = False
+        with self._data_lock:
             state = self._provider_state.get(provider)
-            if state:
-                state["response_start_time"] = now
+            if state is None:
+                return
+            state["active_requests"] = max(0, state["active_requests"] - 1)
+            if state["active_requests"] == 0:
+                # 无活跃请求：显示速率清 0（消除空闲幽灵残留）
+                state["rate"] = 0.0
+                state["weighted"] = 0.0
+                state["window_start"] = None
+                write_zero = True
+
+        if write_zero:
+            # 写入 0 值文件，让 webui 立即停止显示该进程的速率
+            try:
+                self._write_to_file(provider)
+            except Exception as e:
+                logger.debug(f"[ThroughputTracker] end_request后写入文件失败: {e}")
 
     def record_usage(self, provider: str, completion_tokens: int, duration_seconds: float) -> None:
         """记录真实usage数据（在 runner 进程流式响应结束时调用）
+
+        用精确速率（completion_tokens/duration）更新跨请求校准 EWMA，
+        并将当前显示速率设置为该精确值。
 
         Args:
             provider: Provider 名称
@@ -199,32 +300,29 @@ class ThroughputTracker:
         if not provider or completion_tokens <= 0 or duration_seconds <= 0:
             return
 
+        now = time.time()
         with self._data_lock:
-            # 如果该provider已有状态，更新为最新请求的数据
-            state = self._provider_state.get(provider)
-            if state:
-                # 记录真实吞吐率（completion_tokens / 响应时间）
-                tps = completion_tokens / duration_seconds
-                # 直接设置当前吞吐率（不经过EWMA平滑，因为是单次请求的精确值）
-                state["rate"] = round(tps, 1)
-                # 🔧 事务#1891：重置累计器，避免下一个请求的区间速率计算包含残留token
-                # 问题：record() 持续累加 accumulated_tokens，record_usage() 直接覆盖 rate
-                # 但不重置累计器，导致下一个请求的 interval_rate = (残留token + 新token) / dt 虚高
-                state["accumulated_tokens"] = 0.0
-                state["last_calc_time"] = time.time()
-                state["first_sample"] = True  # 下一个请求首次采样直接使用区间速率
-                logger.debug(
-                    f"[ThroughputTracker] record_usage: provider={provider}, "
-                    f"completion_tokens={completion_tokens}, duration={duration_seconds:.2f}s, tps={tps:.1f}"
-                )
+            state = self._get_state(provider, now)
+            tps = completion_tokens / duration_seconds
+
+            # 跨请求校准 EWMA：τ=90s（按墙钟时间衰减）
+            prev = state.get("calibrated")
+            last_t = state.get("last_calib_time")
+            if prev is None or last_t is None:
+                state["calibrated"] = tps
             else:
-                # 首次使用该provider，创建状态
-                self._provider_state[provider] = {
-                    "rate": round(completion_tokens / duration_seconds, 1),
-                    "accumulated_tokens": 0.0,
-                    "last_calc_time": time.time(),
-                    "first_sample": True,
-                }
+                dt = max(now - last_t, 0.001)
+                alpha = 1.0 - math.exp(-dt / CALIB_EWMA_TAU)
+                state["calibrated"] = alpha * tps + (1.0 - alpha) * prev
+            state["last_calib_time"] = now
+
+            # 真实 usage 速率直接作为显示值（不钳制，它是精确测量值）
+            state["rate"] = round(tps, 1)
+            logger.debug(
+                f"[ThroughputTracker] record_usage: provider={provider}, "
+                f"completion_tokens={completion_tokens}, duration={duration_seconds:.2f}s, "
+                f"tps={tps:.1f}, calibrated={state['calibrated']:.1f}"
+            )
 
         # 立即写入文件（跨进程共享）
         try:
@@ -236,7 +334,15 @@ class ThroughputTracker:
         """
         记录一次输出（在 runner 进程中调用）
 
-        累计 token 数，达到采样间隔时计算区间速率并用 EWMA 平滑。
+        指数加权速率估计（O(1) 增量，等价于指数加权滑动窗口）：
+        1. weighted = weighted·e^(-Δt/τ) + tokens（增量衰减）
+        2. rate = weighted / min(τ, max(自首chunk的墙钟时间, MIN_ELAPSED))
+           - 请求初期（elapsed<τ）分母用实际时长 → 无冷启动欠冲
+           - 之后分母固定为 τ → burst 后指数快速回落
+        3. rate 钳制到 cap = max(MIN_CAP, CALIB_FACTOR×校准速率)（或 HARD_CAP）
+
+        burst 免疫原理：服务器缓冲涌出的 N tokens 使 raw_rate 瞬间达 N/τ，
+        被钳制到 cap；随后按 e^(-t/τ) 连续衰减，约 3~4τ 回落到真实速率。
 
         Args:
             provider: Provider 名称
@@ -249,34 +355,33 @@ class ThroughputTracker:
         tokens = _estimate_tokens(char_count)
 
         with self._data_lock:
-            if provider not in self._provider_state:
-                self._provider_state[provider] = {
-                    "rate": 0.0,
-                    "accumulated_tokens": 0.0,
-                    "last_calc_time": now,
-                    "first_sample": True,
-                }
+            state = self._get_state(provider, now)
 
-            state = self._provider_state[provider]
-            state["accumulated_tokens"] += tokens
+            # 窗口空闲自愈：距上次 record 超过 WINDOW_RESET_GAP 视为新请求开始。
+            # 即使 start/end_request 未严格配对（异常路径/旧版调用方），
+            # 请求间隙的旧加权残留（已衰减至~0）也被显式清零。
+            last_rec = state.get("last_record_time")
+            if last_rec is not None and now - last_rec > WINDOW_RESET_GAP:
+                state["weighted"] = 0.0
+                state["window_start"] = None
 
-            # 达到采样间隔，计算区间速率
-            dt = now - state["last_calc_time"]
-            if dt >= CALC_INTERVAL:
-                interval_rate = state["accumulated_tokens"] / dt
+            # 指数加权增量更新（dt 钳非负，防时钟回拨导致权重放大）
+            if last_rec is not None and state["weighted"] > 0:
+                dt = max(now - last_rec, 0.0)
+                decay = math.exp(-dt / RATE_TAU)
+                state["weighted"] = state["weighted"] * decay + tokens
+            else:
+                state["weighted"] = tokens
+            state["last_record_time"] = now
+            if state["window_start"] is None:
+                state["window_start"] = now
 
-                if state["first_sample"]:
-                    # 首次采样直接使用区间速率，不从0平滑
-                    state["rate"] = interval_rate
-                    state["first_sample"] = False
-                else:
-                    # EWMA 平滑：rate_new = α × interval_rate + (1 - α) × rate_old
-                    alpha = 1.0 - math.exp(-dt / EWMA_TIME_CONSTANT)
-                    state["rate"] = alpha * interval_rate + (1.0 - alpha) * state["rate"]
-
-                # 重置累计器
-                state["accumulated_tokens"] = 0.0
-                state["last_calc_time"] = now
+            # 自适应归一化：初期用实际时长，稳态用 τ 封顶
+            elapsed = max(now - state["window_start"], 0.0)
+            norm = min(RATE_TAU, max(elapsed, MIN_ELAPSED))
+            rate = state["weighted"] / norm
+            rate = min(rate, self._calc_cap(state))
+            state["rate"] = rate
 
         # 定期写入文件（跨进程共享）
         if now - self._last_file_write.get(provider, 0) >= FILE_WRITE_INTERVAL:
@@ -293,24 +398,19 @@ class ThroughputTracker:
 
         写入格式: {
             "timestamp": 当前时间戳,
-            "throughput": EWMA 吞吐率（tokens/s）,
+            "throughput": 当前显示速率（tokens/s，空闲时为 0）,
             "pid": 进程ID
         }
+
+        注意：rate 为 0 时也写入（覆盖旧值），用于 end_request 后立即
+        清除该进程在 webui 端的显示（get_snapshot 会过滤掉 0 值）。
         """
         try:
             with self._data_lock:
                 state = self._provider_state.get(provider)
                 if not state:
                     return
-                # 优先使用已计算的 rate；如果还没采样过，用累计数/时间估算
-                tps = state["rate"]
-                if tps <= 0:
-                    dt = time.time() - state["last_calc_time"]
-                    if dt > 0.01 and state["accumulated_tokens"] > 0:
-                        tps = state["accumulated_tokens"] / dt
-                    else:
-                        return  # 确实没有数据
-                tps = round(tps, 1)
+                tps = round(state["rate"], 1)
 
             data = {
                 "timestamp": time.time(),
