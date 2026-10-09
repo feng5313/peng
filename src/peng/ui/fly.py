@@ -1783,6 +1783,29 @@ def run_fly(argv: list[str] | None = None) -> int:
 
             _cleanup_legacy_registry_autostart()
 
+            # 0. 部署 PostgreSQL（未安装时自动安装：scoop/winget + initdb，无需管理员权限）
+            #    与 Linux 分支保持一致：PostgreSQL 由 fly install 负责安装/部署
+            try:
+                from peng.db.postgres_auto_deploy import (
+                    check_postgresql_available,
+                    ensure_postgresql_fly,
+                )
+
+                if not check_postgresql_available():
+                    print("[PostgreSQL] 未检测到可用实例，正在自动部署（scoop/winget）...")
+                    sys.stdout.flush()
+                    if not ensure_postgresql_fly():
+                        print(
+                            "[PostgreSQL] ❌ 部署失败，peng 服务可能无法正常工作",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print("[PostgreSQL] ✅ 自动部署完成")
+                else:
+                    print("[PostgreSQL] 已就绪")
+            except Exception as e:
+                print(f"[PostgreSQL] ⚠️  部署异常（非致命）: {e}")
+
             # 1. Create VBS wrappers
             peng_vbs = create_peng_vbs()
             print(f"🐣 VBS wrapper created: {peng_vbs}")

@@ -4,9 +4,16 @@ REM ============================================================
 REM  Peng - One-click installer for Windows
 REM
 REM  Usage:
-REM    install.bat                Interactive install (recommended)
-REM    install.bat --with-service Register scheduled-task service after install (UAC prompt)
-REM    install.bat --yes          Non-interactive, use defaults (CI friendly)
+REM    install.bat                Interactive install (recommended):
+REM                               - auto runs uv sync
+REM                               - asks whether to install peng service
+REM                               - asks whether to install nest client
+REM                                 (target host + optional name)
+REM                               - auto-installs PostgreSQL if missing
+REM    install.bat --with-service Non-interactive: register scheduled-task
+REM                               service + auto-install PostgreSQL (UAC prompt)
+REM    install.bat --yes          Non-interactive, use defaults:
+REM                               no service / no nest / no PostgreSQL (CI friendly)
 REM    install.bat --help         Show help
 REM
 REM  Steps:
@@ -15,7 +22,14 @@ REM    2. Detect/install Python 3.12 (uv python install)
 REM    3. uv sync - create .venv and install all dependencies
 REM    4. Verify installation (import peng + fly --help)
 REM    5. Check LLM API key configuration and print guidance
-REM    6. Optional: register auto-start service (fly install, incl. PostgreSQL)
+REM    6. Interactive setup:
+REM       - peng system service? [Y/n]
+REM       - nest client (connect to a remote peng service)? [y/N]
+REM         * target host (host or host:port, required)
+REM         * nest name (optional, default: auto from hostname)
+REM       - PostgreSQL: auto-install if missing and needed
+REM         (skipped in pure-nest mode where the database is
+REM          bridged via the remote nest)
 REM
 REM  NOTE: Keep this file ASCII-only. cmd.exe parses batch files using the
 REM  active OEM code page (e.g. GBK/CP936) before chcp takes effect, so
@@ -29,6 +43,13 @@ if "%PENG_ROOT:~-1%"=="\" set "PENG_ROOT=%PENG_ROOT:~0,-1%"
 
 set "ASSUME_YES=0"
 set "WITH_SERVICE=0"
+set "RC=0"
+set "INSTALL_SERVICE="
+set "INSTALL_NEST="
+set "NEST_HOST="
+set "NEST_NAME="
+set "NEED_PG="
+set "PG_SKIP_REASON="
 
 REM ---------- Argument parsing ----------
 :parse_args
@@ -48,10 +69,19 @@ echo.
 echo Usage: install.bat [options]
 echo.
 echo Options:
-echo   -y, --yes            Non-interactive, use defaults (no service registration)
-echo   --with-service       Register scheduled-task service and start it (UAC prompt)
+echo   -y, --yes            Non-interactive, use defaults
+echo                        (no service, no nest, no PostgreSQL deploy)
+echo   --with-service       Non-interactive: register scheduled-task service
+echo                        and auto-install PostgreSQL (UAC prompt)
 echo   --no-banner          Skip banner
 echo   -h, --help           Show this help
+echo.
+echo Interactive mode (default) asks:
+echo   1. Install peng system service? [Y/n]
+echo   2. Install nest client connecting to a remote peng service? [y/N]
+echo      (asks for target host and optional nest name, default=hostname)
+echo   PostgreSQL is auto-installed when missing, except in pure-nest mode
+echo   (no local service + nest installed; database bridged via remote nest).
 echo.
 echo Environment variables:
 echo   PENG_SKIP_UV_INSTALL=1   Skip uv auto-install (use system uv)
@@ -72,9 +102,9 @@ if not exist "%PENG_ROOT%\pyproject.toml" (
     exit /b 1
 )
 
-REM ---------- Step 1/5: uv ----------
+REM ---------- Step 1/6: uv ----------
 echo.
-echo == Step 1/5: Check uv package manager ==
+echo == Step 1/6: Check uv package manager ==
 
 set "UV_CMD="
 where uv >nul 2>&1 && set "UV_CMD=uv"
@@ -126,10 +156,10 @@ if not defined UV_CMD (
 )
 echo [ OK ] uv installed
 
-REM ---------- Step 2/5: Python 3.12 ----------
+REM ---------- Step 2/6: Python 3.12 ----------
 :py_check
 echo.
-echo == Step 2/5: Check Python 3.12 ==
+echo == Step 2/6: Check Python 3.12 ==
 
 set "PY_OK=0"
 where py >nul 2>&1 && (
@@ -154,10 +184,10 @@ if errorlevel 1 (
 )
 echo [ OK ] Python 3.12 installed
 
-REM ---------- Step 3/5: dependencies ----------
+REM ---------- Step 3/6: dependencies ----------
 :deps
 echo.
-echo == Step 3/5: Install dependencies (uv sync) ==
+echo == Step 3/6: Install dependencies (uv sync) ==
 
 cd /d "%PENG_ROOT%"
 %UV_CMD% sync --python 3.12
@@ -173,9 +203,9 @@ if not exist "%VENV_PYTHON%" (
     exit /b 1
 )
 
-REM ---------- Step 4/5: verify ----------
+REM ---------- Step 4/6: verify ----------
 echo.
-echo == Step 4/5: Verify installation ==
+echo == Step 4/6: Verify installation ==
 
 "%VENV_PYTHON%" -c "import peng" >nul 2>&1
 if errorlevel 1 (
@@ -191,9 +221,9 @@ if errorlevel 1 (
     echo [ OK ] fly command works
 )
 
-REM ---------- Step 5/5: API keys ----------
+REM ---------- Step 5/6: API keys ----------
 echo.
-echo == Step 5/5: Check LLM API keys ==
+echo == Step 5/6: Check LLM API keys ==
 
 set "HAS_KEY=0"
 if defined ZHIPU_AI_API_KEY  ( echo [ OK ] ZHIPU_AI_API_KEY is set   & set "HAS_KEY=1" )
@@ -214,32 +244,162 @@ if "%HAS_KEY%"=="0" (
     echo.
 )
 
-REM ---------- Optional: system service ----------
-if "%WITH_SERVICE%"=="1" (
-    echo.
-    echo == Register scheduled-task service ==
-    echo [INFO] Running fly install ^(auto-deploys PostgreSQL and registers the
-    echo        service; a UAC elevation prompt may appear^)...
-    "%VENV_PYTHON%" "%PENG_ROOT%\bin\fly" install
-    if errorlevel 1 (
-        echo [FAIL] fly install failed, run it manually later: bin\fly install
-        exit /b 1
-    )
-    echo [ OK ] Service registered. Check with: fly status
+REM ---------- Step 6/6: interactive service & nest setup ----------
+echo.
+echo == Step 6/6: Service and nest setup ==
+
+REM Non-interactive mode: --yes (env only) or --with-service (service + PG)
+if "%WITH_SERVICE%"=="1" goto :nonint_service
+if "%ASSUME_YES%"=="1" goto :nonint_yes
+goto :ask_service
+:nonint_yes
+set "INSTALL_SERVICE=0"
+set "INSTALL_NEST=0"
+set "NEED_PG=0"
+set "PG_SKIP_REASON=--yes mode installs the environment only"
+echo [INFO] Non-interactive mode (--yes): env only, no service/nest/PostgreSQL
+goto :pg_decide
+:nonint_service
+set "INSTALL_SERVICE=1"
+set "INSTALL_NEST=0"
+echo [INFO] Non-interactive mode (--with-service): installing service + PostgreSQL
+goto :pg_decide
+
+:ask_service
+set "SVC_ANSWER="
+set /p SVC_ANSWER=Install peng system service (auto-start on logon, incl. PostgreSQL)? [Y/n]: 
+if not defined SVC_ANSWER set "SVC_ANSWER=Y"
+if /i "%SVC_ANSWER%"=="y" (set "INSTALL_SERVICE=1" & goto :ask_nest)
+if /i "%SVC_ANSWER%"=="n" (set "INSTALL_SERVICE=0" & goto :ask_nest)
+echo [WARN] Please answer y or n
+goto :ask_service
+
+:ask_nest
+set "NEST_ANSWER="
+set /p NEST_ANSWER=Also install nest client (connect this machine to a remote peng service)? [y/N]: 
+if not defined NEST_ANSWER set "NEST_ANSWER=N"
+if /i "%NEST_ANSWER%"=="y" (set "INSTALL_NEST=1" & goto :nest_ask_host)
+if /i "%NEST_ANSWER%"=="n" (set "INSTALL_NEST=0" & goto :pg_decide)
+echo [WARN] Please answer y or n
+goto :ask_nest
+
+:nest_ask_host
+set "NEST_HOST="
+set /p NEST_HOST=Remote peng service address (host or host:port, required):
+if defined NEST_HOST goto :nest_ask_name
+echo [WARN] Host is required
+goto :nest_ask_host
+
+:nest_ask_name
+set "NEST_NAME="
+set /p NEST_NAME=Nest instance name (press Enter = auto from hostname):
+
+REM ---------- PostgreSQL decision ----------
+:pg_decide
+REM Pure-nest mode (no local service + nest installed): the database is
+REM bridged via the remote nest, local PostgreSQL is not required.
+if defined NEED_PG goto :pg_got
+set "NEED_PG=1"
+if "%INSTALL_SERVICE%"=="0" if "%INSTALL_NEST%"=="1" (
+    set "NEED_PG=0"
+    set "PG_SKIP_REASON=pure-nest mode bridges the database via the remote nest"
+)
+:pg_got
+if "%NEED_PG%"=="1" goto :pg_check
+echo [INFO] Local PostgreSQL skipped: %PG_SKIP_REASON%
+goto :svc_install
+
+:pg_check
+echo.
+echo == Check PostgreSQL ==
+echo [INFO] Checking local PostgreSQL...
+"%VENV_PYTHON%" -c "import sys; from peng.db.postgres_auto_deploy import check_postgresql_available; sys.exit(0 if check_postgresql_available() else 1)" >nul 2>&1
+if not errorlevel 1 (
+    echo [ OK ] PostgreSQL is ready
+    goto :svc_install
+)
+echo [INFO] PostgreSQL not available, auto-installing via scoop/winget...
+echo        ^(this downloads PostgreSQL, may take several minutes; no admin rights needed^)
+"%VENV_PYTHON%" -c "import sys; from peng.db.postgres_auto_deploy import ensure_postgresql_fly; sys.exit(0 if ensure_postgresql_fly() else 1)"
+if not errorlevel 1 (
+    echo [ OK ] PostgreSQL installed and ready
+) else (
+    echo [WARN] PostgreSQL auto-install failed. Install it manually or re-run install.bat
+    set "RC=1"
+)
+
+REM ---------- Install peng system service ----------
+:svc_install
+if "%INSTALL_SERVICE%"=="1" goto :svc_do
+goto :nest_install
+
+:svc_do
+echo.
+echo == Install peng system service ==
+echo [INFO] Running fly install ^(a UAC elevation prompt may appear^)...
+"%VENV_PYTHON%" "%PENG_ROOT%\bin\fly" install
+if errorlevel 1 (
+    echo [FAIL] fly install failed, run it manually later: bin\fly install
+    set "RC=1"
+) else (
+    echo [ OK ] Service registered. Check status with: bin\fly status
+)
+
+REM ---------- Install nest client ----------
+:nest_install
+if "%INSTALL_NEST%"=="1" goto :nest_do
+goto :done
+
+:nest_do
+echo.
+echo == Install nest service ==
+if defined NEST_NAME goto :nest_do_named
+echo [INFO] Running: bin\nest install --host %NEST_HOST% ^(name: auto from hostname^)
+"%VENV_PYTHON%" "%PENG_ROOT%\bin\nest" install --host "%NEST_HOST%"
+goto :nest_check
+
+:nest_do_named
+echo [INFO] Running: bin\nest install --host %NEST_HOST% --name %NEST_NAME%
+"%VENV_PYTHON%" "%PENG_ROOT%\bin\nest" install --host "%NEST_HOST%" --name "%NEST_NAME%"
+
+:nest_check
+if errorlevel 1 (
+    echo [FAIL] nest install failed, run it manually later:
+    echo        bin\nest install --host %NEST_HOST%
+    set "RC=1"
+) else (
+    echo [ OK ] nest service registered and started
 )
 
 REM ---------- Done ----------
+:done
 echo.
-echo [ OK ] Peng installed successfully!
+if "%RC%"=="0" (
+    echo [ OK ] Peng installed successfully!
+) else (
+    echo [WARN] Peng install finished with warnings/errors, review the log above
+)
+echo.
+echo Setup summary:
+if "%INSTALL_SERVICE%"=="1" (
+    echo   - peng service : installed ^(scheduled task, auto-start on logon^)
+) else (
+    echo   - peng service : not installed ^(run bin\fly install anytime^)
+)
+if "%INSTALL_NEST%"=="1" (
+    echo   - nest client  : installed, connecting to %NEST_HOST%
+) else (
+    echo   - nest client  : not installed ^(run bin\nest install --host ^<host^> anytime^)
+)
 echo.
 echo Next steps:
 echo   Interactive chat : %PENG_ROOT%\bin\fly
 echo   Foreground+WebUI : %PENG_ROOT%\bin\fly service --webui    (WebUI: http://localhost:6688)
-echo   System service   : %PENG_ROOT%\bin\fly install             (scheduled task + PostgreSQL)
 echo   Service status   : %PENG_ROOT%\bin\fly status
+echo   Nest status      : %PENG_ROOT%\bin\nest status
 echo   Help             : %PENG_ROOT%\bin\fly --help
 echo.
 echo License: free for personal/non-commercial use; commercial use requires
 echo a commercial license, see LICENSE and README.
 endlocal
-exit /b 0
+exit /b %RC%
