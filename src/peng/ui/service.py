@@ -1233,23 +1233,107 @@ def _kill_all_service_processes(port: int | None = None) -> int:
     return killed
 
 
+def _get_protected_pids() -> set[int]:
+    """
+    获取受保护 PID 集合：当前进程及其全部祖先链。
+
+    防止 fly stop / fly restart 在清理服务进程时误杀自身进程链
+    （fly.exe wrapper 及其 python 子进程），导致命令中途自杀中断。
+    """
+    protected = {os.getpid()}
+    try:
+        import psutil
+
+        p = psutil.Process(os.getpid())
+        for anc in p.parents():
+            protected.add(anc.pid)
+    except Exception:
+        pass
+    return protected
+
+
+def _is_fly_service_cmdline(cmdline: str) -> bool:
+    """判断命令行是否是 fly service 服务进程（含 fly 且含 service）"""
+    cmdline = (cmdline or "").lower()
+    return "fly" in cmdline and "service" in cmdline
+
+
 def _get_all_service_pids() -> list[int]:
     """
     获取所有正在运行的 fly 服务进程 PID（所有端口）
 
     Returns:
-        正在运行的服务 PID 列表（排除当前进程）
+        正在运行的服务 PID 列表（排除当前进程及其祖先链）
+
+    注意：旧实现使用 wmic 枚举进程，但 Windows 11 24H2+ 已移除 wmic，
+    FileNotFoundError 被静默吞掉后永远返回空列表，导致 kill_all_services()
+    一个进程都杀不掉（服务无法停止）。现改为 psutil 优先，无 psutil 时
+    回退 PowerShell CIM，再回退 wmic（老系统）。
     """
     import subprocess
 
     from peng.common.platform import IS_WINDOWS
 
-    pids = []
-    current_pid = os.getpid()
+    pids: list[int] = []
+    protected = _get_protected_pids()
+
+    def _add(pid: int) -> None:
+        if pid and pid not in protected and pid not in pids:
+            pids.append(pid)
 
     if IS_WINDOWS:
-        # Windows: 使用 wmic 查找 fly 服务进程
-        # 查找 python.exe、pythonw.exe 和 fly.exe 进程
+        # 方法1: psutil（首选：无子进程开销，可靠）
+        try:
+            import psutil
+
+            for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+                try:
+                    name = (proc.info["name"] or "").lower()
+                    if name not in ("python.exe", "pythonw.exe", "fly.exe"):
+                        continue
+                    if _is_fly_service_cmdline(" ".join(proc.info["cmdline"] or [])):
+                        _add(proc.pid)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            if pids:
+                return pids
+        except ImportError:
+            pass
+
+        # 方法2: PowerShell CIM（Win11 无 wmic 且无 psutil 时）
+        try:
+            import json as _json
+
+            ps_cmd = (
+                "Get-CimInstance Win32_Process -Filter "
+                "\"Name='python.exe' or Name='pythonw.exe' or Name='fly.exe'\" "
+                "| Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                data = _json.loads(result.stdout)
+                if isinstance(data, dict):
+                    data = [data]
+                for item in data:
+                    try:
+                        pid = int(item.get("ProcessId", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if _is_fly_service_cmdline(item.get("CommandLine") or ""):
+                        _add(pid)
+            if pids:
+                return pids
+        except (FileNotFoundError, subprocess.SubprocessError, ValueError):
+            pass
+
+        # 方法3: wmic（老版本 Windows 回退）
         for proc_name in ("python.exe", "pythonw.exe", "fly.exe"):
             try:
                 result = subprocess.run(
@@ -1268,18 +1352,12 @@ def _get_all_service_pids() -> list[int]:
                 if result.returncode == 0:
                     for line in result.stdout.split("\n"):
                         line = line.strip()
-                        if "fly" in line and "service" in line:
+                        if _is_fly_service_cmdline(line):
                             # 提取 PID（wmic 输出的最后一列）
                             parts = line.split()
                             for part in reversed(parts):
                                 try:
-                                    pid = int(part)
-                                    if (
-                                        pid != current_pid
-                                        and pid not in pids
-                                        and _check_process_exists(pid)
-                                    ):
-                                        pids.append(pid)
+                                    _add(int(part))
                                     break
                                 except ValueError:
                                     continue
@@ -1297,9 +1375,7 @@ def _get_all_service_pids() -> list[int]:
             if result.returncode == 0 and result.stdout.strip():
                 for line in result.stdout.strip().split("\n"):
                     try:
-                        pid = int(line.strip())
-                        if pid != current_pid and pid not in pids and _check_process_exists(pid):
-                            pids.append(pid)
+                        _add(int(line.strip()))
                     except ValueError:
                         pass
         except (FileNotFoundError, AttributeError):

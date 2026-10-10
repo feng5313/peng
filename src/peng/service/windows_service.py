@@ -775,11 +775,46 @@ def start_peng() -> tuple[bool, str]:
     return False, "启动 peng 服务失败"
 
 
+def _kill_service_processes_by_pid() -> int:
+    """按 PID 精确终止 fly service 进程（fly.exe wrapper / python 服务进程）
+
+    ⚠️ 绝不能用 `taskkill /F /IM fly.exe` 按映像名全杀：
+    那会把正在执行的 fly stop / fly restart 自身的 fly.exe wrapper
+    一并杀掉，导致命令中途自杀中断（restart 流程中断、停止信号文件
+    残留、start 阶段永不执行）。
+
+    只终止命令行匹配 fly service 的进程，并排除当前进程祖先链。
+
+    Returns:
+        终止的进程数
+    """
+    # 延迟导入避免模块级循环依赖
+    from peng.ui.service import _get_all_service_pids
+
+    killed = 0
+    for pid in _get_all_service_pids():
+        try:
+            r = subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
+            )
+            if r.returncode == 0:
+                killed += 1
+                logger.info(f"已终止 fly service 进程 PID {pid}")
+        except subprocess.SubprocessError as e:
+            logger.warning(f"终止 fly service 进程 PID {pid} 失败: {e}")
+    return killed
+
+
 def stop_peng() -> tuple[bool, str]:
     """停止 peng 服务"""
     _end_task(PENG_TASK_NAME)
-    # schtasks /end 会终止 wscript，但 fly.exe 可能还在运行，显式终止
-    subprocess.run(["taskkill", "/F", "/IM", "fly.exe"], capture_output=True, timeout=10)
+    # schtasks /end 会终止 wscript，但 fly.exe 服务进程可能残留，按 PID 精确清理
+    # （不能按映像名 taskkill /IM fly.exe 全杀，会误杀 fly stop/restart 自身）
+    killed = _kill_service_processes_by_pid()
+    if killed:
+        logger.info(f"已终止 {killed} 个残留 fly service 进程")
     return True, "peng 服务已停止"
 
 
