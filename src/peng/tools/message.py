@@ -160,7 +160,7 @@ class MessageTool(Tool):
 4. 选项（--nest/--workdir/--timeout 等）必须写在参数**末尾**（内容之后），
    否则会被当作内容的一部分而失效！例如：send 消息内容 --nest win11 --workdir D:\\work\\temp
 5. 发送者由系统自动标识为「鹏🐣·事务#当前事务ID」，--from 参数会被忽略；
-   禁止向风主发送全局新消息（send --to 风主无效），汇报请用 reply 回复已有消息链
+   send子命令只用于创建新事务，禁止用于事务交互，交互/汇报请用 reply 回复已有消息链，注意消息ID和事务ID的区别，reply不要用事务ID当作参数！
 6. 复杂任务应该用report工具汇报总结工作，不要使用message工具除非被明确要求回复。
 7. 回复消息后，禁止用message或report工具连续汇报类似内容！
 8. 使用--help参数获取详细帮助
@@ -360,7 +360,9 @@ class MessageTool(Tool):
                     option_tokens, removed = _pop_option_pairs(option_tokens, ("--from",))
                     if removed:
                         logger.warning(f"[message工具] 已剥离LLM传入的 --from: {' '.join(removed)}")
-                        sender_note = f"\nℹ️ 发送者已自动标识为 {self._sender_tag()}（--from 参数被忽略）。"
+                        sender_note = (
+                            f"\nℹ️ 发送者已自动标识为 {self._sender_tag()}（--from 参数被忽略）。"
+                        )
 
                 if subcmd == "reply":
                     # ===== reply 流程：接收者固定为风主🍃，挂在目标消息链内 =====
@@ -383,7 +385,7 @@ class MessageTool(Tool):
                             )
                     cmd = _build_msg_cmd(
                         "reply",
-                        *( [msg_id_str] if msg_id_str else [] ),
+                        *([msg_id_str] if msg_id_str else []),
                         *option_tokens,
                         "--from",
                         self._sender_tag(),
@@ -490,12 +492,7 @@ class MessageTool(Tool):
                         logger.warning(f"删除临时文件失败: {temp_file}")
 
             output = (
-                " ".join(cmd)
-                + "\n"
-                + (result.stderr or "")
-                + "\n"
-                + (result.stdout or "")
-                + hint
+                " ".join(cmd) + "\n" + (result.stderr or "") + "\n" + (result.stdout or "") + hint
             )
             if result.returncode != 0:
                 output = f"❌  message工具调用失败： " + output
