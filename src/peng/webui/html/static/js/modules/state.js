@@ -139,7 +139,10 @@ const state = {
   projectDirs: new Set(),   // 项目目录相对路径集合（如 "src", "src/peng", "config"）
   projectFiles: new Set(),  // 项目根目录文件名集合（如 "README.md", "pyproject.toml"）
   // 后端运行平台（"linux" 或 "windows"，用于路径超链接匹配策略）
-  platform: 'linux',
+  // 🔧 事务#2156：默认null（未知），禁止错误假设为'linux'——避免初始化竞态时
+  // _resolveNestPlatform('local')用默认值把state.nestPlatform固化成错误平台，
+  // 导致Windows部署下toNativeDisplayPath不转换、workdir输入框末尾反斜杠被"删除"
+  platform: null,
   // 🔧 Task #87：跟踪终端当前活动的 ANSI SGR 颜色状态（跨行记忆）
   // 当超链接转换需要恢复颜色时，使用此值作为"前一个颜色"
   // 每次处理完一行后更新为该行最后一个 SGR 序列

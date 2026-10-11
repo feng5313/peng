@@ -23,7 +23,12 @@ async function validateAndSetWorkdir(path) {
     const safePath = path.replace(/\\/g, '/');
     state.remoteNestRoot = safePath;
     state.workdir = safePath;
-    workdirInput.value = toNativeDisplayPath(safePath);
+    // 🔧 事务#2156：仅当显示值实际变化时才写输入框——
+    // 值相同时重写会导致光标跳到末尾（用户输入中被打断），且是末尾反斜杠被"删除"的显式入口
+    const displayPath = toNativeDisplayPath(safePath);
+    if (displayPath !== workdirInput.value) {
+      workdirInput.value = displayPath;
+    }
     // 🔧 保存到本地 config.webui.workdir（save_only 跳过路径验证，远程路径本地不存在）
     try {
       await fetch(`/api/set-workdir?path=${encodeURIComponent(safePath)}&save_only=true`, {

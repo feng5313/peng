@@ -47,6 +47,12 @@ async function loadConfig() {
     // 加载后端运行平台（用于路径超链接匹配策略）
     if (config.platform) {
       state.platform = config.platform;
+      // 🔧 事务#2156：config到位后刷新local nest平台缓存
+      // 修复初始化竞态：nest.js的/api/nest/list可能先于本config到达，
+      // _updateWorkdirForNest会用尚未加载的state.platform固化state.nestPlatform为错误值
+      if (typeof _resolveNestPlatform === 'function' && (!state.remoteNest || state.remoteNest === 'local')) {
+        state.nestPlatform = _resolveNestPlatform(state.remoteNest || 'local');
+      }
     }
 
     // 同步全局 thinking_mode 到勾选框
