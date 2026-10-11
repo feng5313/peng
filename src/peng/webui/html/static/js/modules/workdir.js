@@ -1,6 +1,19 @@
 // ==================== 工作目录验证 ====================
 
 /**
+ * 剥离路径末尾的分隔符（正斜杠和反斜杠，兼容Windows/Linux路径）
+ * 🔧 事务#2156：原正则 /\/+$/ 只剥正斜杠，Windows用户输入的末尾反斜杠（如
+ * D:\AI\ComfyUI\）不被剥离，而后端 Path.resolve() 返回的普通目录路径无尾分隔符，
+ * 比较误判为"实质不同"→用后端值重写输入框→末尾反斜杠被"自动删除"（约1秒，防抖+fetch往返）
+ * 盘符根特例：'D:\'/'D:/' 剥离后为 'D:'，与后端 resolve 保留的 'D:\' 剥离后一致，正确跳过重写
+ * @param {string} p - 路径
+ * @returns {string} 剥离尾部斜杠后的路径
+ */
+function _stripTrailingPathSep(p) {
+  return p.replace(/[\/\\]+$/, '');
+}
+
+/**
  * 验证并设置工作目录（实际切换到后端）
  * @param {string} path - 工作目录路径
  */
@@ -60,9 +73,9 @@ async function validateAndSetWorkdir(path) {
   }
 
   // 🔧 修复：如果工作目录与当前相同，跳过整个函数（避免频繁调用 loadProjectStructure）
-  // 规范化路径：移除尾部斜杠后比较
-  const normalizedNewPath = path.replace(/\/+$/, '');
-  const normalizedCurrentPath = (state.workdir || '').replace(/\/+$/, '');
+  // 规范化路径：移除尾部斜杠（/和\）后比较
+  const normalizedNewPath = _stripTrailingPathSep(path);
+  const normalizedCurrentPath = _stripTrailingPathSep(state.workdir || '');
   if (normalizedNewPath === normalizedCurrentPath) {
     // 路径相同，无需切换，直接返回
     return;
@@ -78,9 +91,11 @@ async function validateAndSetWorkdir(path) {
     if (result.success) {
       workdirInput.classList.remove('invalid');
       state.workdir = result.path;  // 使用解析后的绝对路径
-      // 只有路径实质不同时才更新输入框（忽略尾部斜杠差异）
-      const normalizedInput = path.replace(/\/+$/, '');
-      const normalizedResult = (result.path || '').replace(/\/+$/, '');
+      // 只有路径实质不同时才更新输入框（忽略尾部斜杠差异，/和\均忽略）
+      // 🔧 事务#2156：末尾反斜杠必须纳入忽略范围，否则Windows路径每次都会被
+      // 后端resolve()的无尾分隔符结果重写，造成"末尾反斜杠被自动删除"
+      const normalizedInput = _stripTrailingPathSep(path);
+      const normalizedResult = _stripTrailingPathSep(result.path || '');
       if (normalizedResult && normalizedResult !== normalizedInput) {
         workdirInput.value = toNativeDisplayPath(result.path);
       }
