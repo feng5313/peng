@@ -1472,9 +1472,44 @@ def _create_user_and_db_on_windows(pg_bin: Path) -> bool:
     return True
 
 
+def _eval_pg_install_result(pkg_label: str, returncode: int, installer: str) -> tuple[Path | None, bool]:
+    """
+    评估一次包管理器安装动作的结果（scoop/winget 共用）。
+
+    以文件系统实测为准：安装器实际成功但返回码异常（如 winget 的 3010
+    SUCCESS_REBOOT_REQUIRED、UAC 竞态等）时也能识别为已安装，
+    避免把"实际成功"误判为失败后连环安装多个版本导致双版本共存。
+
+    Args:
+        pkg_label: 包名/包ID（日志用）
+        returncode: 安装命令返回码
+        installer: 安装器名称（scoop/winget，日志用）
+
+    Returns:
+        (pg_bin, stop):
+        - pg_bin: 实测找到的 bin 目录（未找到则 None）
+        - stop:   是否应停止尝试其他候选包/安装器（安装已成功或已报告成功）
+    """
+    pg_bin = _find_pg_bin_on_windows()
+    if pg_bin:
+        print(f"✅ {installer} 安装 PostgreSQL 成功（{pkg_label}）: {pg_bin}")
+        sys.stdout.flush()
+        return pg_bin, True
+    if returncode in (0, 3010):
+        # 包管理器报告成功，但文件系统暂未见（可能需要重启终端刷新 PATH）
+        print(f"⚠️ {installer} 报告 {pkg_label} 安装成功，但暂未检测到 bin（可能需要重启终端）")
+        sys.stdout.flush()
+        return None, True
+    return None, False
+
+
 def _try_install_pg_on_windows() -> Path | None:
     """
     尝试在 Windows 上自动安装 PostgreSQL（通过 scoop/winget，无需管理员权限）
+
+    幂等：检测到系统已有任何已安装版本时直接返回，绝不重复安装；
+    每次安装动作后以文件系统实测结果为准，只有安装真正失败才尝试下一个
+    候选包（防止安装器实际成功但返回码异常被误判，导致连环安装多版本共存）。
 
     安装过程输出直接打印到终端，让用户看到进度。
 
@@ -1482,6 +1517,13 @@ def _try_install_pg_on_windows() -> Path | None:
         安装后的 bin 目录路径，失败返回 None
     """
     import shutil
+
+    # 幂等保护：系统已检测到任何已安装的 PostgreSQL 则直接返回，绝不重复安装
+    existing = _find_pg_bin_on_windows()
+    if existing:
+        print(f"ℹ️ 检测到已有 PostgreSQL，跳过安装: {existing}")
+        sys.stdout.flush()
+        return existing
 
     # 注意：不能用 CREATE_NO_WINDOW，否则子进程输出不显示到控制台！
     # 优先级1：scoop（开发者的首选包管理器，无需管理员）
@@ -1495,14 +1537,13 @@ def _try_install_pg_on_windows() -> Path | None:
                 timeout=120,
                 shell=True,
             )
-            if result.returncode == 0:
-                print("✅ scoop 安装 PostgreSQL 成功")
-                pg_bin = _find_pg_bin_on_windows()
-                if pg_bin:
-                    return pg_bin
-                print("⚠️ scoop 安装成功但找不到 pg_ctl，可能需要重启终端")
-            else:
-                print(f"⚠️ scoop 安装失败 (exit code: {result.returncode})")
+            pg_bin, stop = _eval_pg_install_result("postgresql", result.returncode, "scoop")
+            if pg_bin:
+                return pg_bin
+            if stop:
+                # scoop 已报告成功（文件系统暂未可见），勿再用 winget 重复安装
+                return None
+            print(f"⚠️ scoop 安装失败 (exit code: {result.returncode})")
         except subprocess.TimeoutExpired:
             print("⚠️ scoop 安装超时（120秒）")
         except (FileNotFoundError, OSError) as e:
@@ -1530,14 +1571,13 @@ def _try_install_pg_on_windows() -> Path | None:
                     timeout=1800,
                     shell=True,
                 )
-                if result.returncode == 0:
-                    print(f"✅ winget 安装 PostgreSQL 成功（{pkg_id}）")
-                    pg_bin = _find_pg_bin_on_windows()
-                    if pg_bin:
-                        return pg_bin
-                    print("⚠️ winget 安装成功但找不到 pg_ctl，可能需要重启终端或刷新 PATH")
-                else:
-                    print(f"⚠️ winget 安装 {pkg_id} 失败 (exit code: {result.returncode})")
+                pg_bin, stop = _eval_pg_install_result(pkg_id, result.returncode, "winget")
+                if pg_bin:
+                    return pg_bin
+                if stop:
+                    # 安装器已报告成功（文件系统暂未可见），禁止继续尝试下一个候选包
+                    return None
+                print(f"⚠️ winget 安装 {pkg_id} 失败 (exit code: {result.returncode})")
             except subprocess.TimeoutExpired:
                 print(f"⚠️ winget 安装 {pkg_id} 超时（1800秒）")
             except (FileNotFoundError, OSError) as e:
