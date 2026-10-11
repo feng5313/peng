@@ -1256,12 +1256,17 @@ def run_fly(argv: list[str] | None = None) -> int:
                         return 1
 
             # Start peng if needed
-            if not _is_process_running("fly.exe"):
+            # ⚠️ 不能按 fly.exe 映像名判断：fly start 自身就是 fly.exe 进程
+            #    （自匹配导致永远误判"已在运行"而跳过启动），按 service
+            #    命令行判断（排除自身进程链）
+            from peng.service.windows_service import _is_peng_service_running
+
+            if not _is_peng_service_running():
                 print("🐣 正在启动服务...")
                 start_peng()
                 for _i in range(30):
                     _time.sleep(1)
-                    if _is_process_running("fly.exe"):
+                    if _is_peng_service_running():
                         break
             else:
                 print("🐣 已在运行")

@@ -764,11 +764,27 @@ def _end_task(task_name: str) -> bool:
 
 # ---------- 公共接口（Task Scheduler 版本） ----------
 
+def _is_peng_service_running() -> bool:
+    """检查 peng service 是否真正运行
+
+    ⚠️ 不能用 tasklist 按 fly.exe 映像名判断：fly start/stop/restart 命令
+    自身就是 fly.exe 进程，必然自匹配，导致 start 永远误判"已在运行"而
+    跳过启动。必须按命令行（含 fly service）判断并排除自身进程链。
+    """
+    from peng.ui.service import _get_all_service_pids
+
+    try:
+        return bool(_get_all_service_pids())
+    except Exception as e:
+        logger.warning(f"检查 peng service 运行状态异常: {e}")
+        return False
+
+
 def start_peng() -> tuple[bool, str]:
     """启动 peng 服务（通过计划任务，无需 UAC）"""
     if not _is_peng_installed():
         return False, "peng 服务未安装，请先运行 fly install"
-    if _is_process_running("fly.exe"):
+    if _is_peng_service_running():
         return True, "peng 已在运行"
     if _run_task(PENG_TASK_NAME):
         return True, "peng 服务已启动"
@@ -807,14 +823,110 @@ def _kill_service_processes_by_pid() -> int:
     return killed
 
 
+def _kill_peng_vbs_wscript() -> int:
+    """终止 peng 服务的 VBS 守护循环 wscript 进程
+
+    VBS（start_peng_hidden.vbs）的 Do..Loop 会在 service 进程退出 5 秒后
+    重新拉起服务。若不先杀 wscript，fly stop 杀掉 service 后服务会被
+    自动复活（表现为 "stop 之后 status 仍显示运行中"）。
+
+    只杀命令行包含 start_peng_hidden.vbs 的 wscript，绝不影响
+    PostgreSQL 的 VBS（start_pg_hidden.vbs）。
+
+    Returns:
+        终止的 wscript 进程数
+    """
+    killed = 0
+    try:
+        import psutil
+    except ImportError:
+        # 无 psutil 时退回 tasklist+taskkill 无法按命令行过滤，
+        # 此时依赖 _end_task 停止任务实例
+        return 0
+
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            name = (proc.info["name"] or "").lower()
+            if name != "wscript.exe":
+                continue
+            cmdline = " ".join(proc.info["cmdline"] or []).lower()
+            if "start_peng_hidden.vbs" in cmdline:
+                proc.kill()
+                killed += 1
+                logger.info(f"已终止 peng VBS 守护进程 wscript PID {proc.pid}")
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return killed
+
+
+def _fly_service_processes_remain() -> bool:
+    """检查是否还有 fly service 进程残留"""
+    from peng.ui.service import _get_all_service_pids
+
+    try:
+        return bool(_get_all_service_pids())
+    except Exception as e:
+        logger.warning(f"检查 fly service 残留进程异常: {e}")
+        return False
+
+
+def _cleanup_pid_files() -> int:
+    """清理 fly service PID 文件
+
+    残留的 PID 文件会让 run_service 误判"已有服务在运行"而拒绝启动，
+    导致 VBS 守护循环反复拉起-退出（服务永远起不来）。
+    """
+    removed = 0
+    data_dir = _get_project_root() / "data"
+    for pid_file in data_dir.glob("fly_service_*.pid"):
+        try:
+            pid_file.unlink()
+            removed += 1
+        except OSError as e:
+            logger.warning(f"清理 PID 文件 {pid_file} 失败: {e}")
+    return removed
+
+
 def stop_peng() -> tuple[bool, str]:
-    """停止 peng 服务"""
+    """停止 peng 服务（保证彻底停止）
+
+    五步终结者协议（顺序缺一不可）：
+    1. 先杀 VBS 守护循环 wscript —— 否则杀掉 service 后 5 秒又被拉起，stop 无效
+    2. 停止计划任务实例（schtasks /end）
+    3. 按 PID 精确终止 service 进程（排除自身进程链，防止自杀中断）
+    4. 循环验证直至全部退出（最多 15 秒，处理僵死进程杀不死的情况）
+    5. 清理残留 PID 文件（防止下次启动误判"已有服务"而拒绝启动）
+    """
+    # 1. 先杀 VBS 守护循环（防止 service 被杀后自动复活）
+    killed_vbs = _kill_peng_vbs_wscript()
+    print(f"🪟 已终止 {killed_vbs} 个 VBS 守护进程(wscript)")
+
+    # 2. 停止计划任务实例
     _end_task(PENG_TASK_NAME)
-    # schtasks /end 会终止 wscript，但 fly.exe 服务进程可能残留，按 PID 精确清理
-    # （不能按映像名 taskkill /IM fly.exe 全杀，会误杀 fly stop/restart 自身）
+
+    # 3. 按 PID 精确终止 service 进程
     killed = _kill_service_processes_by_pid()
-    if killed:
-        logger.info(f"已终止 {killed} 个残留 fly service 进程")
+    print(f"🔪 已终止 {killed} 个 service 进程")
+
+    # 4. 循环验证，直到 fly service 进程全部退出
+    for _i in range(15):
+        if not _fly_service_processes_remain():
+            break
+        time.sleep(1)
+        killed += _kill_service_processes_by_pid()
+
+    # 5. 清理残留 PID 文件
+    removed = _cleanup_pid_files()
+
+    remain = _fly_service_processes_remain()
+    logger.info(
+        f"stop_peng 完成: VBS守护={killed_vbs}, service进程={killed}, "
+        f"PID文件清理={removed}, 残留进程={'有' if remain else '无'}"
+    )
+    if remain:
+        print(f"⚠️ 仍有 fly service 进程残留，请检查任务管理器")
+    else:
+        print(f"✅ peng 服务进程已全部终止 (PID文件清理 {removed} 个)")
     return True, "peng 服务已停止"
 
 

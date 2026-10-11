@@ -1025,20 +1025,35 @@ def _get_port_from_cmdline(pid: int) -> int | None:
         cmdline = ""
 
         if IS_WINDOWS:
-            # Windows: 使用 wmic 获取命令行
-            result = subprocess.run(
-                ["wmic", "process", "where", f"ProcessId={pid}", "get", "CommandLine=/VALUE"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode == 0:
-                # 解析 wmic 输出
-                for line in result.stdout.split("\n"):
-                    line = line.strip()
-                    if line.startswith("CommandLine="):
-                        cmdline = line.split("=", 1)[1]
-                        break
+            # Windows: psutil 优先（wmic 在 Win11 24H2+ 已移除，
+            # 直接 subprocess 调 wmic 会抛 FileNotFoundError 使调用链崩溃）
+            _cmdline = None
+            try:
+                import psutil
+
+                _cmdline = " ".join(psutil.Process(pid).cmdline() or [])
+            except Exception:
+                _cmdline = None
+            if _cmdline is not None:
+                cmdline = _cmdline
+            else:
+                # 回退 wmic（老版本 Windows），失败安全返回
+                try:
+                    result = subprocess.run(
+                        ["wmic", "process", "where", f"ProcessId={pid}", "get", "CommandLine=/VALUE"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                except (FileNotFoundError, subprocess.SubprocessError):
+                    return None
+                if result.returncode == 0:
+                    # 解析 wmic 输出
+                    for line in result.stdout.split("\n"):
+                        line = line.strip()
+                        if line.startswith("CommandLine="):
+                            cmdline = line.split("=", 1)[1]
+                            break
         else:
             # POSIX: 使用 ps 获取命令行
             result = subprocess.run(
@@ -1111,31 +1126,26 @@ def _get_running_service_pids(port: int | None = None) -> list[int]:
 
     # 方法2：查找所有 fly 服务进程
     if IS_WINDOWS:
-        # Windows: 使用 wmic 查找 python 进程
+        # Windows: psutil 枚举（旧实现用 wmic，但 Win11 24H2+ 已移除 wmic 且
+        # 匹配模式 "bin/fly --service" 与实际命令行不符，从未生效过）
         try:
-            result = subprocess.run(
-                ["wmic", "process", "where", "name='python.exe'", "get", "ProcessId,CommandLine"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                for line in result.stdout.split("\n"):
-                    if "bin/fly" in line and "--service" in line:
-                        # 提取 PID
-                        parts = line.strip().split()
-                        for part in reversed(parts):
-                            try:
-                                pid = int(part)
-                                if pid != current_pid and pid not in pids and process_exists(pid):
-                                    # 检查该进程是否运行在目标端口
-                                    proc_port = _get_port_from_cmdline(pid)
-                                    if proc_port == target_port:
-                                        pids.append(pid)
-                                break
-                            except ValueError:
-                                continue
-        except (FileNotFoundError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+            import psutil
+
+            for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+                try:
+                    name = (proc.info["name"] or "").lower()
+                    if name not in ("python.exe", "pythonw.exe", "fly.exe"):
+                        continue
+                    cmdline = " ".join(proc.info["cmdline"] or []).lower()
+                    if "fly" in cmdline and "service" in cmdline:
+                        if proc.pid != current_pid and proc.pid not in pids:
+                            # 检查该进程是否运行在目标端口
+                            proc_port = _get_port_from_cmdline(proc.pid)
+                            if proc_port == target_port:
+                                pids.append(proc.pid)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except ImportError:
             pass
     else:
         # POSIX: 通过 pgrep 查找
@@ -1682,20 +1692,39 @@ async def run_service(
     # 启动前检查是否已有服务在运行（同一端口）
     running_pids = _get_running_service_pids(final_port)
     if running_pids:
-        if force_start:
-            logger.info(
-                f"🔄 强制启动：发现端口 {final_port} 上有 {len(running_pids)} 个服务进程，正在终止..."
-            )
-            killed = _kill_all_service_processes(final_port)
-            logger.info(f"✅ 已终止 {killed} 个旧服务进程")
-            # 等待进程完全退出
-            await asyncio.sleep(1)
-        else:
+        # 探测旧服务是否真正存活：进程存在但端口无响应 = 僵死服务，
+        # 必须接管重启（否则 VBS 守护循环会无限拉起-退出，服务永远起不来）
+        _old_alive = False
+        try:
+            import socket as _socket
+
+            _sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            _sock.settimeout(2)
+            _old_alive = _sock.connect_ex(("127.0.0.1", final_port)) == 0
+            _sock.close()
+        except Exception:
+            _old_alive = False
+
+        if _old_alive and not force_start:
             # 使用简洁的错误提示，不输出 traceback
             print(f"❌ 端口 {final_port} 上已有服务在运行 (PID: {running_pids})")
             print(f"💡 使用 './bin/fly kill --port {final_port}' 释放端口")
             print(f"   或使用 './bin/fly service --force' 强制启动")
             return 1
+
+        # 旧服务僵死（端口无响应）或强制启动：杀掉旧进程接管
+        if _old_alive:
+            logger.warning(
+                f"🔄 强制启动：发现端口 {final_port} 上有 {len(running_pids)} 个服务进程，正在终止..."
+            )
+        else:
+            logger.warning(
+                f"🧟 端口 {final_port} 上的旧服务进程 {running_pids} 无响应（僵死），自动接管重启..."
+            )
+        killed = _kill_all_service_processes(final_port)
+        logger.info(f"✅ 已终止 {killed} 个旧服务进程")
+        # 等待进程完全退出
+        await asyncio.sleep(1)
 
     # 写入 PID 文件（按端口区分）
     pid_file = get_pid_file(final_port)
