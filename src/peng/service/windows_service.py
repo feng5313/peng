@@ -965,10 +965,14 @@ def get_all_services_status() -> dict:
 
     Returns:
         dict with keys: peng_state, peng_installed, pg_state, pg_installed
+
+    ⚠️ peng 运行判断不能用 tasklist 按 fly.exe 映像名：
+    fly status/stop/restart 命令自身就是 fly.exe 进程，必然自匹配，
+    导致服务明明已停止却显示"运行中"（误导用户 stop 无效）。
     """
     peng_installed = _is_peng_installed()
     pg_installed = _is_pg_installed() or _is_pg_service_installed()
-    peng_running = _is_process_running("fly.exe")
+    peng_running = _is_peng_service_running()
     pg_running = _is_process_running("postgres.exe")
     return {
         "peng_installed": peng_installed,
