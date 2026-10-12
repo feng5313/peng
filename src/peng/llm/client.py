@@ -668,8 +668,14 @@ class GLMClient:
         return self._llm_semaphore
 
     async def close(self) -> None:
-        """关闭客户端"""
-        await self._client.aclose()
+        """关闭实例级长驻客户端（若存在）
+
+        🔧 事务#2178：chat_stream 改用每次调用专属 client 并由自身 finally
+        关闭，不再经过本方法；本方法仅保留给实例级 client（若曾创建）。
+        """
+        client = getattr(self, "_client", None)
+        if client is not None:
+            await client.aclose()
 
     def get_system_prompt(self, messages: list[dict]) -> str:
         if messages:
@@ -922,7 +928,10 @@ class GLMClient:
             write=self.config.timeout_write,  # 写入超时
             pool=self.config.timeout_pool,  # 连接池超时
         )
-        self._client = httpx.AsyncClient(
+        # 🔧 事务#2178：本次调用专属 client（旧版赋给 self._client，并发调用互相
+        # 覆盖引用、生成器退出时无人关闭，每次 LLM 调用泄漏一个连接池）。
+        # 局部化后由本生成器的 finally 显式关闭；self._client 保留给 close()。
+        _call_client = httpx.AsyncClient(
             timeout=timeout_config,
             headers={
                 "Authorization": f"Bearer {current_api_key}",
@@ -1171,7 +1180,7 @@ class GLMClient:
 
         try:
             # 同步更新 HTTP 客户端的 headers（立即生效）
-            self._client.headers["Authorization"] = f"Bearer {current_api_key}"
+            _call_client.headers["Authorization"] = f"Bearer {current_api_key}"
             logger.debug(f"[LLM Client] 发送POST请求: {url}")
             logger.debug(f"[LLM Client] payload keys: {list(payload.keys())}")
             # 🔧 事务#1864：prefill阶段追踪——请求发出前启动。本地大模型
@@ -1196,7 +1205,7 @@ class GLMClient:
                 logger.debug(f"[LLM Client] prefill追踪启动失败(忽略): {_pf_err}")
             # 使用手动上下文管理替代 async with，避免 GeneratorExit
             # 传播到 __aexit__ 时触发 "athrow(): asynchronous generator is already running"
-            cm = self._client.stream("POST", url, json=payload)
+            cm = _call_client.stream("POST", url, json=payload)
             response = await cm.__aenter__()
             try:
                 # 流式模式下，先检查状态码
@@ -1418,7 +1427,7 @@ class GLMClient:
                                 if content_parts:
                                     yield StreamChunk(content="".join(content_parts))
                         except GeneratorExit:
-                            await self.close()  # 确保 GeneratorExit 时关闭 HTTP 客户端
+                            # 🔧 事务#2178：本次调用专属client由外层finally统一关闭
                             return
 
                     try:
@@ -1444,7 +1453,7 @@ class GLMClient:
                                     pass
                                 yield StreamChunk(thinking=thinking)
                     except GeneratorExit:
-                        await self.close()  # 确保 GeneratorExit 时关闭 HTTP 客户端
+                        # 🔧 事务#2178：本次调用专属client由外层finally统一关闭
                         return
 
                     # 处理工具调用（流式累加）
@@ -1624,10 +1633,16 @@ class GLMClient:
                     pass
                 # 手动退出上下文管理器，确保 HTTP 连接被关闭
                 # 捕获 RuntimeError：当 GeneratorExit 触发时，Python 会自动清理嵌套的
-                # 异步生成器，此时再手动调用 __aexit__ 会因 "asynchronous generator is already running" 而失败
+                # 异步生成器，此时再手动调用 __aexit__ 会因 "athrow(): asynchronous generator is already running" 而失败
                 try:
                     await cm.__aexit__(None, None, None)
                 except RuntimeError:
+                    pass
+                # 🔧 事务#2178：关闭本次调用的专属client（连接池）——旧版每次LLM调用
+                # new一个AsyncClient却只有GeneratorExit路径才关，正常/break结束都泄漏
+                try:
+                    await _call_client.aclose()
+                except Exception:
                     pass
         except asyncio.CancelledError:
             text = f"⚠️  [llm.client]检测到中断。\n"

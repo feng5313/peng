@@ -4001,6 +4001,7 @@ class ToolExecutionEngine:
             _repeated_phrase_maxlen = self.llm.config.repeated_phrase_maxlen  # <2=禁用
             thinking_phrase_state: dict = {}  # thinking流重复短语检测状态（跨chunk累积）
             content_phrase_state: dict = {}  # content流重复短语检测状态（跨chunk累积）
+            stream = None  # 🔧 事务#2178：本次LLM调用的流生成器引用（异常清理用）
             while not llm_finish:
                 try:
                     thinking = ""
@@ -4331,10 +4332,24 @@ class ToolExecutionEngine:
                                     )
                                 should_skip_iteration = True
                                 break
+                    # 🔧 事务#2178：显式关闭本次LLM调用的流生成器（紧急中断/无效输出
+                    # 等break跳出async for时Python不会关闭生成器：client侧finally不执行、
+                    # httpx连接池与信号量槽位被僵尸请求占用，直到下一轮chat_stream重赋值
+                    # 才被GC回收——期间服务端继续往没人读的socket吐字、多事务共享GPU时
+                    # KV/批处理槽被僵尸挤占，正是"感叹号紧急info经常导致从头prefill甚至
+                    # 卡死"的根因。正常跑完的流aclose为幂等no-op。）
+                    await self._aclose_llm_stream(stream)
                     llm_finish = True
+                except GeneratorExit:
+                    # 🔧 事务#2178：run_stream自身被关闭（yield处收到GeneratorExit）时，
+                    # 进行中的流生成器不会被自动关闭，显式清理后再传播退出
+                    await self._aclose_llm_stream(stream)
+                    raise
                 except asyncio.CancelledError as e:
                     text = f"⚠️  事务#{task_id} [ToolEngine]检测到中断，立刻结束大模型处理{e}。\n"
                     logger.info(text)
+                    # 🔧 事务#2178：取消可能发生在yield处（生成器不会自动关闭），显式清理
+                    await self._aclose_llm_stream(stream)
                     return
                 except StreamStallError as e:
                     # SSE流停滞：立即切换provider，不需要多次重试
@@ -6283,6 +6298,30 @@ class ToolExecutionEngine:
             logger.info(text)
             return True
         return False
+
+    async def _aclose_llm_stream(self, stream) -> None:
+        """🔧 事务#2178：显式关闭chat_stream异步生成器（幂等清理）
+
+        根因：紧急中断/无效输出检测break跳出async for时，Python不会自动关闭
+        被消费的异步生成器——chat_stream的finally（关httpx连接、停prefill追踪、
+        释放信号量）直到下一轮chat_stream重赋值触发GC才被执行。窗口期内被打断
+        的请求在服务端继续生成往没人读的socket吐字，僵尸请求占着全局信号量槽位
+        和GPU KV/批处理槽，多事务共享server时挤爆KV池→前缀缓存被驱逐→
+        其他请求从头prefill；writer阻塞→SSE停滞240s→切换重试/心跳杀进程卡死。
+
+        GeneratorExit/CancelledError路径同理：本生成器被外部关闭时，
+        局部变量引用的嵌套生成器不会被自动关闭，需显式aclose。
+        已自然耗尽的生成器aclose为no-op，可安全重复调用。
+        """
+        if stream is None:
+            return
+        try:
+            await stream.aclose()
+        except asyncio.CancelledError:
+            # 清理路径尽力而为：取消期间aclose可能再次被取消，不掩盖原始流程
+            logger.debug(f"[ToolEngine] 事务#{self._task_id}关闭LLM流生成器时被取消(忽略)")
+        except Exception as e:
+            logger.debug(f"[ToolEngine] 关闭LLM流生成器失败(忽略): {e}")
 
     def exit_on_unexpected_status(self):
         # 监测父进程是否存在（如果父进程被杀死，子进程也应该退出）
