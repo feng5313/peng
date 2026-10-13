@@ -144,7 +144,9 @@ class GrepTool(Tool):
                 return DualOutput(summary=output, display=output)
             
             if output_mode == "count":
-                output = f"找到 {len(matches)} 处匹配，在 {files_count} 个文件中"
+                # total_matches 为服务端精确总数（rg 路径）；旧服务端缺省时回退 len(matches)
+                total = result.get("total_matches") or len(matches)
+                output = f"找到 {total} 处匹配，在 {files_count} 个文件中"
                 return DualOutput(summary=output, display=output)
             
             if not matches:
@@ -164,6 +166,24 @@ class GrepTool(Tool):
         if not search_path.exists():
             raise ToolError(f"路径不存在: {search_path}")
 
+        # 从配置获取限制值
+        max_matches, max_line_length = _get_grep_limits()
+
+        # 优先 ripgrep（存在则使用之）；rg 不可用/正则方言不兼容/失败时
+        # asearch 返回 None，回退下方纯 Python 实现
+        from peng.common import ripgrep
+
+        rg_result = await ripgrep.asearch(
+            pattern, str(search_path),
+            glob=glob_pattern, ignore_case=ignore_case,
+            output_mode=output_mode,
+        )
+        if rg_result is not None:
+            output = ripgrep.format_output(
+                rg_result, output_mode, max_matches, max_line_length
+            )
+            return DualOutput(summary=output, display=output)
+
         # 编译正则表达式
         flags = re.IGNORECASE if ignore_case else 0
         try:
@@ -171,9 +191,6 @@ class GrepTool(Tool):
         except re.error as e:
             import traceback
             raise ToolError(f"无效的正则表达式: {e}") from e
-
-        # 从配置获取限制值
-        max_matches, max_line_length = _get_grep_limits()
 
         # 收集文件
         if search_path.is_file():

@@ -1725,6 +1725,29 @@ class LocalExecutor:
         except re.error as e:
             return NestResponse.make_error(params.get("_request_id", ""), f"无效的正则表达式: {e}")
 
+        # 优先 ripgrep（存在则使用之，与 grep 工具共用 peng.common.ripgrep 单一实现；
+        # rg 不可用/方言不兼容/失败时返回 None，回退下方 Python 扫描）
+        from peng.common import ripgrep
+
+        rg_result = await ripgrep.asearch(
+            pattern, str(base_path), glob=glob_pattern, ignore_case=ignore_case
+        )
+        if rg_result is not None:
+            matched_files = {m.path for m in rg_result.matches} | set(
+                rg_result.files_with_matches
+            )
+            return NestResponse.make_result(
+                params.get("_request_id", ""),
+                {
+                    "matches": [
+                        f"{m.path}:{m.line}:{m.text.rstrip()}"
+                        for m in rg_result.matches[:max_matches]
+                    ],
+                    "files_count": len(matched_files),
+                    "total_matches": rg_result.total_matches,
+                },
+            )
+
         # 收集文件
         if base_path.is_file():
             files = [base_path]

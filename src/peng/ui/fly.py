@@ -1811,6 +1811,14 @@ def run_fly(argv: list[str] | None = None) -> int:
             except Exception as e:
                 print(f"[PostgreSQL] ⚠️  部署异常（非致命）: {e}")
 
+            # ripgrep 搜索加速（grep 工具检测 rg 存在则优先使用；非致命）
+            try:
+                from peng.common.ripgrep import ensure_ripgrep
+
+                ensure_ripgrep()
+            except Exception as e:
+                print(f"[ripgrep] ⚠️  自动安装异常（非致命）: {e}")
+
             # 1. Create VBS wrappers
             peng_vbs = create_peng_vbs()
             print(f"🐣 VBS wrapper created: {peng_vbs}")
@@ -1943,6 +1951,14 @@ def run_fly(argv: list[str] | None = None) -> int:
                     print("[PostgreSQL] ❌ 部署失败，peng 服务可能无法正常工作", file=sys.stderr)
             except Exception as e:
                 print(f"[PostgreSQL] ⚠️  部署异常（非致命）: {e}")
+
+            # ripgrep 搜索加速（grep 工具检测 rg 存在则优先使用；非致命）
+            try:
+                from peng.common.ripgrep import ensure_ripgrep
+
+                ensure_ripgrep()
+            except Exception as e:
+                print(f"[ripgrep] ⚠️  自动安装异常（非致命）: {e}")
 
             success, msg = systemd_install_service()
             print(msg)

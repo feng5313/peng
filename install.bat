@@ -33,6 +33,8 @@ REM         * nest name (optional, default: auto from hostname)
 REM       - PostgreSQL: auto-install if missing and needed
 REM         (skipped in pure-nest mode where the database is
 REM          bridged via the remote nest)
+REM       - ripgrep: auto-install if missing (optional grep accelerator,
+REM         non-fatal; via peng.common.ripgrep.ensure_ripgrep: scoop/winget)
 REM
 REM  NOTE: Keep this file ASCII-only. cmd.exe parses batch files using the
 REM  active OEM code page (e.g. GBK/CP936) before chcp takes effect, so
@@ -310,7 +312,7 @@ if "%INSTALL_SERVICE%"=="0" if "%INSTALL_NEST%"=="1" (
 :pg_got
 if "%NEED_PG%"=="1" goto :pg_check
 echo [INFO] Local PostgreSQL skipped: %PG_SKIP_REASON%
-goto :svc_install
+goto :rg_check
 
 :pg_check
 echo.
@@ -329,6 +331,19 @@ if not errorlevel 1 (
 ) else (
     echo [WARN] PostgreSQL auto-install failed. Install it manually or re-run install.bat
     set "RC=1"
+)
+
+REM ---------- Check ripgrep ----------
+REM Optional search accelerator for the grep tool (auto-install, non-fatal).
+:rg_check
+echo.
+echo == Check ripgrep ==
+echo [INFO] Checking ripgrep (optional, speeds up the grep tool)...
+"%VENV_PYTHON%" -X utf8 -c "import sys; from peng.common.ripgrep import ensure_ripgrep; sys.exit(0 if ensure_ripgrep() else 1)"
+if not errorlevel 1 (
+    echo [ OK ] ripgrep is ready
+) else (
+    echo [WARN] ripgrep auto-install failed; grep tool falls back to built-in Python search ^(non-fatal^)
 )
 
 REM ---------- Install peng system service ----------
