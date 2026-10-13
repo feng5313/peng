@@ -120,7 +120,7 @@
         "small_model": "swift-1.5-iq3_s",
         "thinking_type": "chat_template_kwargs",
         "reasoning_effort": "xhigh",
-        "preserve_thinking": false,
+        "preserve_thinking": true,
         "vision": "yes",
         "enable": false,
         "icon": "🐱",
@@ -145,7 +145,7 @@
             "top_p": 1.0
           }
         }
-      },      
+      },
       "z-glm5.3": {
         "api_key": "your_key",
         "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
@@ -180,8 +180,8 @@
       "deepseek-flash": {
         "api_key": "your_key",
         "base_url": "https://api.deepseek.com",
-        "model": "deepseek-v4-pro",
-        "small_model": "deepseek-v4-pro",
+        "model": "deepseek-flash",
+        "small_model": "deepseek-flash",
         "max_concurrent": 8,
         "thinking_type": "thinking",
         "enable": false,

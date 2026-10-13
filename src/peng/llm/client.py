@@ -1127,6 +1127,34 @@ class GLMClient:
                         payload["thinking"] = {"type": "enabled"}
                         payload["reasoning_effort"] = current_reasoning_effort
 
+            # 🔧 事务#2185：chat_template_kwargs 风格（Qwen3.8 系列）preserve_thinking=true
+            # 时显式注入模板变量，确保后端渲染行为与 peng 配置语义一致。
+            # 官方依据（Qwen3.8 chat_template.jinja L116）：
+            #   {%- if preserve_thinking is undefined or preserve_thinking is true
+            #        or loop.index0 > ns.last_query_index %}
+            #       渲染 '<think>\n' + message.reasoning_content + '\n</think>'（保留）
+            #   {%- else %} 剥离历史轮 thinking（仅保留当前工具循环轮）
+            # 思考内容的唯一正确通道是 assistant 消息的 reasoning_content 字段
+            # （模板 L112 只读 message.reasoning_content，不解析 content 内嵌 <think> 标签，
+            # tool_engine.to_api_format 的序列化格式已正确）。
+            # 不显式注入时依赖后端默认值：llama.cpp --reasoning-preserve 默认 enabled
+            # （caps.cpp caps_apply_preserve_reasoning 注入 preserve_thinking 模板变量），
+            # 但服务器若以 --no-reasoning-preserve 启动则历史思考被剥离，与配置背离；
+            # SGLang 则完全依赖请求显式传参。故两种别名都注入：
+            #   preserve_thinking=true  → Qwen3.8/vLLM/SGLang 模板直读（SGLang 将
+            #                              chat_template_kwargs 全部键作为模板变量注入）
+            #   preserve_reasoning=true → llama.cpp caps 机制（chat.cpp 触发
+            #                              caps_apply_preserve_reasoning 同步设置
+            #                              preserve_thinking/clear_thinking 等四个变量）
+            if use_template_kwargs and provider_data and provider_data.get("preserve_thinking"):
+                ctk = payload.setdefault("chat_template_kwargs", {})
+                ctk["preserve_thinking"] = True
+                ctk["preserve_reasoning"] = True
+                logger.debug(
+                    "[LLM Client] preserve_thinking=true: 已注入 chat_template_kwargs "
+                    "{preserve_thinking: true, preserve_reasoning: true}（确保后端保留历史思考渲染）"
+                )
+
             # 应用 provider 级别采样参数覆盖（按模型作者要求）
             # 部分模型（如 Qwen3）在不同 thinking 模式下需要不同的 temperature/top_p
             # 配置示例: {"thinking_on": {"temperature": 0.6, "top_p": 0.95}, "thinking_off": {"temperature": 0.001, "top_p": 1.0}}
