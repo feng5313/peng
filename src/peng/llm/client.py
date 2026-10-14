@@ -28,6 +28,7 @@ from peng.common.types import ToolCall
 from peng.config import load_config
 from peng.config.loader import LLMConfig, ProviderConfig
 from peng.common.logging_config import setup_llm_logging, should_log
+from peng.llm.concurrency import acquire_llm_slots_handle
 
 logger = logging.getLogger(__name__)
 llm_logger = None
@@ -509,12 +510,12 @@ class GLMClient:
         self._vision_switch_from: str | None = None
         self._vision_switch_used: int = 0
 
-        # 并发控制信号量
-        self._llm_semaphore = asyncio.Semaphore(self.config.max_concurrent)
-        self._small_model_semaphore = asyncio.Semaphore(self.config.small_model_max_concurrent)
-        # 每个 provider 的独立信号量（用于 provider 级别并发限制）
-        self._provider_semaphores: dict[str, asyncio.Semaphore] = {}
-        self._init_provider_semaphores()
+        # 🔧 事务#2204：并发控制改为**跨进程**文件锁槽位信号量
+        # （peng/llm/concurrency.py）。旧实现在每个 GLMClient 实例内建
+        # asyncio.Semaphore，而每个事务都在独立子进程中运行（各自新建
+        # PengAgent/GLMClient），信号量进程私有 ⇒ max_concurrent 对真实
+        # provider 并发数毫无约束（用户实测抱怨"毫无效果"）。跨进程槽位
+        # 在每次 chat_stream 时按最新配置动态获取，无需实例级缓存。
 
         # 初始化 LLM 专用日志器
         global llm_logger
@@ -576,11 +577,61 @@ class GLMClient:
             self._vision_switch_used = 0
             logger.info("[LLM Client] 已切回原provider，vision切换窗口关闭")
 
-    def _init_provider_semaphores(self) -> None:
-        """为每个配置了 max_concurrent 的 provider 初始化独立信号量"""
-        for name, prov_cfg in self.config.providers.items():
-            if prov_cfg.max_concurrent is not None and prov_cfg.max_concurrent > 0:
-                self._provider_semaphores[name] = asyncio.Semaphore(prov_cfg.max_concurrent)
+    # ==================== 大模型并发控制（跨进程，事务#2204）====================
+
+    def _get_concurrency_specs(
+        self, model: str | None = None, small_model: str | None = None, provider: str | None = None
+    ) -> list[tuple[str, int]]:
+        """构造本次请求的跨进程并发约束 [(key, limit), ...]
+
+        约束来源（与旧进程内信号量语义一致，只是改为跨进程生效）：
+        1. 全局并发：请求使用小模型（model == provider 的 small_model）时用
+           llm.small_model_max_concurrent，否则用 llm.max_concurrent；
+        2. provider 并发：该 provider 配置了 max_concurrent（>0）时叠加该约束。
+
+        limit 为 None/<=0 表示不限制（该项不入列）。
+        """
+        specs: list[tuple[str, int]] = []
+
+        small_model_name = small_model or self.config.small_model
+        if model is not None and model == small_model_name:
+            global_key, global_limit = "global:small_model", self.config.small_model_max_concurrent
+        else:
+            global_key, global_limit = "global:llm", self.config.max_concurrent
+        if global_limit is not None and int(global_limit) > 0:
+            specs.append((global_key, int(global_limit)))
+
+        if provider:
+            prov_cfg = self.config.providers.get(provider)
+            prov_limit = getattr(prov_cfg, "max_concurrent", None) if prov_cfg else None
+            if prov_limit is not None and int(prov_limit) > 0:
+                specs.append((f"provider:{provider}", int(prov_limit)))
+
+        return specs
+
+    def _slot_heartbeat(self, task_id: int | None) -> None:
+        """等待并发槽位期间的事务心跳刷新（由限制器在线程池中调用，防止误杀）"""
+        if not task_id or not self.task_manager:
+            return
+        self.task_manager.update_heartbeat(task_id)
+
+    def _notify_slot_wait(self, task_id: int | None, waited: float, desc: str) -> None:
+        """等待并发槽位超过阈值时向事务输出打印提示（用户可见、便于诊断）"""
+        if not task_id:
+            return
+        try:
+            from peng.task.output_manager import get_output_manager
+
+            get_output_manager().write_output(
+                task_id=task_id,
+                source="system",
+                content=(
+                    f"⏳ {ANSI_COLORS['blue']} 等待大模型并发槽位 {waited:.0f}s"
+                    f"（{desc}）{ANSI_COLORS['reset']}\n"
+                ),
+            )
+        except Exception as e:
+            logger.debug(f"[LLM Client] 并发等待提示输出失败(忽略): {e}")
 
     def _error_signature(self, content: str) -> str:
         """生成报错的标准化签名（用于去重比较）"""
@@ -607,65 +658,6 @@ class GLMClient:
             recent = recent[-max_keep:]
         self._recent_error_sigs[tid] = recent
         return True
-
-    def _get_combined_semaphore(
-        self, model: str | None = None, small_model: str | None = None, provider: str | None = None
-    ):
-        """获取组合异步信号量上下文管理器（同时控制全局+provider级别并发）
-
-        返回一个异步上下文管理器，进入时先获取全局信号量再获取provider信号量，
-        退出时按相反顺序释放。这样既保证总体并发受控，又保证单provider并发受控。
-        """
-        from contextlib import asynccontextmanager
-
-        global_sem = (
-            self._llm_semaphore
-            if model != (small_model or self.config.small_model)
-            else self._small_model_semaphore
-        )
-        provider_sem = self._provider_semaphores.get(provider) if provider else None
-
-        @asynccontextmanager
-        async def _combined():
-            async with global_sem:
-                if provider_sem:
-                    async with provider_sem:
-                        yield
-                else:
-                    yield
-
-        return _combined()
-
-    def _get_semaphore(
-        self, model: str | None = None, small_model: str | None = None, provider: str | None = None
-    ) -> asyncio.Semaphore:
-        """
-        根据模型和provider获取对应的信号量
-
-        优先级：provider级别信号量 > 全局信号量
-
-        Args:
-            model: 模型名称
-            small_model: 小模型名称（可选，用于判断是否使用小模型信号量）
-            provider: provider名称（可选，用于获取provider级别信号量）
-
-        Returns:
-            对应的信号量
-        """
-        # 1. 如果指定了provider且有provider级别信号量，返回它
-        if provider and provider in self._provider_semaphores:
-            logger.debug(f"[LLM Client._get_semaphore] 返回provider '{provider}' 的信号量")
-            return self._provider_semaphores[provider]
-
-        # 2. 如果使用小模型，返回小模型信号量
-        small_model_name = small_model or self.config.small_model
-        if model and model == small_model_name:
-            logger.debug(f"[LLM Client._get_semaphore] 返回小模型信号量")
-            return self._small_model_semaphore
-
-        # 3. 默认返回大模型信号量
-        logger.debug(f"[LLM Client._get_semaphore] 返回大模型信号量")
-        return self._llm_semaphore
 
     async def close(self) -> None:
         """关闭实例级长驻客户端（若存在）
@@ -943,12 +935,24 @@ class GLMClient:
         # 获取日志配置
         llm_logs_config = getattr(llm_logger, "llm_logs_config", None) if llm_logger else None
 
-        # 使用信号量控制并发（组合全局+provider级别）
+        # 🔧 事务#2204：使用**跨进程**文件锁槽位信号量控制并发
+        # （全局 max_concurrent + provider max_concurrent 组合；全有或全无获取）
         effective_model = current_model
-        logger.debug("[LLM Client] 尝试获取信号量...")
-        combined = self._get_combined_semaphore(effective_model, current_small_model, self.provider)
-        async with combined:
-            logger.debug("[LLM Client] 成功获取信号量，准备发送请求")
+        concurrency_specs = self._get_concurrency_specs(
+            effective_model, current_small_model, self.provider
+        )
+        logger.debug(f"[LLM Client] 尝试获取并发槽位: {concurrency_specs}")
+        # 槽位必须覆盖"请求发出 → SSE 流式读取结束"的完整窗口：chat_stream 的请求块
+        # 位于函数体顶层缩进（见下方 try），无法包进 async with，因此用显式句柄并在
+        # 末尾 finally 中**同步**释放（同步释放对 GeneratorExit 展开路径同样安全）。
+        _slot_handle = await acquire_llm_slots_handle(
+            concurrency_specs,
+            task_id=task_id,
+            heartbeat_cb=lambda: self._slot_heartbeat(task_id),
+            notice_cb=lambda waited, desc: self._notify_slot_wait(task_id, waited, desc),
+        )
+        try:
+            logger.debug("[LLM Client] 已获得并发槽位，准备发送请求")
             url = f"{current_base_url}/chat/completions"
 
             # 使用传入的 thinking_mode 或配置的值
@@ -1206,7 +1210,10 @@ class GLMClient:
             if tools:
                 payload["tools"] = tools
 
-        try:
+            # 🔧 事务#2204：原实现此处另起一个 try 块（缩进8），导致请求块落在并发
+            # 槽位的 async with 之外——槽位在 payload 构建后、请求发出前就被释放，
+            # 并发限制形同虚设（连进程内限制也失效）。现已合并到上面的 try 中，
+            # 使槽位窗口覆盖"请求发出 → SSE 流式读取结束"全过程。
             # 同步更新 HTTP 客户端的 headers（立即生效）
             _call_client.headers["Authorization"] = f"Bearer {current_api_key}"
             logger.debug(f"[LLM Client] 发送POST请求: {url}")
@@ -1680,6 +1687,10 @@ class GLMClient:
             pass
         except Exception as e:
             raise
+        finally:
+            # 🔧 事务#2204：释放跨进程并发槽位（正常/异常/中断/取消/生成器关闭
+            # 各路径均覆盖）。release() 为同步操作，GeneratorExit 展开路径安全。
+            _slot_handle.release()
 
     def _parse_thinking_tags_streaming(
         self, content: str, buffer: str = "", in_thinking: bool = False
