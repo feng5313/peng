@@ -3793,6 +3793,13 @@ class ToolExecutionEngine:
         self._context_overflow_rounds: int = 0
         # 全provider失败等待重试的连续轮次计数（仅用于警告提示，不暂停事务）
         self._all_failed_rounds: int = 0
+        # 🔧 事务#2235：网络瞬时错误(ReadError等)熔断计数——
+        # _transient_rounds：内层5次重试耗尽的连续轮次（成功一次流即重置）。
+        # content非空的断流在TransportError分支直接保留响应走正常收尾（不重试），
+        # 到达耗尽分支的均为content为空的断流，连续3轮耗尽即熔断转长冷却等待。
+        # 背景：#2235事故中is_transient_error耗尽后sleep(5)+continue无限死磕，
+        # 单迭代30分钟959次ReadError，服务器每次完整输出后断流，响应全丢重烧
+        self._transient_rounds: int = 0
         # 有tool_call的迭代计数（用于PUA注入间隔判断）
         self._tool_call_iter_count: int = 0
         # nest+workdir 冲突警告列表：_check_workdir_conflicts 检测并保存，
@@ -4654,6 +4661,38 @@ class ToolExecutionEngine:
                         )
                     else:
                         is_transient_error = True  # 标记瞬时错误，阻止provider切换
+                        # 🔧 事务#2235：断流但已收到实质content——保留响应，不丢弃重烧！
+                        # #2235事故：服务器每次都完整输出thinking+content（"上下文将满，
+                        # 我把全部发现固化到checklist后重启事务"）后流尾ReadError，
+                        # 原实现整个响应丢弃→重试→312K上下文重发+重复生成→无限烧钱
+                        # 死循环（30分钟959次ReadError，tool_call永远没机会传输）。
+                        # 保留判据极简：content非空。保留后视为本流有效结束
+                        # （llm_finish=True跳出重试循环），走正常迭代收尾：
+                        # thinking/content写入history（已烧的token不浪费），
+                        # 模型下一轮可见自己已说过的内容，上下文演进不再原地打转。
+                        if content.strip():
+                            _rc_msg = (
+                                f"⚠️  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+                                f"{ANSI_COLORS.get('bright_yellow')}"
+                                f"事务#{task_id}流被{type(e).__name__}中断，但已收到完整响应内容"
+                                f"({len(content)}字符)，保留本次响应不再重试（避免丢弃重烧）。"
+                                f"若响应被截断，模型下一轮会看到自己的部分输出并自然继续。"
+                                f"{ANSI_COLORS.get('reset')}\n"
+                            )
+                            logger.warning(
+                                f"⚠️ [ToolEngine] 事务#{task_id} {type(e).__name__}断流"
+                                f"但content非空({len(content)}字符)，保留响应走正常收尾"
+                            )
+                            if self._should_report_system_error(_rc_msg):
+                                get_output_manager().write_output(
+                                    task_id=task_id,
+                                    content=_rc_msg,
+                                    source="system",
+                                )
+                            # 成功语义：重置熔断计数（与4706区成功重置一致）
+                            self._transient_rounds = 0
+                            llm_finish = True
+                            break
                         logger.info(
                             f"{icon} {self.llm.provider} 事务#{task_id}大模型网络瞬时错误"
                             f"({type(e).__name__})，不切换provider，0.5秒后同provider重试(第{retry}次)。\n"
@@ -4712,6 +4751,8 @@ class ToolExecutionEngine:
                 self._all_failed_rounds = 0
                 # 🔧 事务#2002：LLM调用成功，重置上下文长度超标compact轮次计数
                 self._context_overflow_rounds = 0
+                # 🔧 事务#2235：LLM调用成功，重置瞬时错误熔断计数
+                self._transient_rounds = 0
 
             # 如果重试循环因错误耗尽而break退出（llm_finish仍为False），
             # 说明所有provider都不可用（如全部被限流/冷却中）。
@@ -4726,13 +4767,42 @@ class ToolExecutionEngine:
                     await asyncio.sleep(0.5)
                     continue  # 回到外层 while True 循环，重试同一provider
                 if is_transient_error:
-                    # 网络瞬时错误：内层重试耗尽，短暂等待后回到外层循环重试同一provider
-                    logger.info(
-                        f"🌐 [ToolEngine] 事务#{task_id} 网络瞬时错误重试耗尽，"
-                        f"5秒后继续重试同一provider={self.llm.provider}"
-                    )
-                    await asyncio.sleep(5)
-                    continue  # 回到外层 while True 循环，重试同一provider（未被标记失败）
+                    # 🔧 事务#2235：网络瞬时错误无限死磕兜底——原实现5次重试
+                    # 耗尽后sleep(5)+continue回外层无限重来（retry清零）。content
+                    # 非空的断流已在TransportError分支保留响应走正常收尾（不重试），
+                    # 到达此处的均为content为空的断流（thinking阶段即断）。连续
+                    # 3轮耗尽（15次流全失败）说明服务器持续性故障，放弃5秒高频
+                    # 死磕，落入下方公共provider失败等待路径（30-300秒长冷却+
+                    # _all_failed_rounds计数+==5醒目警告，事务保活，恢复后自动继续）
+                    self._transient_rounds += 1
+                    if self._transient_rounds >= 3:
+                        _te_msg = (
+                            f"⛔  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+                            f"{ANSI_COLORS.get('bright_red')}"
+                            f"事务#{task_id}网络瞬时错误持续断流（连续第{self._transient_rounds}轮耗尽，"
+                            f"provider={self.llm.provider}，流均在收到内容前中断），停止5秒高频重试，"
+                            f"转入长冷却等待。请检查该provider服务状态（部署日志/网络）。"
+                            f"事务保持运行，冷却后自动重试。"
+                            f"{ANSI_COLORS.get('reset')}\n"
+                        )
+                        logger.error(
+                            f"⛔ [ToolEngine] 事务#{task_id} 瞬时错误熔断"
+                            f"(连续{self._transient_rounds}轮耗尽)，转入公共provider失败等待路径"
+                        )
+                        if self._should_report_system_error(_te_msg):
+                            get_output_manager().write_output(
+                                task_id=task_id,
+                                content=_te_msg,
+                                source="system",
+                            )
+                        # 不continue：落入下方公共provider失败等待路径
+                    else:
+                        logger.info(
+                            f"🌐 [ToolEngine] 事务#{task_id} 网络瞬时错误重试耗尽"
+                            f"(第{self._transient_rounds}轮)，5秒后继续重试同一provider={self.llm.provider}"
+                        )
+                        await asyncio.sleep(5)
+                        continue  # 回到外层 while True 循环，重试同一provider（未被标记失败）
                 if is_context_overflow:
                     # 🔧 事务#2002：400上下文长度超标：上下文是provider无关的，
                     # 换provider必然同样失败。正确做法：compact压缩上下文后重试。
