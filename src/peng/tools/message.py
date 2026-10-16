@@ -393,55 +393,8 @@ class MessageTool(Tool):
                         MASTER_NAME,
                     )
                 elif subcmd == "send":
-                    # ===== send 流程：解析 --to 接收者（默认=发布新任务给鹏） =====
-                    option_tokens, removed_to = _pop_option_pairs(option_tokens, ("--to",))
-                    to_value = None
-                    if removed_to:
-                        # 支持 --to value 与 --to=value 两种形式
-                        first_tok = removed_to[0]
-                        if "=" in first_tok:
-                            to_value = first_tok.split("=", 1)[1]
-                        elif len(removed_to) > 1:
-                            to_value = removed_to[1]
-                        else:
-                            to_value = ""
-                        logger.info(f"[message工具] send解析到 --to: {to_value}")
-                    kind, target_id, note = self._resolve_to_agent_target(to_value)
-                    if kind == "invalid":
-                        output = f"❌  message工具调用失败： {note}"
-                        return DualOutput(summary=output, display=output)
-                    if note:
-                        hint += f"\nℹ️ {note}"
-                    if kind == "new_task":
-                        # 新任务消息：接收者=agent，注入上下文 nest/workdir 作为执行环境
-                        cmd = _build_msg_cmd(
-                            "send",
-                            *option_tokens,
-                            "--from",
-                            self._sender_tag(),
-                            "--to",
-                            AGENT_NAME,
-                            inject_env=True,
-                        )
-                    else:
-                        # 链内路由：receiver=agent，回复注入目标链（运行中事务自动接收）
-                        err = self._validate_chain_message(target_id)
-                        if err:
-                            output = f"❌  message工具调用失败： {err}"
-                            return DualOutput(summary=output, display=output)
-                        option_tokens, _removed_env = _pop_option_pairs(
-                            option_tokens, ("--nest", "-n", "--workdir", "-w")
-                        )
-                        cmd = _build_msg_cmd(
-                            "send",
-                            *option_tokens,
-                            "--reply",
-                            str(target_id),
-                            "--from",
-                            self._sender_tag(),
-                            "--to",
-                            AGENT_NAME,
-                        )
+                    output = f"❌  message工具调用失败： 禁用send！"
+                    return DualOutput(summary=output, display=output)
                 else:
                     # content/title/search 等只读或字段操作子命令：原样传递
                     cmd = _build_msg_cmd(subcmd, *option_tokens)
