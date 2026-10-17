@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import ntpath
 import subprocess
 import time
 import json
@@ -26,6 +27,60 @@ from typing import Any
 from peng.tools.base import DualOutput, Tool, ToolError
 
 logger = logging.getLogger(__name__)
+
+
+def _local_side_platform() -> str:
+    """本端（工具进程所在主机）平台标识，与 nest list 显示口径一致"""
+    return "Windows" if os.name == "nt" else "Linux"
+
+
+def _path_platform_mismatch(path: str, side_platform: str) -> str | None:
+    """护栏：路径形态与其解析端平台交叉时返回拒绝原因，一致/不确定返回 None。
+
+    🔧 事务#2251 斩断来源：pull/push/sync 的 local_path 在本机解析、remote_path
+    在目标 nest 端解析；跨平台绝对路径传错端时在该端只是**相对路径**，此前被
+    静默 mkdir/open 在工作目录根实体化（"D:\\work\\fcc\\x" 在 Linux host 上创建了
+    垃圾目录 D:/）。现在明确拒绝并提示正确用法。UNC/无盘符路径不判定（避免误伤）。
+    """
+    p = str(path).strip()
+    if not p:
+        return None
+    drive, _ = ntpath.splitdrive(p.replace("\\", "/"))
+    has_drive = len(drive) == 2 and drive[1] == ":"
+    plat = (side_platform or "").lower()
+    if plat.startswith("win"):
+        # Windows 端：盘符路径与 "/x"（nt 视为当前驱动器根）均合法，不拒绝
+        return None
+    if plat:
+        # POSIX 端（Linux/macOS）：带盘符路径只是相对路径，明确拒绝（事务#2251 事故形态）
+        if has_drive and not os.path.isabs(p):
+            return f"POSIX 端路径不应是 Windows 盘符路径（会按相对路径静默落在 cwd）: {p}"
+    return None
+
+
+def _check_transfer_paths(nest_name: str, local_path: str, remote_path: str) -> None:
+    """校验传输两端的平台交叉路径，不合法抛 ToolError（空值=默认行为，不校验）"""
+    if local_path:
+        reason = _path_platform_mismatch(local_path, _local_side_platform())
+        if reason:
+            raise ToolError(
+                f"local_path 平台交叉: {reason}。local_path 在本实例主机"
+                f"（{_local_side_platform()}）解析，请使用该主机上有效的绝对路径。"
+            )
+    if remote_path and nest_name:
+        try:
+            from peng.tools._nest_helper import get_nest_platform
+
+            plat = get_nest_platform(nest_name)
+        except Exception:
+            plat = ""
+        if plat:
+            reason = _path_platform_mismatch(remote_path, plat)
+            if reason:
+                raise ToolError(
+                    f"remote_path 平台交叉: {reason}。remote_path 在目标 nest"
+                    f"（{nest_name}，平台 {plat}）解析，请使用该平台有效的绝对路径。"
+                )
 
 
 class WindowTool(Tool):
@@ -412,8 +467,8 @@ class NestTool(Tool):
 - action: 操作类型 list/exec/pull/push/sync（必填）
 - nest: 目标nest名称（exec/pull/push/sync时必填）
 - command: bash命令（exec时必填）
-- remote_path: 远程文件/目录路径（pull/push/sync时必填）
-- local_path: 本地文件/目录路径（pull时可选默认工作目录；push/sync时必填）
+- remote_path: 远程nest上的文件/目录路径（pull/push/sync时必填，须为目标平台有效的绝对路径）
+- local_path: 本地文件/目录路径，在本实例主机解析（pull时可选默认当前工作目录；push/sync时必填；须为本机平台有效的绝对路径）
 - direction: 同步方向 push（默认，本地→远端）或 pull（远端→本地），仅sync
 - delete: 镜像删除目标端多余文件，仅sync（可选，默认false）
 - dry_run: 只预演不实际传输，仅sync（可选，默认false）"""
@@ -438,11 +493,11 @@ class NestTool(Tool):
                 },
                 "remote_path": {
                     "type": "string",
-                    "description": "远程nest上的文件/目录路径（pull/push/sync时必填；push目录时为远端目标目录）",
+                    "description": "远程nest上的文件/目录路径（pull/push/sync时必填；须为目标nest平台有效的绝对路径；push目录时为远端目标目录）",
                 },
                 "local_path": {
                     "type": "string",
-                    "description": "本地文件/目录路径（pull时可选默认当前工作目录；push/sync时必填）",
+                    "description": "本地文件/目录路径，在本实例主机解析（pull时可选默认当前工作目录；push/sync时必填；须为本机平台有效的绝对路径，跨平台路径将被拒绝）",
                 },
                 "direction": {
                     "type": "string",
@@ -612,6 +667,7 @@ class NestTool(Tool):
             raise ToolError("pull操作需要提供nest参数（远程nest名称）")
         if not remote_path:
             raise ToolError("pull操作需要提供remote_path参数（远程文件路径）")
+        _check_transfer_paths(nest_name, local_path, remote_path)
 
         transport = self._make_transport(nest_name)
 
@@ -659,6 +715,7 @@ class NestTool(Tool):
             raise ToolError("push操作需要提供local_path参数（本地文件/目录路径）")
         if not remote_path:
             raise ToolError("push操作需要提供remote_path参数（远端目标路径）")
+        _check_transfer_paths(nest_name, local_path, remote_path)
 
         src = Path(local_path).expanduser()
         if not src.exists():
@@ -705,6 +762,7 @@ class NestTool(Tool):
             raise ToolError("sync操作需要提供remote_path参数（远端目录路径）")
         if direction not in ("push", "pull"):
             raise ToolError(f"无效的direction: {direction}（支持 push/pull）")
+        _check_transfer_paths(nest_name, local_path, remote_path)
 
         transport = self._make_transport(nest_name)
 

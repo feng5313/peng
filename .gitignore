@@ -55,6 +55,16 @@ uv.lock
 MagicMock
 temp/
 tmp/
+
+# 运行时传输中转目录（跨nest传输经工作目录中转，勿入库）
+xfer/
+exe_parts/
+zip_parts/
+parts2/
+*.exe
+
+# 跨平台路径曾在工作目录根静默实体化的垃圾目录形态（护栏：tools/nest.py 平台交叉拒绝）
+[A-Za-z]:/
 nest.json
 test_large_file.py
 
