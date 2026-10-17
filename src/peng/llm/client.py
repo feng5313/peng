@@ -250,11 +250,11 @@ async def _read_agents_md_remote(nest_name: str, workdir: str) -> str | None:
 
 
 async def load_task_agents_md(task: dict | None) -> str | None:
-    """读取事务所在 nest 工作目录内的 AGENTS.md 或 .peng/AGENTS.md（事务#1672）
+    """读取事务所在 nest 工作目录内的 AGENTS.md 或 .peng/AGENTS.md（事务#1672/#2242）
 
     - local nest：nest 与 peng 同机，直接本地读取（不走网络，最快且最可靠）
     - 远程 nest：经 nest 协议远程读取（带超时保护与 mtime 缓存）
-    - 任一失败静默返回 None（系统提示词回退旧逻辑），不影响事务执行
+    - 任一失败静默返回 None（系统提示词不追加该段，不影响事务执行）
 
     Args:
         task: 事务字典（含 nest、workdir 字段）

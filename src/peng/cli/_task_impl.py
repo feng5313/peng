@@ -1292,11 +1292,13 @@ def _cmd_show_html(args):
 
     # 获取系统提示词（从 prompts.jsonp、AGENTS.md 和 task_prompt）
     def _get_system_prompt():
-        """获取系统提示词内容"""
-        from peng.config import get_path
-        from peng.common import jsonp as json
-        from pathlib import Path
+        """获取系统提示词内容（与 agent._prepare_prompt 实际注入逻辑对齐，事务#2242）"""
+        import asyncio
 
+        from peng.common import jsonp as json
+        from peng.config import get_path
+
+        # ── 主系统提示词：全局 AGENTS.md（项目根）→ 回退 prompts.jsonp system_prompt ──
         system_prompt = ""
         # 从 prompts.jsonp 读取 system_prompt（使用 jsonp 模块支持注释）
         prompts_path = get_path("prompts_json")
@@ -1307,13 +1309,20 @@ def _cmd_show_html(args):
             prompts_dict = prompts_config.get("prompts", prompts_config)
             system_prompt = prompts_dict.get("system_prompt", {}).get("content", "")
 
-        # 加载 AGENTS.md（如果存在）
+        # 加载全局 AGENTS.md（如果存在）
+        # 🔧 事务#2242：改为项目根目录基准（与 agent._load_agent_md 的 #2105 修正一致，
+        # 消除 CWD 依赖导致的跨工作目录读取污染）
+        from peng.config.loader import get_project_root
+
+        project_root = Path(get_project_root())
         agent_md = ""
-        possible_paths = [Path("./AGENTS.md"), Path(".peng/AGENTS.md")]
-        for path in possible_paths:
+        for path in [project_root / "AGENTS.md", project_root / ".peng" / "AGENTS.md"]:
             if path.exists():
                 agent_md = path.read_text(encoding="utf-8")
                 break
+
+        # 主系统提示词二选一（与实际注入一致：AGENTS.md 存在则替代 system_prompt）
+        combined = agent_md if agent_md else system_prompt
 
         # 获取 task_prompt（与 _prepare_prompt 逻辑一致）
         # prompt = task.get("prompt") or "task_prompt"
@@ -1324,12 +1333,33 @@ def _cmd_show_html(args):
         else:
             task_prompt_content = prompt_key
 
-        # 返回组合后的系统提示词（system_prompt + agent_md + task_prompt）
-        combined = system_prompt
-        if agent_md:
-            combined += "\n\n---\n\n" + agent_md
         if task_prompt_content:
             combined += "\n\n---\n\n" + task_prompt_content
+
+        # ── 尾部追加：事务所在 nest 工作目录的 AGENTS.md（如果存在）（事务#2242）──
+        try:
+            from peng.llm.client import load_task_agents_md
+
+            _task_for_md = {"nest": task.get("nest"), "workdir": task.get("workdir")}
+            if _task_for_md.get("workdir"):
+                task_agents_md = None
+                if (_task_for_md.get("nest") or "local") == "local":
+                    # local nest：纯同步本地直读
+                    from peng.llm.client import _read_agents_md_local
+
+                    task_agents_md = _read_agents_md_local(_task_for_md["workdir"])
+                else:
+                    # 远程 nest：无事件循环时 asyncio.run（_cmd_show_html 为同步上下文），
+                    # 已在事件循环中（如转发线程内联协程）则跳过远程读取（展示降级）
+                    try:
+                        asyncio.get_running_loop()
+                    except RuntimeError:
+                        task_agents_md = asyncio.run(load_task_agents_md(_task_for_md))
+                if task_agents_md and task_agents_md != agent_md:
+                    combined += "\n\n---\n\n" + task_agents_md
+        except Exception as e:
+            logger.warning(f"[task show] 读取工作目录AGENTS.md用于展示失败(忽略): {e}")
+
         return combined
 
     system_prompt_content = _get_system_prompt()

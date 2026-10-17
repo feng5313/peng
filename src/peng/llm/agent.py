@@ -390,11 +390,14 @@ class PengAgent:
     async def _prepare_prompt(self, task):
         """准备系统提示词和用户提示词
 
-        AGENTS.md 注入优先级（事务#1672）：
-        1. 事务所在 nest 工作目录的 AGENTS.md / .peng/AGENTS.md
-           （local nest 本地直读；远程 nest 经 nest 协议读取）
-        2. 回退旧逻辑：peng 进程 cwd 的 AGENTS.md / .peng/AGENTS.md
-        3. 再回退：prompts.jsonp 的 system_prompt
+        系统提示词构成（事务#2242）：
+        1. 主系统提示词：peng 项目根 AGENTS.md → 回退 prompts.jsonp 的 system_prompt
+        2. skills discovery 提示词（技能清单，节省 token）
+        3. task_prompt（prompt 模板）
+        4. 尾部追加：事务所在 nest 工作目录的 AGENTS.md / .peng/AGENTS.md（如果存在）
+           （local nest 本地直读；远程 nest 经 nest 协议读取，事务#1672 基础设施）
+           ——项目特定指令位于系统提示词尾部（最靠近对话，注意力优先级最高）；
+           与主系统提示词内容相同时跳过（workdir==project_root 场景防重复注入）
         """
 
         # 直接读取 config/prompts.jsonp
@@ -404,24 +407,13 @@ class PengAgent:
 
         prompts_dict = prompts_config.get("prompts", prompts_config)
 
-        # 🔧 优先读取事务所在 nest 工作目录的 AGENTS.md（事务#1672）
-        task_agents_md = None
-        try:
-            from peng.llm.client import load_task_agents_md
-
-            task_agents_md = await load_task_agents_md(task)
-        except Exception as e:
-            logger.warning(f"[Agent] 读取事务AGENTS.md失败(回退旧逻辑): {e}")
-
-        if task_agents_md:
-            self.history.add_system(task_agents_md)
+        # 主系统提示词：全局 AGENTS.md（项目根）→ 回退 prompts.jsonp system_prompt
+        agent_md = self._load_agent_md()
+        if agent_md:
+            self.history.add_system(agent_md)
         else:
-            agent_md = self._load_agent_md()
-            if agent_md:
-                self.history.add_system(agent_md)
-            else:
-                system_prompt = prompts_dict["system_prompt"]["content"]
-                self.history.add_system(system_prompt)
+            system_prompt = prompts_dict["system_prompt"]["content"]
+            self.history.add_system(system_prompt)
 
         prompt = task.get("prompt") or "task_prompt"
         if prompt in prompts_dict:
@@ -438,6 +430,22 @@ class PengAgent:
         self.history.add_system(skills_prompt)
         if task_prompt:
             self.history.add_system(task_prompt)
+
+        # 🔧 事务#2242：读取事务所在 nest 工作目录的 AGENTS.md（如果存在），
+        # 追加到系统提示词尾部（原#1672"优先替代主系统提示词"改为"尾部追加"，
+        # 全局系统提示词保持完整，工作目录特定指令后置强化）
+        task_agents_md = None
+        try:
+            from peng.llm.client import load_task_agents_md
+
+            task_agents_md = await load_task_agents_md(task)
+        except Exception as e:
+            logger.warning(f"[Agent] 读取事务工作目录AGENTS.md失败(忽略): {e}")
+        if task_agents_md and task_agents_md != agent_md:
+            self.history.add_system(task_agents_md)
+            logger.info(
+                f"[Agent] 已追加工作目录AGENTS.md到系统提示词尾部 ({len(task_agents_md)}字符)"
+            )
 
     async def run_stream(
         self,
