@@ -511,7 +511,10 @@ class MessageHistory:
                     f"[MessageHistory] drop工具已清理上一轮迭代工具结果 "
                     f"id={drop_id} (消息#{i}, 原{original_len}字符)"
                 )
-                return (True, f"已清理：id {drop_id} 对应的工具返回结果")
+                return (
+                    True,
+                    f"已清理：id {drop_id} 对应的工具返回结果，从{original_len}字符精简到{len(replace)}字符。",
+                )
         # 窗口内未命中：区分"id不存在"与"存在但不在上一轮迭代"两种情况，给出精确报错
         for i, msg in enumerate(self._messages):
             if msg.get("role") == "tool" and marker in self._content_text(msg.get("content")):
@@ -5734,7 +5737,8 @@ class ToolExecutionEngine:
                 # 🔧 事务#2114：超长工具结果（超过provider级drop_hint_threshold，
                 # 默认1024字节）末尾追加带唯一4位数字id的drop清理提示，
                 # 模型确认结果毫无用处时可用drop工具清理以节省上下文空间
-                history_content = self._append_drop_hint(history_content)
+                if "checklist" not in tool_name:
+                    history_content = self._append_drop_hint(history_content)
                 history.add_tool_result(tool_call_id, tool_name, history_content)
 
                 tool_args = (
