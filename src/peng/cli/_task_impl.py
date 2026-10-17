@@ -1053,13 +1053,21 @@ def _section_html(icon_title: str, content_html: str) -> str:
     return f'<div class="task-section"><h3>{_h(icon_title)}</h3>{content_html}</div>'
 
 
-def _cmd_show_html(args):
-    """HTML 格式输出事务详情（用于 WebUI 弹窗）"""
+def render_task_detail_html(task_id: int) -> str | None:
+    """渲染事务详情 HTML 字符串（进程内纯渲染，供 WebUI API 直接调用）
+
+    🔧 事务#2246：WebUI 事务详情弹窗原先通过 /api/command 启动 bin/task 子进程
+    （解释器启动 + uv_sync + venv 重启 + 全量 import + 新建 DB 连接 ≈0.7s，且
+    subprocess.run 阻塞事件循环）。提取本纯渲染函数后 WebUI 可在服务进程内直接
+    调用（TaskManager 为单例，复用已有 DB 连接），消除全部子进程开销。
+
+    Returns:
+        HTML 字符串；事务不存在时返回 None（由调用方决定错误提示方式）。
+    """
     tm = get_task_manager()
-    task = tm.get_task(args.id)
+    task = tm.get_task(task_id)
     if not task:
-        _print_task_not_found_debug_info(args.id)
-        return 1
+        return None
 
     parts = []
 
@@ -1404,7 +1412,7 @@ def _cmd_show_html(args):
         )
 
     # ── 依赖 ──
-    deps = tm.get_dependencies(args.id)
+    deps = tm.get_dependencies(task_id)
     if deps:
         dep_items = []
         for dep_id in deps:
@@ -1420,7 +1428,7 @@ def _cmd_show_html(args):
         parts.append(_section_html("🔗 依赖", f'<ul class="md-list">{"".join(dep_items)}</ul>'))
 
     # ── 被依赖 ──
-    dependents = tm.get_dependents(args.id)
+    dependents = tm.get_dependents(task_id)
     if dependents:
         dep_items = []
         for dep_id in dependents:
@@ -1601,7 +1609,16 @@ def _cmd_show_html(args):
     if task.get("report"):
         parts.append(_section_html("📊 工作汇报", _md_to_html(task["report"], task.get("nest"))))
 
-    print(f'<div class="task-detail-html">{"\n".join(parts)}</div>')
+    return f'<div class="task-detail-html">{"\n".join(parts)}</div>'
+
+
+def _cmd_show_html(args):
+    """HTML 格式输出事务详情（CLI 入口，用于 WebUI 弹窗）"""
+    html = render_task_detail_html(args.id)
+    if html is None:
+        _print_task_not_found_debug_info(args.id)
+        return 1
+    print(html)
     return 0
 
 

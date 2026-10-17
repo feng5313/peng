@@ -169,6 +169,34 @@ async def get_task(task_id: int) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"{e}\n\nTraceback:\n{tb}") from None
 
 
+@router.get("/tasks/{task_id}/detail-html")
+async def get_task_detail_html(task_id: int) -> dict[str, Any]:
+    """获取事务详情完整 HTML（WebUI 事务详情弹窗内容）。
+
+    🔧 事务#2246：原先前端通过 /api/command 启动 bin/task 子进程生成
+    （解释器启动 + uv_sync + venv 重启 + 全量 import + 新建 DB 连接 ≈0.7s，
+    且 subprocess.run 阻塞事件循环）。现改为服务进程内直接渲染，
+    复用单例 TaskManager 的 DB 连接，响应从 ~700ms 降至几十毫秒。
+
+    使用 asyncio.to_thread 执行：1) 不阻塞事件循环；2) 工作线程内无运行中的
+    事件循环，渲染函数对远程 nest AGENTS.md 的 asyncio.run 读取分支可正常
+    工作，行为与原 CLI 子进程模式完全一致。
+    """
+    try:
+        from peng.cli._task_impl import render_task_detail_html
+
+        html = await asyncio.to_thread(render_task_detail_html, task_id)
+        if html is None:
+            raise HTTPException(status_code=404, detail="事务不存在")
+        return {"success": True, "output": html}
+    except HTTPException:
+        raise
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.error(f"获取事务详情HTML失败: {e}\n{tb}")
+        raise HTTPException(status_code=500, detail=f"{e}\n\nTraceback:\n{tb}") from None
+
+
 @router.get("/tasks/{task_id}/context-info")
 async def get_task_context_info(task_id: int) -> dict[str, Any]:
     """获取事务上下文摘要信息（tokens、费用、分项用量）。

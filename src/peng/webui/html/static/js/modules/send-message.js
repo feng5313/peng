@@ -479,12 +479,14 @@ async function showTaskDetails(taskId) {
   if (modal0) modal0.dataset.detailTaskId = taskId;
 
   // 异步加载完整详情
+  // 🔧 事务#2246：改用进程内渲染端点（复用服务端DB连接，~700ms→几十ms），
+  // 原先 /api/command 每次启动 bin/task 子进程（含解释器启动+uv_sync+venv重启+全量import）
   try {
-    const response = await fetch('/api/command', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ command: `/task show ${taskId} --format html` })
-    });
+    const response = await fetch(`/api/tasks/${taskId}/detail-html`);
+    if (!response.ok) {
+      const err = await response.json().catch(() => null);
+      throw new Error(err?.detail || `HTTP ${response.status}`);
+    }
     const data = await response.json();
 
     // 检查弹窗是否仍然存在且仍是当前事务（用户可能已关闭或切换到其他事务）
