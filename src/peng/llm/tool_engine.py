@@ -477,7 +477,7 @@ class MessageHistory:
                 break
         return (start, end)
 
-    def drop_tool_result(self, drop_id: str) -> tuple[bool, str]:
+    def drop_tool_result(self, drop_id: str, replace: str) -> tuple[bool, str]:
         """按id清理上一轮迭代的工具返回结果（事务#2114）
 
         只允许清理上一轮迭代（最近一批工具结果所在迭代，见get_drop_window）：
@@ -506,16 +506,12 @@ class MessageHistory:
                 continue
             if marker in self._content_text(msg.get("content")):
                 original_len = len(self._content_text(msg.get("content")))
-                msg["content"] = self._DROPPED_PLACEHOLDER
+                msg["content"] = replace
                 logger.info(
                     f"[MessageHistory] drop工具已清理上一轮迭代工具结果 "
                     f"id={drop_id} (消息#{i}, 原{original_len}字符)"
                 )
-                return (
-                    True,
-                    f"已清理：id {drop_id} 对应的工具返回结果"
-                    f"（原{original_len}字符）已替换为「{self._DROPPED_PLACEHOLDER}」",
-                )
+                return (True, f"已清理：id {drop_id} 对应的工具返回结果")
         # 窗口内未命中：区分"id不存在"与"存在但不在上一轮迭代"两种情况，给出精确报错
         for i, msg in enumerate(self._messages):
             if msg.get("role") == "tool" and marker in self._content_text(msg.get("content")):
@@ -3247,13 +3243,9 @@ class ToolExecutionEngine:
                 return history_content + hint
             if isinstance(history_content, list):
                 text_parts = [
-                    p
-                    for p in history_content
-                    if isinstance(p, dict) and p.get("type") == "text"
+                    p for p in history_content if isinstance(p, dict) and p.get("type") == "text"
                 ]
-                size = sum(
-                    len(str(p.get("text", "")).encode("utf-8")) for p in text_parts
-                )
+                size = sum(len(str(p.get("text", "")).encode("utf-8")) for p in text_parts)
                 if size <= threshold or not text_parts:
                     return history_content
                 hint = self._prompts.drop_hint.format(drop_id=self._allocate_drop_id())
