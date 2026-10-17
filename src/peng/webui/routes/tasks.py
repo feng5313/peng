@@ -181,11 +181,28 @@ async def get_task_detail_html(task_id: int) -> dict[str, Any]:
     使用 asyncio.to_thread 执行：1) 不阻塞事件循环；2) 工作线程内无运行中的
     事件循环，渲染函数对远程 nest AGENTS.md 的 asyncio.run 读取分支可正常
     工作，行为与原 CLI 子进程模式完全一致。
+
+    🔧 事务#2246（远程 nest 卡死修复）：渲染为同步函数跑在 to_thread 工作线程里，
+    内部若对远程 nest AGENTS.md 用 asyncio.run，会在临时新循环上跨循环 await 主循环
+    future → 卡满超时（实测远程 nest 事务 ~30s）。故远程 nest 的 AGENTS.md 在**主
+    事件循环**上 await load_task_agents_md 预取（实测 0.00s），经 override 注入渲染。
     """
     try:
         from peng.cli._task_impl import render_task_detail_html
 
-        html = await asyncio.to_thread(render_task_detail_html, task_id)
+        # 🔧 远程 nest：在主事件循环上预取工作目录 AGENTS.md（避免跨事件循环卡死）；
+        #     本地 nest 传 None，由渲染函数内纯同步本地直读（无跨循环，行为不变）。
+        agents_md_override: str | None = None
+        task_manager = TaskManager()
+        task_row = task_manager.get_task(task_id)
+        if task_row is not None and (task_row.get("nest") or "local") != "local":
+            from peng.llm.client import load_task_agents_md
+
+            agents_md_override = await load_task_agents_md(
+                {"nest": task_row.get("nest"), "workdir": task_row.get("workdir")}
+            )
+
+        html = await asyncio.to_thread(render_task_detail_html, task_id, agents_md_override)
         if html is None:
             raise HTTPException(status_code=404, detail="事务不存在")
         return {"success": True, "output": html}

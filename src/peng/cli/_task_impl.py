@@ -1053,13 +1053,28 @@ def _section_html(icon_title: str, content_html: str) -> str:
     return f'<div class="task-section"><h3>{_h(icon_title)}</h3>{content_html}</div>'
 
 
-def render_task_detail_html(task_id: int) -> str | None:
+def render_task_detail_html(
+    task_id: int, task_agents_md_override: str | None = None
+) -> str | None:
     """渲染事务详情 HTML 字符串（进程内纯渲染，供 WebUI API 直接调用）
 
     🔧 事务#2246：WebUI 事务详情弹窗原先通过 /api/command 启动 bin/task 子进程
     （解释器启动 + uv_sync + venv 重启 + 全量 import + 新建 DB 连接 ≈0.7s，且
     subprocess.run 阻塞事件循环）。提取本纯渲染函数后 WebUI 可在服务进程内直接
     调用（TaskManager 为单例，复用已有 DB 连接），消除全部子进程开销。
+
+    🔧 事务#2246（远程 nest 卡死修复）：本函数为**同步函数**，远程 nest 的
+    AGENTS.md 读取（load_task_agents_md）其 future 绑定在服务**主事件循环**上。
+    若在无事件循环的 asyncio.to_thread 工作线程里用 asyncio.run 跑，会形成跨事件
+    循环 await，future 永不在等待方循环上 resolve → 卡满超时（实测远程 nest 事务
+    详情加载 ~30s）。故 WebUI 调用方应在主循环上 await load_task_agents_md 取到内容，
+    经 task_agents_md_override 注入本函数；本地 nest 仍走纯同步本地直读（无跨循环）。
+    CLI 子进程模式（单循环、无 override）保留原 asyncio.run 行为不变。
+
+    Args:
+        task_id: 事务ID
+        task_agents_md_override: 调用方预先读取的事务工作目录 AGENTS.md 内容
+            （WebUI 主循环异步预取后注入）；None 则函数内自行读取（CLI 路径）。
 
     Returns:
         HTML 字符串；事务不存在时返回 None（由调用方决定错误提示方式）。
@@ -1351,7 +1366,11 @@ def render_task_detail_html(task_id: int) -> str | None:
             _task_for_md = {"nest": task.get("nest"), "workdir": task.get("workdir")}
             if _task_for_md.get("workdir"):
                 task_agents_md = None
-                if (_task_for_md.get("nest") or "local") == "local":
+                if task_agents_md_override is not None:
+                    # 🔧 事务#2246：调用方（WebUI 主循环）预取后注入，避免在本同步
+                    # 函数的 asyncio 临时循环里跨事件循环 await 远程 nest future 而卡死
+                    task_agents_md = task_agents_md_override
+                elif (_task_for_md.get("nest") or "local") == "local":
                     # local nest：纯同步本地直读
                     from peng.llm.client import _read_agents_md_local
 
