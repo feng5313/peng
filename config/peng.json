@@ -125,7 +125,7 @@
         "enable": false,
         "icon": "🐱",
         "max_concurrent": 3,
-        "max_tokens": 50000,
+        "max_tokens": 32000,
         "thinking_overload_threshold": 32000,
         "compact_threshold": 320000,
         "priority": 90,
