@@ -262,7 +262,7 @@ class MessageHistory:
         self._last_usage: dict = {}  # 最近一次API返回的usage（用于费用校验）
         self._user_merge_floor: int = 0  # 迭代边界：只允许合并此索引之后的user消息
         # 🔧 事务#2114：迭代边界索引记录（每次mark_iteration_start记录len(_messages)，
-        # 保留最近8条）。供drop工具定位"上一轮迭代"（最近一批工具结果所在迭代），
+        # 保留最近8条）。供compact工具定位"上一轮迭代"（最近一批工具结果所在迭代），
         # 禁止跨多个迭代清理，只修改上下文尾部区域以保护前缀缓存
         self._iteration_marks: list[int] = []
 
@@ -284,8 +284,8 @@ class MessageHistory:
     def mark_iteration_start(self) -> None:
         """标记新迭代开始，防止跨迭代合并user消息破坏上下文前缀缓存
 
-        同时记录迭代边界索引（事务#2114），供drop工具限定只能清理
-        上一轮迭代的工具结果（禁止跨迭代，且只修改上下文尾部区域以保护前缀缓存）
+        同时记录迭代边界索引（事务#2114），供compact工具限定只能清理
+        上一轮迭代的工具结果/思考内容（禁止跨迭代，且只修改上下文尾部区域以保护前缀缓存）
         """
         self._user_merge_floor = len(self._messages)
         self._iteration_marks.append(len(self._messages))
@@ -424,8 +424,8 @@ class MessageHistory:
                 i += 1
         return -1
 
-    # drop工具清理后的替换文案（事务#2114，单一事实源）
-    _DROPPED_PLACEHOLDER = "垃圾信息，已被drop工具清理。"
+    # compact工具精简后replace为空时的回退占位文案（事务#2114，单一事实源）
+    _COMPACTED_PLACEHOLDER = "内容已由compact工具精简。"
 
     @staticmethod
     def _content_text(content) -> str:
@@ -440,7 +440,7 @@ class MessageHistory:
             )
         return str(content) if content else ""
 
-    def get_drop_window(self) -> tuple[int, int] | None:
+    def get_compact_window(self) -> tuple[int, int] | None:
         """获取"上一轮迭代"（最近一批工具结果所在迭代）的消息索引窗口 [start, end)（事务#2114）
 
         end = 最后一次mark（当前迭代的消息——含正在执行的工具批次——全部在其后，
@@ -448,11 +448,11 @@ class MessageHistory:
 
         从模型视角，"上一轮迭代"= 它看到的最近一批工具结果：中间隔着的无工具
         空转迭代（空响应重试/纯文本轮/中断跳过等）不产生工具结果，不应把窗口
-        顶到错过最近一批结果；而更早批次的工具结果（隔着真实工具迭代）不允许
-        清理（"不得跨多个迭代drop"，同时保护上下文前缀缓存）。
+        顶到错过最近一批结果；而更早批次的内容（隔着真实工具迭代）不允许
+        精简（"不得跨多个迭代compact"，同时保护上下文前缀缓存）。
 
         Returns:
-            (start, end)：可清理的消息索引范围（已按当前消息数钳制）；
+            (start, end)：可精简的消息索引范围（已按当前消息数钳制）；
             None：无迭代边界或历史中尚无工具结果
         """
         if not self._iteration_marks:
@@ -477,55 +477,86 @@ class MessageHistory:
                 break
         return (start, end)
 
-    def drop_tool_result(self, drop_id: str, replace: str) -> tuple[bool, str]:
-        """按id清理上一轮迭代的工具返回结果（事务#2114）
+    def compact_by_id(self, compact_id: str, replace: str) -> tuple[bool, str]:
+        """按id精简上一轮迭代的工具返回结果或思考内容（事务#2114，事务#2270扩展思考内容）
 
-        只允许清理上一轮迭代（最近一批工具结果所在迭代，见get_drop_window）：
-        命中的 tool 消息 content 整体替换为占位文案（同时清除多模态附件part，
-        节省视觉token），不改动 assistant 消息中的 tool_calls 与参数。
-        中间隔着真实工具迭代的更早批次结果禁止清理（不得跨多个迭代drop）。
+        只允许精简上一轮迭代（最近一批工具结果所在迭代，见get_compact_window）：
+        - 命中 tool 消息（content 含 "id xxxx" 标记）：content 整体替换为精简文字
+          （同时清除多模态附件part，节省视觉token），不改动 assistant 消息中的
+          tool_calls 与参数
+        - 命中 assistant 消息（reasoning_content 含标记，保留思考内容的provider如
+          qwen3.8/deepseek 系列的超长思考）：reasoning_content 整体替换为精简文字，
+          content 与 tool_calls 不动
+        中间隔着真实工具迭代的更早批次内容禁止精简（不得跨多个迭代compact）。
+        replace 为空/纯空白时回退为占位文案。
 
         Args:
-            drop_id: 4位数字ID（来自工具结果末尾drop提示中的 "id xxxx"）
+            compact_id: 4位数字ID（来自内容末尾compact提示中的 "id xxxx"）
+            replace: 替换文字（精简摘要或"无用信息"等标记）
 
         Returns:
             (是否成功, 说明文本)
         """
-        drop_id = str(drop_id).strip()
-        if not re.fullmatch(r"\d{4}", drop_id):
-            return False, f"错误：id必须为4位数字（收到 '{drop_id}'）。"
-        marker = f"id {drop_id}"
-        window = self.get_drop_window()
+        compact_id = str(compact_id).strip()
+        if not re.fullmatch(r"\d{4}", compact_id):
+            return False, f"错误：id必须为4位数字（收到 '{compact_id}'）。"
+        replace = str(replace)
+        if not replace.strip():
+            replace = self._COMPACTED_PLACEHOLDER
+        marker = f"id {compact_id}"
+        window = self.get_compact_window()
         if window is None:
-            return False, "错误：当前不存在可清理的上一轮迭代工具结果。"
+            return False, "错误：当前不存在可精简的上一轮迭代内容。"
         start, end = window
 
         for i in range(start, end):
             msg = self._messages[i]
-            if msg.get("role") != "tool":
-                continue
-            if marker in self._content_text(msg.get("content")):
-                original_len = len(self._content_text(msg.get("content")))
-                msg["content"] = replace
-                logger.info(
-                    f"[MessageHistory] drop工具已清理上一轮迭代工具结果 "
-                    f"id={drop_id} (消息#{i}, 原{original_len}字符)"
-                )
-                return (
-                    True,
-                    f"已清理：id {drop_id} 对应的工具返回结果，从{original_len}字符精简到{len(replace)}字符。",
-                )
+            role = msg.get("role")
+            if role == "tool":
+                if marker in self._content_text(msg.get("content")):
+                    original_len = len(self._content_text(msg.get("content")))
+                    msg["content"] = replace
+                    logger.info(
+                        f"[MessageHistory] compact工具已精简上一轮迭代工具结果 "
+                        f"id={compact_id} (消息#{i}, 原{original_len}字符)"
+                    )
+                    return (
+                        True,
+                        f"已精简：id {compact_id} 对应的工具返回结果，"
+                        f"从{original_len}字符精简到{len(replace)}字符。",
+                    )
+            elif role == "assistant":
+                reasoning = msg.get("reasoning_content")
+                if isinstance(reasoning, str) and marker in reasoning:
+                    original_len = len(reasoning)
+                    msg["reasoning_content"] = replace
+                    logger.info(
+                        f"[MessageHistory] compact工具已精简上一轮迭代思考内容 "
+                        f"id={compact_id} (消息#{i}, 原{original_len}字符)"
+                    )
+                    return (
+                        True,
+                        f"已精简：id {compact_id} 对应的思考内容，"
+                        f"从{original_len}字符精简到{len(replace)}字符。",
+                    )
         # 窗口内未命中：区分"id不存在"与"存在但不在上一轮迭代"两种情况，给出精确报错
         for i, msg in enumerate(self._messages):
             if msg.get("role") == "tool" and marker in self._content_text(msg.get("content")):
                 return (
                     False,
-                    f"错误：id {drop_id} 对应的工具结果不属于上一轮迭代（消息#{i}），"
-                    f"禁止跨迭代清理。只能清理上一轮迭代中带drop提示的工具结果。",
+                    f"错误：id {compact_id} 对应的工具结果不属于上一轮迭代（消息#{i}），"
+                    f"禁止跨迭代清理。只能精简上一轮迭代中带compact提示的内容。",
+                )
+            reasoning = msg.get("reasoning_content")
+            if msg.get("role") == "assistant" and isinstance(reasoning, str) and marker in reasoning:
+                return (
+                    False,
+                    f"错误：id {compact_id} 对应的思考内容不属于上一轮迭代（消息#{i}），"
+                    f"禁止跨迭代清理。只能精简上一轮迭代中带compact提示的内容。",
                 )
         return (
             False,
-            f"错误：未找到 id {drop_id} 对应的工具结果。请核对工具结果末尾提示中的4位数字ID。",
+            f"错误：未找到 id {compact_id} 对应的内容。请核对工具结果/思考内容末尾提示中的4位数字ID。",
         )
 
     def from_api_format(self, messages):
@@ -1488,12 +1519,12 @@ class ToolExecutionEngine:
         # run_stream 每轮开始重置为当前文件行数以跳过历史内容）
         self._thinking_scan_line: int = 0
 
-        # 🔧 事务#2114：drop清理提示的唯一4位数字ID分配器（1000-9999顺序分配，
-        # 跳过已用ID；用尽后重新扫描复用最旧ID——由于drop只允许清理上一轮迭代的
-        # 结果，相隔9000次分配的同ID提示不可能同处一个窗口，无冲突风险）。
+        # 🔧 事务#2114：compact精简提示的唯一4位数字ID分配器（1000-9999顺序分配，
+        # 跳过已用ID；用尽后重新扫描复用最旧ID——由于compact只允许精简上一轮迭代的
+        # 内容，相隔9000次分配的同ID提示不可能同处一个窗口，无冲突风险）。
         # 注意：不随 run_stream 重入重置，避免resume后与history中已存提示ID撞车
-        self._drop_id_seq: int = 9999
-        self._used_drop_ids: set[int] = set()
+        self._compact_id_seq: int = 9999
+        self._used_compact_ids: set[int] = set()
 
     @property
     def _error_dedup_rounds(self) -> int:
@@ -3183,47 +3214,78 @@ class ToolExecutionEngine:
         cfg = getattr(self.llm, "provider_config", None)
         return bool(cfg.get("preserve_thinking", False)) if isinstance(cfg, dict) else False
 
-    # ==================== 上下文长度优化（事务#2114） ====================
+    # ==================== 上下文长度优化（事务#2114，事务#2270扩展思考内容） ====================
 
-    def _get_drop_hint_threshold(self) -> int:
-        """当前provider的drop清理提示阈值（字节，事务#2114）
+    def _thinking_kept_in_context(self) -> bool:
+        """当前 provider 序列化时是否保留思考内容（事务#2270）
 
-        优先级：provider级 drop_hint_threshold（peng.json llm.providers.<name>）
-        > 全局 llm.drop_hint_threshold（默认1024）。<=0 表示禁用。
+        与 to_api_format 的 keep_reasoning 同款准据：
+        thinking_type="thinking"（DeepSeek 等 API 强制要求保留 reasoning_content）
+        或 preserve_thinking=true（qwen3.8 系列等，事务#2111）。
+        只有保留模式下思考内容才驻留上下文，才需要/才值得追加精简提示。
+        """
+        if getattr(self.llm, "thinking_type", None) == "thinking":
+            return True
+        return self._provider_preserve_thinking()
+
+    def _get_compact_hint_threshold(self) -> int:
+        """当前provider的工具结果compact清理提示阈值（字节，事务#2114）
+
+        优先级：provider级 compact_hint_threshold（peng.json llm.providers.<name>）
+        > 全局 llm.compact_hint_threshold（默认1024）。<=0 表示禁用。
         """
         cfg = getattr(self.llm, "provider_config", None)
-        if isinstance(cfg, dict) and cfg.get("drop_hint_threshold") is not None:
+        if isinstance(cfg, dict) and cfg.get("compact_hint_threshold") is not None:
             try:
-                return int(cfg["drop_hint_threshold"])
+                return int(cfg["compact_hint_threshold"])
             except (TypeError, ValueError):
                 pass
         try:
-            return int(getattr(self.llm.config, "drop_hint_threshold", 1024))
+            return int(getattr(self.llm.config, "compact_hint_threshold", 1024))
         except (TypeError, ValueError):
             return 1024
 
-    def _allocate_drop_id(self) -> str:
+    def _get_thinking_compact_threshold(self) -> int:
+        """当前provider的思考内容compact精简提示阈值（字节，事务#2270）
+
+        优先级：provider级 thinking_compact_threshold（peng.json llm.providers.<name>）
+        > 全局 llm.thinking_compact_threshold（默认2048）。<=0 表示禁用。
+        仅对保留思考内容的provider生效（见 _thinking_kept_in_context）。
+        """
+        cfg = getattr(self.llm, "provider_config", None)
+        if isinstance(cfg, dict) and cfg.get("thinking_compact_threshold") is not None:
+            try:
+                return int(cfg["thinking_compact_threshold"])
+            except (TypeError, ValueError):
+                pass
+        try:
+            return int(getattr(self.llm.config, "thinking_compact_threshold", 2048))
+        except (TypeError, ValueError):
+            return 2048
+
+    def _allocate_compact_id(self) -> str:
         """分配唯一的4位数字ID（1000-9999，事务#2114）
 
         顺序递增并跳过已用ID；全部用尽时清空已用集重新分配（相隔9000次
-        分配的同ID提示不可能同处一个drop窗口，无跨迭代误清理风险）。
+        分配的同ID提示不可能同处一个compact窗口，无跨迭代误精简风险）。
+        工具结果提示与思考内容提示共用同一ID空间（同窗口内保持唯一即可）。
         """
         for _ in range(9000):
-            self._drop_id_seq += 1
-            if self._drop_id_seq > 9999:
-                self._drop_id_seq = 1000
-            if self._drop_id_seq not in self._used_drop_ids:
-                self._used_drop_ids.add(self._drop_id_seq)
-                return f"{self._drop_id_seq:04d}"
+            self._compact_id_seq += 1
+            if self._compact_id_seq > 9999:
+                self._compact_id_seq = 1000
+            if self._compact_id_seq not in self._used_compact_ids:
+                self._used_compact_ids.add(self._compact_id_seq)
+                return f"{self._compact_id_seq:04d}"
         # 9000个ID全部在用（理论不可能）：重置已用集重新分配
-        self._used_drop_ids = {self._drop_id_seq}
-        return f"{self._drop_id_seq:04d}"
+        self._used_compact_ids = {self._compact_id_seq}
+        return f"{self._compact_id_seq:04d}"
 
-    def _append_drop_hint(self, history_content):
-        """超长工具结果末尾追加drop清理提示（事务#2114）
+    def _append_compact_hint(self, history_content):
+        """超长工具结果末尾追加compact清理提示（事务#2114）
 
         结果字节数超过阈值（provider级可配，默认1024）时追加带唯一4位数字ID的
-        清理提示，模型确认结果毫无用处时可调用drop工具清理以节省上下文空间。
+        清理提示，模型确认结果毫无用处时可调用compact工具清理以节省上下文空间。
 
         - 多模态列表content：按text part字节数判断并追加到首个text part
           （附件part不计入——附件发送一次后即剥离，非持久上下文负担）
@@ -3235,14 +3297,14 @@ class ToolExecutionEngine:
         Returns:
             追加提示后的内容（未超阈值或禁用时原样返回）
         """
-        threshold = self._get_drop_hint_threshold()
+        threshold = self._get_compact_hint_threshold()
         if threshold <= 0:
             return history_content
         try:
             if isinstance(history_content, str):
                 if len(history_content.encode("utf-8")) <= threshold:
                     return history_content
-                hint = self._prompts.drop_hint.format(drop_id=self._allocate_drop_id())
+                hint = self._prompts.compact_hint.format(compact_id=self._allocate_compact_id())
                 return history_content + hint
             if isinstance(history_content, list):
                 text_parts = [
@@ -3251,12 +3313,49 @@ class ToolExecutionEngine:
                 size = sum(len(str(p.get("text", "")).encode("utf-8")) for p in text_parts)
                 if size <= threshold or not text_parts:
                     return history_content
-                hint = self._prompts.drop_hint.format(drop_id=self._allocate_drop_id())
+                hint = self._prompts.compact_hint.format(compact_id=self._allocate_compact_id())
                 text_parts[0]["text"] = str(text_parts[0].get("text", "")) + hint
                 return history_content
         except Exception as e:
-            logger.debug(f"[ToolEngine] 追加drop清理提示失败(忽略): {e}")
+            logger.debug(f"[ToolEngine] 追加compact清理提示失败(忽略): {e}")
         return history_content
+
+    def _append_thinking_compact_hint(self, thinking: str) -> str:
+        """超长思考内容末尾追加compact精简提示（事务#2270）
+
+        仅对保留思考内容的provider（thinking_type="thinking" 或
+        preserve_thinking=true，如 qwen3.8/deepseek 系列）生效：思考内容驻留
+        上下文消耗token，字节数超过阈值（provider级可配，默认2048）时末尾追加
+        带唯一4位数字ID的精简提示，模型确认对后续工作已无用（或可总结精简）时
+        调用compact工具按id精简以节省上下文空间。
+
+        非保留模式下思考内容序列化时即被剥离（to_api_format），不驻留上下文，
+        追加提示纯属浪费token，直接原样返回。任何异常也静默返回原内容，
+        绝不影响思考内容入history。
+
+        Args:
+            thinking: 即将进入history的思考内容（str）
+
+        Returns:
+            追加提示后的内容（未超阈值/非保留模式/禁用时原样返回）
+        """
+        if not thinking:
+            return thinking
+        threshold = self._get_thinking_compact_threshold()
+        if threshold <= 0:
+            return thinking
+        if not self._thinking_kept_in_context():
+            return thinking
+        try:
+            if len(thinking.encode("utf-8")) <= threshold:
+                return thinking
+            hint = self._prompts.thinking_compact_hint.format(
+                compact_id=self._allocate_compact_id()
+            )
+            return thinking + hint
+        except Exception as e:
+            logger.debug(f"[ToolEngine] 追加思考compact精简提示失败(忽略): {e}")
+        return thinking
 
     def _remind_thinking_only(
         self, history: MessageHistory, thinking: str, content: str, tool_calls: list
@@ -5080,7 +5179,11 @@ class ToolExecutionEngine:
                     # 保存保留的有效部分到history（避免浪费已消耗token）
                     _is_deepseek = "deepseek" in (self.llm.provider or "")
                     if thinking_trimmed:
-                        history.add_thinking(thinking_trimmed, is_deepseek=_is_deepseek)
+                        # 🔧 事务#2270：保留思考内容的provider中超长思考末尾追加compact精简提示
+                        history.add_thinking(
+                            self._append_thinking_compact_hint(thinking_trimmed),
+                            is_deepseek=_is_deepseek,
+                        )
                     if content_trimmed:
                         history.add_assistant(content_trimmed)
 
@@ -5140,7 +5243,11 @@ class ToolExecutionEngine:
 
                 if thinking_to_save:
                     _is_deepseek = "deepseek" in (self.llm.provider or "")
-                    history.add_thinking(thinking_to_save, is_deepseek=_is_deepseek)
+                    # 🔧 事务#2270：保留思考内容的provider中超长思考末尾追加compact精简提示
+                    history.add_thinking(
+                        self._append_thinking_compact_hint(thinking_to_save),
+                        is_deepseek=_is_deepseek,
+                    )
                     if content:
                         history.add_assistant(content)
                     self._save_history(history)
@@ -5174,15 +5281,19 @@ class ToolExecutionEngine:
             # 当有 tool_calls 时，将 reasoning_content 合并到同一个 assistant 消息中
             # 避免产生两条连续 assistant 消息（DeepSeek 不支持）
             _is_deepseek = "deepseek" in (self.llm.provider or "")
+            # 🔧 事务#2270：保留思考内容的provider（qwen3.8/deepseek系列）中超长思考
+            # 末尾追加compact精简提示（不改动thinking变量本身，避免污染后续
+            # 死循环检测指纹/思考过载统计等消费方）
+            _thinking_hinted = self._append_thinking_compact_hint(thinking) if thinking else thinking
             if thinking and tool_calls:
                 # 合并模式：一条消息同时包含 reasoning_content + tool_calls
                 # 不调用 add_thinking（避免产生两条连续 assistant 消息）
                 history.add_thinking("", is_deepseek=_is_deepseek)
                 history_list = []
-                history.add_assistant(content, tool_calls, _reasoning=thinking)
+                history.add_assistant(content, tool_calls, _reasoning=_thinking_hinted)
             else:
                 # 分离模式：thinking 和 assistant 分开存储
-                history.add_thinking(thinking, is_deepseek=_is_deepseek)
+                history.add_thinking(_thinking_hinted, is_deepseek=_is_deepseek)
                 history_list = []
                 history.add_assistant(content, tool_calls)
 
@@ -5734,11 +5845,11 @@ class ToolExecutionEngine:
                         logger.info(
                             f"[ToolEngine] 工具 {tool_name} 结果含 {len(parts) - 1} 个多模态附件，已注入LLM上下文"
                         )
-                # 🔧 事务#2114：超长工具结果（超过provider级drop_hint_threshold，
-                # 默认1024字节）末尾追加带唯一4位数字id的drop清理提示，
-                # 模型确认结果毫无用处时可用drop工具清理以节省上下文空间
+                # 🔧 事务#2114：超长工具结果（超过provider级compact_hint_threshold，
+                # 默认1024字节）末尾追加带唯一4位数字id的compact清理提示，
+                # 模型确认结果毫无用处时可用compact工具清理以节省上下文空间
                 if "checklist" not in tool_name:
-                    history_content = self._append_drop_hint(history_content)
+                    history_content = self._append_compact_hint(history_content)
                 history.add_tool_result(tool_call_id, tool_name, history_content)
 
                 tool_args = (

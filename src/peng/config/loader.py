@@ -969,10 +969,17 @@ class ProviderConfig(BaseModel):
     priority: int = 50  # Provider 优先级（0-99，默认50，越高优先级越高）
     max_concurrent: int | None = None  # 该provider最大并发数，None时使用全局max_concurrent
 
-    # 🔧 事务#2114：工具结果drop清理提示阈值（字节）。超过此字节数的工具返回结果
-    # 末尾追加带唯一4位数字id的drop清理提示，模型确认结果毫无用处时可用drop工具清理。
-    # None时使用全局 llm.drop_hint_threshold（默认1024）；0=禁用该provider的提示
-    drop_hint_threshold: int | None = None
+    # 🔧 事务#2114：工具结果compact清理提示阈值（字节）。超过此字节数的工具返回结果
+    # 末尾追加带唯一4位数字id的compact清理提示，模型确认结果毫无用处时可用compact工具清理。
+    # None时使用全局 llm.compact_hint_threshold（默认1024）；0=禁用该provider的提示
+    compact_hint_threshold: int | None = None
+
+    # 🔧 事务#2270：思考内容compact精简提示阈值（字节）。保留思考内容的provider
+    # （thinking_type="thinking" 或 preserve_thinking=true，如 qwen3.8/deepseek 系列）
+    # 中超过此字节数的思考内容末尾追加带唯一4位数字id的精简提示，模型确认对后续
+    # 工作已无用（或可大幅精简）时可用compact工具精简。
+    # None时使用全局 llm.thinking_compact_threshold（默认2048）；0=禁用该provider的提示
+    thinking_compact_threshold: int | None = None
 
     # 采样参数覆盖（按模型作者要求，部分模型在不同thinking模式下需要不同采样参数）
     # 格式: {"thinking_on": {"temperature": 0.6, "top_p": 0.95}, "thinking_off": {"temperature": 0.001, "top_p": 1.0}}
@@ -1130,10 +1137,17 @@ class LLMPromptsConfig(BaseModel):
         "思考内容不会保留在上下文中，因此思考后必须输出正式内容总结，以免丢失思考成果！"
     )
 
-    # 🔧 事务#2114：超长工具结果的drop清理提示（{drop_id} 为唯一4位数字ID）。
-    # 工具返回结果字节数超过 drop_hint_threshold（provider级可配，默认1024）时
-    # 追加此提示，模型确认结果毫无用处时调用drop工具清理以节省上下文空间
-    drop_hint: str = "\n 返回结果较长，如果无用或可以用总结大幅精简，请用drop工具清理或精简，id {drop_id}，尽量节省上下文空间！"
+    # 🔧 事务#2114：超长工具结果的compact清理提示（{compact_id} 为唯一4位数字ID）。
+    # 工具返回结果字节数超过 compact_hint_threshold（provider级可配，默认1024）时
+    # 追加此提示，模型确认结果毫无用处时调用compact工具清理以节省上下文空间
+    compact_hint: str = "\n 返回结果较长，如果无用或可以用总结大幅精简，请用compact工具清理或精简，id {compact_id}，尽量节省上下文空间！"
+
+    # 🔧 事务#2270：超长思考内容的compact精简提示（{compact_id} 为唯一4位数字ID）。
+    # 保留思考内容的provider（thinking_type="thinking" 或 preserve_thinking=true，
+    # 如 qwen3.8/deepseek 系列）中，思考内容字节数超过 thinking_compact_threshold
+    # （provider级可配，默认2048）时追加此提示，模型确认对后续工作已无用时
+    # 调用compact工具精简以节省上下文空间
+    thinking_compact_hint: str = "\n 思考内容较长，如对后续工作已无用或可用总结大幅精简，请用compact工具精简，id {compact_id}，尽量节省上下文空间！"
 
 
 class LLMConfig(BaseModel):
@@ -1174,10 +1188,14 @@ class LLMConfig(BaseModel):
     # 并发控制
     max_concurrent: int = 5  # 大模型并发数
     small_model_max_concurrent: int = 200  # 小模型并发数
-    # 🔧 事务#2114：工具结果drop清理提示阈值（字节，全局默认，provider级可覆盖）。
-    # 超过此字节数的工具返回结果末尾追加drop清理提示（见llm.prompts.drop_hint）；
+    # 🔧 事务#2114：工具结果compact清理提示阈值（字节，全局默认，provider级可覆盖）。
+    # 超过此字节数的工具返回结果末尾追加compact清理提示（见llm.prompts.compact_hint）；
     # 0=禁用
-    drop_hint_threshold: int = 1024
+    compact_hint_threshold: int = 1024
+    # 🔧 事务#2270：思考内容compact精简提示阈值（字节，全局默认，provider级可覆盖）。
+    # 保留思考内容的provider中超过此字节数的思考内容末尾追加compact精简提示
+    # （见llm.prompts.thinking_compact_hint）；0=禁用
+    thinking_compact_threshold: int = 2048
     # 向后兼容：顶层 model 字段（将从 current_provider 获取）
     model: str = ""
     # 向后兼容：顶层 model 字段（将从 current_provider 获取）
@@ -1722,9 +1740,12 @@ class LLMConfig(BaseModel):
                         "compact_threshold": prov_config.compact_threshold
                         if prov_config.compact_threshold is not None
                         else self.compact_threshold,
-                        "drop_hint_threshold": prov_config.drop_hint_threshold
-                        if prov_config.drop_hint_threshold is not None
-                        else self.drop_hint_threshold,
+                        "compact_hint_threshold": prov_config.compact_hint_threshold
+                        if prov_config.compact_hint_threshold is not None
+                        else self.compact_hint_threshold,
+                        "thinking_compact_threshold": prov_config.thinking_compact_threshold
+                        if prov_config.thinking_compact_threshold is not None
+                        else self.thinking_compact_threshold,
                         "price_input_hit": prov_config.price_input_hit
                         if prov_config.price_input_hit is not None
                         else self.price_input_hit,
@@ -1811,9 +1832,12 @@ class LLMConfig(BaseModel):
                     "compact_threshold": prov_config.compact_threshold
                     if prov_config.compact_threshold is not None
                     else self.compact_threshold,
-                    "drop_hint_threshold": prov_config.drop_hint_threshold
-                    if prov_config.drop_hint_threshold is not None
-                    else self.drop_hint_threshold,
+                    "compact_hint_threshold": prov_config.compact_hint_threshold
+                    if prov_config.compact_hint_threshold is not None
+                    else self.compact_hint_threshold,
+                    "thinking_compact_threshold": prov_config.thinking_compact_threshold
+                    if prov_config.thinking_compact_threshold is not None
+                    else self.thinking_compact_threshold,
                     "price_input_hit": prov_config.price_input_hit
                     if prov_config.price_input_hit is not None
                     else self.price_input_hit,
@@ -1939,9 +1963,12 @@ class LLMConfig(BaseModel):
                             "compact_threshold": prov_config.compact_threshold
                             if prov_config.compact_threshold is not None
                             else self.compact_threshold,
-                            "drop_hint_threshold": prov_config.drop_hint_threshold
-                            if prov_config.drop_hint_threshold is not None
-                            else self.drop_hint_threshold,
+                            "compact_hint_threshold": prov_config.compact_hint_threshold
+                            if prov_config.compact_hint_threshold is not None
+                            else self.compact_hint_threshold,
+                            "thinking_compact_threshold": prov_config.thinking_compact_threshold
+                            if prov_config.thinking_compact_threshold is not None
+                            else self.thinking_compact_threshold,
                             "price_input_hit": prov_config.price_input_hit
                             if prov_config.price_input_hit is not None
                             else self.price_input_hit,
@@ -2151,9 +2178,12 @@ class LLMConfig(BaseModel):
             "compact_threshold": prov_config.compact_threshold
             if prov_config.compact_threshold is not None
             else self.compact_threshold,
-            "drop_hint_threshold": prov_config.drop_hint_threshold
-            if prov_config.drop_hint_threshold is not None
-            else self.drop_hint_threshold,
+            "compact_hint_threshold": prov_config.compact_hint_threshold
+            if prov_config.compact_hint_threshold is not None
+            else self.compact_hint_threshold,
+            "thinking_compact_threshold": prov_config.thinking_compact_threshold
+            if prov_config.thinking_compact_threshold is not None
+            else self.thinking_compact_threshold,
             "price_input_hit": prov_config.price_input_hit
             if prov_config.price_input_hit is not None
             else self.price_input_hit,
