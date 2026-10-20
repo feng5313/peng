@@ -148,6 +148,27 @@ CONTEXT_LENGTH_KEYWORDS = [
 _STALL_WINDOW_SECONDS = 180.0
 _STALL_SWITCH_THRESHOLD_SECONDS = 90.0
 
+# 🔧 事务#2289：断流保留响应熔断阈值——连续N轮"断流但content非空保留响应"
+# （#2235路径）判定服务器持续性在tool_calls传输阶段断流，转长冷却限频重试。
+# 背景：保留的半截content（工具调用前导文本）每轮无tool_calls，空响应熔断
+# 与transient熔断均被绕过（content非空重置_consecutive_empty、保留路径重置
+# _transient_rounds），钩子block防结束 → 无限迭代烧钱（#2288实测65.76元）。
+_STREAM_KEPT_BREAKER_THRESHOLD = 3
+# 限频等待上限（秒），线性退避 30s×超限轮数
+_STREAM_KEPT_WAIT_MAX_SECONDS = 300
+
+
+def _stream_kept_breaker_wait(rounds: int) -> int:
+    """断流保留响应熔断：按连续保留轮数计算限频等待秒数（0=不等待）
+
+    rounds < 阈值：0（不等待，服务器可能只是偶发断流，保留响应后正常继续）；
+    达到阈值：30s起线性退避（第3轮30s、第4轮60s…封顶300s），持续故障时限频
+    重试防烧钱，流完整成功后计数重置自然恢复全速。
+    """
+    if rounds < _STREAM_KEPT_BREAKER_THRESHOLD:
+        return 0
+    return min(30 * (rounds - _STREAM_KEPT_BREAKER_THRESHOLD + 1), _STREAM_KEPT_WAIT_MAX_SECONDS)
+
 # 🔧 事务#2084：从错误消息中提取服务端声称的上下文窗口大小（tokens）。
 # 用于识别"伪上下文超标"：自研推理服务（如epyc的Strata server）在引擎
 # 未就绪/重载中时返回 "prompt (X tokens) + max tokens (Y) exceeds the
@@ -3903,6 +3924,15 @@ class ToolExecutionEngine:
         # 背景：#2235事故中is_transient_error耗尽后sleep(5)+continue无限死磕，
         # 单迭代30分钟959次ReadError，服务器每次完整输出后断流，响应全丢重烧
         self._transient_rounds: int = 0
+        # 🔧 事务#2289：断流保留响应熔断计数——连续"断流但content非空保留响应"轮数。
+        # #2235保留路径的两个绕过漏洞（#2288事故实测65.76元）：
+        # 1. 保留路径无条件重置_transient_rounds=0 → transient熔断失效；
+        # 2. 保留的半截content（工具调用前导文本）非空 → 空响应处理重置
+        #    _consecutive_empty → 空响应熔断失效。服务器持续性在tool_calls
+        #    传输阶段断流时：每轮保留无tool_calls的半截响应 → 钩子block防
+        #    结束 → 无限迭代烧钱。
+        # 本计数器在保留路径+1、流完整成功时重置，连续达到阈值转长冷却限频重试。
+        self._stream_kept_rounds: int = 0
         # 有tool_call的迭代计数（用于PUA注入间隔判断）
         self._tool_call_iter_count: int = 0
         # nest+workdir 冲突警告列表：_check_workdir_conflicts 检测并保存，
@@ -3959,6 +3989,70 @@ class ToolExecutionEngine:
 
             # 标记新迭代开始，防止跨迭代合并user消息破坏上下文前缀缓存
             history.mark_iteration_start()
+
+            # 🔧 事务#2289：断流保留响应熔断——连续多轮"#2235保留路径"（断流但
+            # content非空，流在tool_calls传输前中断）时，每轮保留的半截content
+            # （工具调用前导文本）都无tool_calls，事务无法推进且钩子block防结束，
+            # 无限迭代空转烧钱（#2288实测11:02-11:10连续保留、费用65.76元）。
+            # 达到阈值转长冷却限频重试（线性退避30s~300s），流完整成功后
+            # 重置计数自动恢复全速。等待期间响应紧急中断/控制信号（同#2064）。
+            if self._stream_kept_rounds >= _STREAM_KEPT_BREAKER_THRESHOLD:
+                _kept_wait = _stream_kept_breaker_wait(self._stream_kept_rounds)
+                if self._stream_kept_rounds == _STREAM_KEPT_BREAKER_THRESHOLD:
+                    _kept_breaker_msg = (
+                        f"⛔  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+                        f"{ANSI_COLORS.get('bright_red')}"
+                        f"警告：已连续{self._stream_kept_rounds}轮流式响应在工具调用"
+                        f"传输前中断（响应文本保留但工具调用始终未送达，事务无法推进，"
+                        f"疑似推理服务在长输出后断流）。已转入限频等待模式防止空转烧钱，"
+                        f"每轮等待{_kept_wait}秒后重试，服务恢复后将自动继续。"
+                        f"请检查provider服务状态。"
+                        f"{ANSI_COLORS.get('reset')}\n"
+                    )
+                    logger.error(
+                        f"⛔ [ToolEngine] 事务#{task_id} 断流保留响应熔断"
+                        f"（连续第{self._stream_kept_rounds}轮，限频{_kept_wait}秒）"
+                    )
+                    get_output_manager().write_output(
+                        task_id=task_id,
+                        content=_kept_breaker_msg,
+                        source="system",
+                    )
+                else:
+                    _kept_wait_msg = (
+                        f"⏳  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+                        f"{ANSI_COLORS.get('bright_yellow')}"
+                        f"断流保留响应限频等待中（连续第{self._stream_kept_rounds}轮，"
+                        f"等待{_kept_wait}秒后重试）..."
+                        f"{ANSI_COLORS.get('reset')}\n"
+                    )
+                    logger.warning(
+                        f"⚠️ [ToolEngine] 事务#{task_id} 断流保留响应限频"
+                        f"（第{self._stream_kept_rounds}轮，等待{_kept_wait}秒）"
+                    )
+                    if self._should_report_system_error(_kept_wait_msg):
+                        get_output_manager().write_output(
+                            task_id=task_id,
+                            content=_kept_wait_msg,
+                            source="system",
+                        )
+                # deadline绝对时间等待（复用公共provider失败等待模式，#2064中断检测）
+                _kept_deadline = time.monotonic() + _kept_wait
+                while time.monotonic() < _kept_deadline:
+                    self.exit_on_unexpected_status()
+                    _wait_interrupt = self._has_pending_interrupts()
+                    _wait_urgent = None if _wait_interrupt else self._has_urgent_interrupts()
+                    if _wait_interrupt or _wait_urgent:
+                        logger.info(
+                            f"⚡ [ToolEngine] 事务#{task_id}断流保留限频等待期间"
+                            f"检测到紧急中断/控制信号，立刻中断等待处理"
+                        )
+                        self._last_urgent_check_ts = 0.0
+                        self._last_urgent_interrupt_reason = None
+                        break
+                    _remaining = _kept_deadline - time.monotonic()
+                    if _remaining > 0:
+                        await asyncio.sleep(min(1, _remaining))
 
             # 根事务处理新回复消息
             self._get_unread_reply(history)
@@ -4075,6 +4169,9 @@ class ToolExecutionEngine:
             chunk_count = 0
             llm_finish = False
             should_quit = False
+            # 🔧 事务#2289：本轮流是否为"断流但content非空保留响应"（#2235路径）。
+            # 收尾时若无tool_calls，据此注入补发提示（工具调用意图未送达）
+            stream_interrupted_kept = False
             retry = 0
             is_rate_limited = False  # 429限流标志：禁止冷却和切换provider，立刻重试抢流量
             is_content_filtered = (
@@ -4812,6 +4909,16 @@ class ToolExecutionEngine:
                                 )
                             # 成功语义：重置熔断计数（与4706区成功重置一致）
                             self._transient_rounds = 0
+                            # 🔧 事务#2289：断流保留响应轮数+1（流被中断、finish_reason
+                            # 未收到，语义上并非完整成功，不得重置）。服务器持续性在
+                            # tool_calls传输阶段断流时，保留的半截content（前导文本）
+                            # 每轮都无tool_calls → 钩子block防结束 → 无限迭代烧钱
+                            # （#2288实测5+轮空转65.76元）。连续达到阈值由迭代循环
+                            # 开头的熔断检查转长冷却限频重试
+                            self._stream_kept_rounds += 1
+                            # 标记本轮流被中断保留：正常收尾时若无tool_calls，
+                            # 注入补发提示（模型工具调用意图未送达，告知其直接补发）
+                            stream_interrupted_kept = True
                             llm_finish = True
                             break
                         logger.info(
@@ -4874,6 +4981,9 @@ class ToolExecutionEngine:
                 self._context_overflow_rounds = 0
                 # 🔧 事务#2235：LLM调用成功，重置瞬时错误熔断计数
                 self._transient_rounds = 0
+                # 🔧 事务#2289：流完整正常结束（非断流保留路径，断流保留的break
+                # 跳过本重置区），服务器已恢复，重置断流保留熔断计数
+                self._stream_kept_rounds = 0
 
             # 如果重试循环因错误耗尽而break退出（llm_finish仍为False），
             # 说明所有provider都不可用（如全部被限流/冷却中）。
@@ -5325,6 +5435,34 @@ class ToolExecutionEngine:
                 history.add_assistant(content, tool_calls)
 
             self._save_history(history)
+            # 🔧 事务#2289：断流保留响应且无tool_calls——向模型注入补发提示。
+            # 流在工具调用传输前中断（#2235保留路径），模型的工具调用意图未送达
+            # （content末尾常见"……更新："式前导文本），下一轮模型见不到工具结果
+            # 会重新长篇思考再输出前导文本。明确告知直接补发，减少token浪费
+            if stream_interrupted_kept and not tool_calls:
+                _resend_hint = (
+                    "[系统提示：网络中断——你上一轮响应在工具调用发出前被网络中断，"
+                    "工具调用未送达（因此不会有任何工具执行结果返回）。"
+                    "你此前的思考和计划仍然有效，无需重新长篇思考，"
+                    "请直接重新发起所需的工具调用。]"
+                )
+                history.add_user(_resend_hint)
+                self._save_history(history)
+                logger.info(
+                    f"⚡ [ToolEngine] 事务#{task_id} 断流保留响应无tool_calls，"
+                    f"已注入补发提示（连续第{self._stream_kept_rounds}轮保留）"
+                )
+                get_output_manager().write_output(
+                    task_id=task_id,
+                    content=(
+                        f"{ANSI_COLORS.get('bright_yellow')}"
+                        f"⚠️ 断流保留的响应无工具调用，已提示模型直接补发"
+                        f"（连续第{self._stream_kept_rounds}轮保留，"
+                        f"达到{_STREAM_KEPT_BREAKER_THRESHOLD}轮将限频等待）"
+                        f"{ANSI_COLORS.get('reset')}\n"
+                    ),
+                    source="system",
+                )
             # 7. 先发送所有工具调用事件（让用户看到并行调用的工具）
             keep_list = []
             for tc in tool_calls:
