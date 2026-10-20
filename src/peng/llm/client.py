@@ -1303,9 +1303,12 @@ class GLMClient:
                         )
                     except asyncio.TimeoutError:
                         # SSE流停滞：连接已建立但长时间没有新数据
+                        # 🔧 事务#2277：抛出异常后由tool_engine决定重试策略——
+                        # 默认同provider重新请求，仅3分钟窗口内停滞累计占比
+                        # 过半（>=90s）才切换provider
                         logger.warning(
                             f"[LLM Client] SSE流停滞超过{stall_timeout}秒, "
-                            f"provider={self.provider}, 触发provider切换"
+                            f"provider={self.provider}, 抛出StreamStallError重新请求"
                         )
                         raise StreamStallError(
                             timeout=stall_timeout,

@@ -55,12 +55,12 @@ PREFILL_HEARTBEAT_INTERVAL = 10.0
 
 # 心跳续命绝对上限（秒）：单个请求prefill超过此时长仍未收到首个chunk，
 # 停止刷新心跳，交由heartbeat_monitor判定并强制恢复。
-# 正常路径下SSE停滞检测（stall_timeout=timeout_read，当前240s）会先触发
+# 正常路径下SSE停滞检测（stall_timeout=timeout_read，默认30s）会先触发
 # StreamStallError走错误重试/切换provider流程，远早于此上限；此上限仅在
 # httpx层面卡死（既无数据也无超时异常）等极端场景兜底，防止事务永久
 # 停留在"prefill中"僵死状态（事务#2016：服务崩溃重启期间事务无限prefill）。
-# 取值依据：timeout_read(240s) + 120s余量，覆盖服务自动重启(~3min)场景，
-# 不会在正常长prefill或服务自动恢复窗口内误触发。
+# 取值依据：timeout_read(30s，事务#2277) + 充足余量，覆盖服务自动重启
+# (~3min)场景，不会在正常长prefill或服务自动恢复窗口内误触发。
 PREFILL_HEARTBEAT_MAX_ELAPSED = 360.0
 
 # 输出文件进度行写入间隔（秒）：CLI watch可见的进度提示（低频避免刷屏）

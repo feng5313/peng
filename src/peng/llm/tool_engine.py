@@ -139,6 +139,15 @@ CONTEXT_LENGTH_KEYWORDS = [
     "too many tokens",
 ]
 
+# 🔧 事务#2277：SSE流停滞重试策略参数。
+# 停滞默认同provider重新请求（failed=False禁止标记provider失败），
+# 仅当3分钟滚动窗口内停滞累计时长占比过半（>=90秒）时判定该provider
+# 当前不可用，才切换provider并清空窗口重新计时。
+# 每次停滞消耗时长=停滞检测阈值（timeout_read，默认30s），连续3次停滞
+# 即达90秒阈值触发切换；孤立偶发停滞（窗口内仅1~2次）同provider重试。
+_STALL_WINDOW_SECONDS = 180.0
+_STALL_SWITCH_THRESHOLD_SECONDS = 90.0
+
 # 🔧 事务#2084：从错误消息中提取服务端声称的上下文窗口大小（tokens）。
 # 用于识别"伪上下文超标"：自研推理服务（如epyc的Strata server）在引擎
 # 未就绪/重载中时返回 "prompt (X tokens) + max tokens (Y) exceeds the
@@ -4103,6 +4112,9 @@ class ToolExecutionEngine:
             thinking_phrase_state: dict = {}  # thinking流重复短语检测状态（跨chunk累积）
             content_phrase_state: dict = {}  # content流重复短语检测状态（跨chunk累积）
             stream = None  # 🔧 事务#2178：本次LLM调用的流生成器引用（异常清理用）
+            # 🔧 事务#2277：SSE流停滞事件记录 [(monotonic时间戳, 停滞时长)]，
+            # 用于3分钟滚动窗口停滞占比判定（是否切换provider）
+            stall_events: list[tuple[float, float]] = []
             while not llm_finish:
                 try:
                     thinking = ""
@@ -4453,15 +4465,30 @@ class ToolExecutionEngine:
                     await self._aclose_llm_stream(stream)
                     return
                 except StreamStallError as e:
-                    # SSE流停滞：立即切换provider，不需要多次重试
+                    # 🔧 事务#2277：SSE流停滞默认同provider重新请求（is_transient_error=True
+                    # → chat_stream failed=False 禁止标记provider失败），不直接切换provider；
+                    # 仅当3分钟滚动窗口内停滞累计时长占比过半（>=90秒）时判定该provider
+                    # 当前不可用，才切换provider并清空窗口重新计时。
                     retry += 1
                     is_rate_limited = False  # 非429，重置限流标志
                     is_content_filtered = False  # 非内容审核错误，重置标志
-                    is_transient_error = False  # 非网络瞬时错误，重置标志
                     provider_name = e.provider or self.llm.provider or "unknown"
-                    logger.info(
-                        f"🤖 事务#{task_id}大模型SSE流停滞超过{e.timeout}秒provider={provider_name}，立即重试。"
+                    stall_switched, window_stall_seconds = self._register_stall_event(
+                        stall_events, e.timeout
                     )
+                    if stall_switched:
+                        logger.warning(
+                            f"🤖 事务#{task_id}SSE流停滞3分钟窗口累计{window_stall_seconds:.0f}秒"
+                            f"占比过半，切换provider重试(第{retry}次)。"
+                        )
+                        is_transient_error = False  # 允许切换provider
+                    else:
+                        is_transient_error = True  # 禁止切换provider，同provider重新请求
+                        logger.info(
+                            f"🤖 事务#{task_id}大模型SSE流停滞超过{e.timeout}秒"
+                            f"provider={provider_name}，同provider重新请求"
+                            f"(3分钟窗口内停滞累计{window_stall_seconds:.0f}秒)。"
+                        )
                     self.llm.error = f"SSE流停滞超过{e.timeout}秒 (provider={provider_name})"
                     if retry >= 5:
                         logger.error(
@@ -6499,6 +6526,27 @@ class ToolExecutionEngine:
             logger.debug(f"[ToolEngine] 事务#{self._task_id}关闭LLM流生成器时被取消(忽略)")
         except Exception as e:
             logger.debug(f"[ToolEngine] 关闭LLM流生成器失败(忽略): {e}")
+
+    def _register_stall_event(
+        self, stall_events: list[tuple[float, float]], timeout_seconds: float | None
+    ) -> tuple[bool, float]:
+        """🔧 事务#2277：登记一次SSE流停滞事件并判定是否应切换provider。
+
+        3分钟滚动窗口（_STALL_WINDOW_SECONDS）内停滞累计时长占比过半
+        （>= _STALL_SWITCH_THRESHOLD_SECONDS）判定该provider当前不可用：
+        清空窗口重新计时并返回 (True, 窗口累计秒数) → 调用方允许切换provider；
+        否则返回 (False, 窗口累计秒数) → 调用方同provider重新请求。
+        每次停滞消耗时长=停滞检测阈值（timeout_read，默认30s）。
+        """
+        now = time.monotonic()
+        stall_events.append((now, float(timeout_seconds or 0.0)))
+        while stall_events and now - stall_events[0][0] > _STALL_WINDOW_SECONDS:
+            stall_events.pop(0)
+        window_stall_seconds = sum(d for _, d in stall_events)
+        if window_stall_seconds >= _STALL_SWITCH_THRESHOLD_SECONDS:
+            stall_events.clear()
+            return True, window_stall_seconds
+        return False, window_stall_seconds
 
     def exit_on_unexpected_status(self):
         # 监测父进程是否存在（如果父进程被杀死，子进程也应该退出）

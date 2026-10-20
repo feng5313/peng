@@ -90,7 +90,7 @@
     "compact_threshold": 360000,
     "timeout": 60.0,
     "timeout_connect": 30.0,
-    "timeout_read": 240.0,
+    "timeout_read": 30.0,
     "timeout_write": 60.0,
     "timeout_pool": 60.0,
     "max_concurrent": 8,
