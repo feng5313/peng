@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import queue
 import re
+import threading
 import time
 import traceback
 from collections.abc import AsyncGenerator
@@ -923,7 +925,12 @@ class GLMClient:
         # 🔧 事务#2178：本次调用专属 client（旧版赋给 self._client，并发调用互相
         # 覆盖引用、生成器退出时无人关闭，每次 LLM 调用泄漏一个连接池）。
         # 局部化后由本生成器的 finally 显式关闭；self._client 保留给 close()。
-        _call_client = httpx.AsyncClient(
+        # 🔧 事务#2289：改为同步httpx.Client——SSE读行移入daemon线程（见下方
+        # _sse_reader）。此前async读取与主事件循环绑定：主循环被同步操作
+        # （DB psycopg2调用/大context序列化/rapidfuzz检测等）阻塞≥10秒时，
+        # httpx停读→TCP接收窗口关闭→server写超时(Strata SO_SNDTIMEO=10s)
+        # abort连接→ReadError断流（#2288实测65.76元，阻塞注入13.1秒100%复现）。
+        _call_client = httpx.Client(
             timeout=timeout_config,
             headers={
                 "Authorization": f"Bearer {current_api_key}",
@@ -1238,39 +1245,60 @@ class GLMClient:
                 )
             except Exception as _pf_err:
                 logger.debug(f"[LLM Client] prefill追踪启动失败(忽略): {_pf_err}")
-            # 使用手动上下文管理替代 async with，避免 GeneratorExit
-            # 传播到 __aexit__ 时触发 "athrow(): asynchronous generator is already running"
-            cm = _call_client.stream("POST", url, json=payload)
-            response = await cm.__aenter__()
-            try:
-                # 流式模式下，先检查状态码
-                # 如果状态码非2xx，先尝试读取响应体（获取API返回的具体错误信息）
-                if response.status_code >= 400:
-                    # 尝试读取错误响应体
-                    try:
-                        error_body = await response.aread()
-                        error_text = (
-                            error_body.decode("utf-8", errors="ignore")[:1000] if error_body else ""
-                        )
-                    except Exception:
-                        error_text = ""
-                    # 记录详细的错误信息到日志
-                    logger.warning(
-                        f"[LLM Client] API返回HTTP {response.status_code}, "
-                        f"provider={self.provider}, model={effective_model}, "
-                        f"响应体: {error_text[:500] if error_text else '(空)'}"
-                    )
-                    # 手动构建异常信息，包含响应体内容
-                    error_detail = (
-                        error_text if error_text else f"HTTP {response.status_code} (响应体为空)"
-                    )
-                    raise httpx.HTTPStatusError(
-                        error_detail,
-                        request=response.request,
-                        response=response,
-                    )
-                response.raise_for_status()
+            # 🔧 事务#2289：SSE读取线程化——主事件循环阻塞≥10秒时（同步DB调用/
+            # 大context的json序列化/rapidfuzz重复检测等），async读取停摆→TCP
+            # 接收窗口关闭→server的写超时(Strata SO_SNDTIMEO=10s)触发abort连接
+            # →ReadError断流（事务#2288实测65.76元；注入12秒事件循环阻塞13.1
+            # 秒100%复现）。读行移入daemon线程：主循环阻塞期间socket仍被持续
+            # 排空，连接不再被server掐断；async侧改为queue轮询消费（50ms间隔，
+            # stall/异常语义不变）。队列无界：极端长流(数万行×~100B=数MB)可
+            # 接受，换取读线程永不阻塞在put（消费者退出后线程能正常走到异常/
+            # 结束路径退出，不泄漏）。
+            _line_q: queue.Queue = queue.Queue()
+            _stream_end = object()  # 流正常结束哨兵
+            _sse_state: dict = {"cm": None}  # 读线程回填的response上下文管理器
 
+            def _sse_reader() -> None:
+                """daemon线程：同步发送请求+流式读行入队（不依赖主事件循环）
+
+                状态码错误构造HTTPStatusError（含响应体），其他异常原样入队
+                （保留异常类型，供tool_engine按TransportError子类分类处理）。
+                """
+                try:
+                    resp_cm = _call_client.stream("POST", url, json=payload)
+                    resp = resp_cm.__enter__()
+                    _sse_state["cm"] = resp_cm
+                    if resp.status_code >= 300:
+                        body = b""
+                        try:
+                            body = resp.read()
+                        except Exception:
+                            pass
+                        error_text = body.decode("utf-8", errors="ignore")[:1000] if body else ""
+                        logger.warning(
+                            f"[LLM Client] API返回HTTP {resp.status_code}, "
+                            f"provider={self.provider}, model={effective_model}, "
+                            f"响应体: {error_text[:500] if error_text else '(空)'}"
+                        )
+                        _line_q.put(
+                            httpx.HTTPStatusError(
+                                error_text or f"HTTP {resp.status_code} (响应体为空)",
+                                request=resp.request,
+                                response=resp,
+                            )
+                        )
+                        return
+                    for line in resp.iter_lines():
+                        _line_q.put(line)
+                    _line_q.put(_stream_end)
+                except BaseException as e:  # noqa: BLE001 - 原样透传给async侧
+                    _line_q.put(e)
+
+            _reader_thread = threading.Thread(
+                target=_sse_reader, daemon=True, name=f"sse-reader-{self.provider}"
+            )
+            _reader_thread.start()
+            try:
                 current_content = ""
                 current_thinking = ""  # 累积 thinking 内容
                 current_tool_calls: dict[int, dict[str, Any]] = {}
@@ -1293,30 +1321,39 @@ class GLMClient:
                 except Exception:
                     pass
 
-                # 使用手动迭代 + asyncio.wait_for 实现停滞检测
-                line_iterator = response.aiter_lines().__aiter__()
+                # 🔧 事务#2289：queue轮询消费读线程的行（替代asyncio.wait_for包装
+                # aiter_lines）。stall计时只统计"队列真空无数据"的时段——主循环
+                # 阻塞恢复后队列若有积压数据立即消费，不会误报stall（读线程持续
+                # 排空socket，server侧连接健康）。50ms轮询间隔：SSE行吞吐~130行/s，
+                # 批量取行摊薄开销，延迟可忽略。
+                _stall_deadline = time.monotonic() + stall_timeout
                 while True:
-                    try:
-                        line = await asyncio.wait_for(
-                            line_iterator.__anext__(),
-                            timeout=stall_timeout,
-                        )
-                    except asyncio.TimeoutError:
-                        # SSE流停滞：连接已建立但长时间没有新数据
-                        # 🔧 事务#2277：抛出异常后由tool_engine决定重试策略——
-                        # 默认同provider重新请求，仅3分钟窗口内停滞累计占比
-                        # 过半（>=90s）才切换provider
-                        logger.warning(
-                            f"[LLM Client] SSE流停滞超过{stall_timeout}秒, "
-                            f"provider={self.provider}, 抛出StreamStallError重新请求"
-                        )
-                        raise StreamStallError(
-                            timeout=stall_timeout,
-                            provider=self.provider,
-                        )
-                    except StopAsyncIteration:
+                    if _line_q.empty():
+                        if time.monotonic() >= _stall_deadline:
+                            # SSE流停滞：连接已建立但长时间没有新数据
+                            # 🔧 事务#2277：抛出异常后由tool_engine决定重试策略——
+                            # 默认同provider重新请求，仅3分钟窗口内停滞累计占比
+                            # 过半（>=90s）才切换provider
+                            logger.warning(
+                                f"[LLM Client] SSE流停滞超过{stall_timeout}秒, "
+                                f"provider={self.provider}, 抛出StreamStallError重新请求"
+                            )
+                            raise StreamStallError(
+                                timeout=stall_timeout,
+                                provider=self.provider,
+                            )
+                        await asyncio.sleep(0.05)
+                        continue
+                    item = _line_q.get_nowait()
+                    if item is _stream_end:
                         # 流正常结束
                         break
+                    if isinstance(item, BaseException):
+                        # 读线程透传的异常（HTTPStatusError/TransportError等），
+                        # 原样抛出保留类型（tool_engine按类型分类处理重试策略）
+                        raise item
+                    line = item
+                    _stall_deadline = time.monotonic() + stall_timeout
                     line_count += 1
                     if line_count == 1:
                         # 🔧 事务#1864：SSE流首个数据行到达，prefill阶段结束，
@@ -1669,17 +1706,20 @@ class GLMClient:
                     get_throughput_tracker().end_request(self.provider)
                 except Exception:
                     pass
-                # 手动退出上下文管理器，确保 HTTP 连接被关闭
-                # 捕获 RuntimeError：当 GeneratorExit 触发时，Python 会自动清理嵌套的
-                # 异步生成器，此时再手动调用 __aexit__ 会因 "athrow(): asynchronous generator is already running" 而失败
+                # 🔧 事务#2289：同步清理（读线程方案）——关闭response与client是
+                # 同步操作：主循环阻塞/GeneratorExit展开路径均安全；close会中断
+                # 读线程阻塞中的iter_lines（daemon线程随后异常入队退出，队列无人
+                # 消费由GC回收，无界队列不阻塞线程退出）
                 try:
-                    await cm.__aexit__(None, None, None)
-                except RuntimeError:
+                    _rcm = _sse_state.get("cm")
+                    if _rcm is not None:
+                        _rcm.__exit__(None, None, None)
+                except Exception:
                     pass
                 # 🔧 事务#2178：关闭本次调用的专属client（连接池）——旧版每次LLM调用
                 # new一个AsyncClient却只有GeneratorExit路径才关，正常/break结束都泄漏
                 try:
-                    await _call_client.aclose()
+                    _call_client.close()
                 except Exception:
                     pass
         except asyncio.CancelledError:

@@ -123,11 +123,13 @@ class TestClientPerCallCleanup:
 
         src = inspect.getsource(client_mod.GLMClient.chat_stream)
         # 本次调用专属 client（不得再赋给 self._client，防并发覆盖/泄漏）
-        assert "_call_client = httpx.AsyncClient" in src
+        # 🔧 事务#2289：AsyncClient→同步Client（SSE读线程化），#2178的专属
+        # client+finally关闭语义不变
+        assert "_call_client = httpx.Client(" in src
         assert "self._client = httpx.AsyncClient" not in src
-        assert "cm = _call_client.stream" in src
+        assert "_call_client.stream" in src
         # finally 中关闭专属 client
-        assert "await _call_client.aclose()" in src
+        assert "_call_client.close()" in src
 
     def test_close_method_guarded(self):
         """close() 不再裸用 self._client（实例级client可能从未创建）"""
