@@ -77,6 +77,48 @@ REF_PREFILL_SECONDS = 180.0
 # 数据过期时间（秒）- 文件超过此时间无更新视为残留（进程崩溃清理用）
 DATA_EXPIRY = 600.0
 
+# ============ 首token预算（事务#2306） ============
+# #2304死亡螺旋根因：固定停滞阈值（timeout_read=30s）同时管辖"首个chunk到达
+# 前"的等待，而长上下文冷缓存请求的真实TTFT可超过30秒（实测智谱z-glm5.3：
+# 78K冷=4.7s、103K冷+工具=8-9s、~130K大请求现场socket取证TTFT≈33s——恰好
+# 越过30s阈值，客户端在答案送达前3秒杀掉请求）。重试→切换provider→序列化键
+# 变化→KV缓存全量失效→更慢的冷prefill→必超时→熔断冷却30s→缓存TTL过期→
+# 永远冷启动。本预算把"首个chunk前"的容忍窗口按prefill估算动态放宽，首chunk
+# 之后的停滞语义保持timeout_read原样（#2289语义不回退）。
+FIRST_TOKEN_LOAD_FACTOR = 2.0  # 服务端排队/负载余量（实测冷请求TTFT对估算值的波动）
+FIRST_TOKEN_BUFFER_SECONDS = 15.0  # 固定缓冲（TLS/网络RTT/网关抖动）
+# 预算上限：必须低于 PREFILL_HEARTBEAT_MAX_ELAPSED 僵尸兜底 watchdog(360s)，
+# 否则服务真死锁时该watchdog失去意义
+FIRST_TOKEN_ALLOWANCE_CAP_SECONDS = 180.0
+
+
+def first_token_allowance_seconds(
+    est_tokens: int, compact_threshold: int, floor_seconds: float = 30.0
+) -> float:
+    """首个chunk到达前的停滞容忍窗口（秒）。
+
+    与 _estimate_prefill_percent 同源估算（est_tokens/compact_threshold ×
+    REF_PREFILL_SECONDS），叠加负载因子与缓冲，钳制到[floor, cap]。
+    短上下文（估算窗口小于floor）返回floor——行为与原固定阈值完全一致。
+    """
+    if est_tokens <= 0 or compact_threshold <= 0:
+        return float(floor_seconds)
+    expected_seconds = (est_tokens / compact_threshold) * REF_PREFILL_SECONDS
+    allowance = expected_seconds * FIRST_TOKEN_LOAD_FACTOR + FIRST_TOKEN_BUFFER_SECONDS
+    allowance = min(allowance, FIRST_TOKEN_ALLOWANCE_CAP_SECONDS)
+    return max(float(floor_seconds), allowance)
+
+
+def effective_stall_timeout(line_count: int, stall_timeout: float, first_allowance: float) -> float:
+    """停滞判定生效阈值（事务#2306，纯函数便于测试锁死语义）：
+
+    - 首个chunk前（line_count==0）：使用动态首token预算 first_allowance
+      （长上下文冷prefill的真实TTFT可超固定阈值，误杀会引发provider切换
+      →缓存失效→更慢→必超时的死亡螺旋，#2304实测）；
+    - 首个chunk之后：维持原 stall_timeout（#2277/#2289语义不回退）。
+    """
+    return float(first_allowance) if line_count == 0 else float(stall_timeout)
+
 # ============ 文件管理 ============
 
 _PREFILL_PREFIX = "prefill_"

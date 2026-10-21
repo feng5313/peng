@@ -31,6 +31,7 @@ from peng.config import load_config
 from peng.config.loader import LLMConfig, ProviderConfig
 from peng.common.logging_config import setup_llm_logging, should_log
 from peng.llm.concurrency import acquire_llm_slots_handle
+from peng.llm.prefill_tracker import effective_stall_timeout, first_token_allowance_seconds
 
 logger = logging.getLogger(__name__)
 llm_logger = None
@@ -106,6 +107,16 @@ def estimate_messages_tokens(messages: list[dict] | None) -> int:
 
     # 混合中英文：平均约 3.5 字符/token；附件按固定 token 数累加
     return total_chars * 2 // 7 + part_tokens
+
+
+def call_read_timeout(timeout_read: float, first_token_allowance: float) -> float:
+    """🔧 事务#2306：per-call httpx socket读超时必须与应用层首token预算同口径。
+
+    #2304实测：应用窗口放宽后，若socket层仍是timeout_read+1=31s，ReadTimeout会
+    抢先触发（07:16-07:20三次"断流但content非空"源头），两层超时任一先炸都会
+    打断本可完成的慢prefill请求。取两者较大者+1s。纯函数便于测试锁死。
+    """
+    return max(float(timeout_read) + 1.0, float(first_token_allowance) + 1.0)
 
 
 @dataclass
@@ -913,12 +924,31 @@ class GLMClient:
             except Exception as e:
                 logger.warning(f"[LLM Client] 更新事务provider失败: {e}\n{traceback.format_exc()}")
 
+        # 🔧 事务#2306：首token预算——"首个chunk到达前"的停滞容忍窗口按prefill
+        # 估算动态放宽（公式单一可信源在prefill_tracker）。#2304死亡螺旋：长上下
+        # 文冷缓存请求真实TTFT>30s（现场socket取证≈33s），固定timeout_read=30s
+        # 把正常慢prefill误判为断流→重试→切换provider→缓存全量失效→更慢→
+        # 必超时。首chunk之后维持timeout_read原语义（#2289不回退）。
+        # tools计入估算（服务端真实prefill含工具schema，#2304实测工具定义~55KB）。
+        _est_first_tokens = estimate_messages_tokens(messages)
+        if tools:
+            try:
+                _est_first_tokens += len(json.dumps(tools, ensure_ascii=False)) * 2 // 7
+            except (TypeError, ValueError):
+                pass
+        _first_token_allowance = first_token_allowance_seconds(
+            _est_first_tokens, self.compact_threshold, floor_seconds=self.config.timeout_read
+        )
+
         # HTTP 客户端
         # 流式请求需要更长的读取超时，因为 LLM 可能需要时间处理
         # 从配置中获取超时时间，支持细粒度控制
+        # 🔧 事务#2306：read超时随首token预算同步放宽——否则socket层ReadTimeout
+        # 会先于应用层窗口触发（#2304的07:16-07:20三次"ReadTimeout断流但content
+        # 非空"正是31s read超时先炸），两层超时口径必须一致。
         timeout_config = httpx.Timeout(
             connect=self.config.timeout_connect,  # 连接超时
-            read=self.config.timeout_read + 1,  # 读取超时
+            read=call_read_timeout(self.config.timeout_read, _first_token_allowance),  # 读取超时（事务#2306同口径）
             write=self.config.timeout_write,  # 写入超时
             pool=self.config.timeout_pool,  # 连接池超时
         )
@@ -1310,7 +1340,16 @@ class GLMClient:
 
                 line_count = 0
                 stall_timeout = self.config.timeout_read
-                logger.debug(f"[LLM Client] 开始读取SSE流, stall_timeout={stall_timeout}s")
+
+                def _effective_stall_timeout() -> float:
+                    """🔧 事务#2306：首个chunk前用动态首token预算，之后维持原阈值"""
+                    return effective_stall_timeout(line_count, stall_timeout, _first_token_allowance)
+
+                logger.debug(
+                    f"[LLM Client] 开始读取SSE流, stall_timeout={stall_timeout}s, "
+                    f"first_token_allowance={_first_token_allowance:.0f}s "
+                    f"(est_tokens={_est_first_tokens})"
+                )
 
                 # 🔧 记录请求开始时间（用于计算真实响应时间）
                 request_start_time = time.time()
@@ -1326,7 +1365,7 @@ class GLMClient:
                 # 阻塞恢复后队列若有积压数据立即消费，不会误报stall（读线程持续
                 # 排空socket，server侧连接健康）。50ms轮询间隔：SSE行吞吐~130行/s，
                 # 批量取行摊薄开销，延迟可忽略。
-                _stall_deadline = time.monotonic() + stall_timeout
+                _stall_deadline = time.monotonic() + _effective_stall_timeout()
                 while True:
                     if _line_q.empty():
                         if time.monotonic() >= _stall_deadline:
@@ -1334,12 +1373,15 @@ class GLMClient:
                             # 🔧 事务#2277：抛出异常后由tool_engine决定重试策略——
                             # 默认同provider重新请求，仅3分钟窗口内停滞累计占比
                             # 过半（>=90s）才切换provider
+                            # 🔧 事务#2306：首个chunk前按动态预算判定，避免误杀
+                            # 正常的长上下文冷prefill（#2304死亡螺旋触发点）
+                            _fired_timeout = _effective_stall_timeout()
                             logger.warning(
-                                f"[LLM Client] SSE流停滞超过{stall_timeout}秒, "
+                                f"[LLM Client] SSE流停滞超过{_fired_timeout:.1f}秒, "
                                 f"provider={self.provider}, 抛出StreamStallError重新请求"
                             )
                             raise StreamStallError(
-                                timeout=stall_timeout,
+                                timeout=_fired_timeout,
                                 provider=self.provider,
                             )
                         await asyncio.sleep(0.05)
@@ -1353,8 +1395,10 @@ class GLMClient:
                         # 原样抛出保留类型（tool_engine按类型分类处理重试策略）
                         raise item
                     line = item
-                    _stall_deadline = time.monotonic() + stall_timeout
+                    # 🔧 事务#2306：先计数再重置——首个chunk到达后，停滞判定立即
+                    # 回归timeout_read原阈值（首token预算只宽限"首个chunk前"窗口）
                     line_count += 1
+                    _stall_deadline = time.monotonic() + _effective_stall_timeout()
                     if line_count == 1:
                         # 🔧 事务#1864：SSE流首个数据行到达，prefill阶段结束，
                         # 停止prefill追踪（心跳恢复正常chunk驱动语义）
