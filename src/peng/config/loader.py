@@ -1345,16 +1345,17 @@ class LLMConfig(BaseModel):
         )
 
     def _note_auto_assignment(self, provider: str, task_id: int | None) -> str:
-        """自动选择命中后登记跨进程分配（事务#2307）
+        """自动选择命中后推进跨进程LRU账本（事务#2307）
 
-        仅自动选择路径登记：显式 @provider / 锁定的归属由调用方决定。
-        有 task_id 才登记（无事务归属的调用如UI展示不污染账本）。
+        仅自动选择路径推进 LRU（新分配）；显式 @provider / 锁定 / 粘性（resume）
+        的归属不推进——它们不改变归属，且 DB tasks 聚合已把它们计入活跃数
+        （chat_stream 每轮把实际 provider 写回 task.provider），空闲度天然完整。
         """
         if provider and task_id is not None and self.provider_rotation:
             try:
                 from peng.llm.provider_balance import get_provider_balance
 
-                get_provider_balance().record(provider, task_id=task_id)
+                get_provider_balance().record_assignment(provider, task_id=task_id)
             except Exception as e:  # 账本失败不影响选择
                 logger.debug(f"[LLMConfig] provider分配登记失败(忽略): {e}")
         return provider
@@ -1383,7 +1384,8 @@ class LLMConfig(BaseModel):
                 vision-only 的provider不参与（它们不支持普通LLM任务）。
             min_context_tokens: 估算的请求输入token数（事务#1807）。
                 上下文能力装不下当前请求的provider被跳过，防止切换后必然400。
-            task_id: 事务id（事务#2307）。传入时同tier按空闲度轮换排序并登记分配。
+            task_id: 事务id（事务#2307）。传入时同tier按空闲度（DB活跃事务数）
+                轮换排序并登记分配。
 
         Returns:
             最佳可用 provider 名称，如果没有可用 provider 则返回 None
@@ -2107,7 +2109,9 @@ class LLMConfig(BaseModel):
             else:
                 # 所有favorites都被禁止，使用自动选择
                 target_provider = self._get_best_available_provider(
-                    forbidden=forbidden, min_context_tokens=min_context_tokens, task_id=task_id
+                    forbidden=forbidden,
+                    min_context_tokens=min_context_tokens,
+                    task_id=task_id,
                 )
                 auto_selected = True
 
@@ -2156,7 +2160,9 @@ class LLMConfig(BaseModel):
                 if current_time - failure_info.last_failure_time <= failure_info.cooldown:
                     # 还在冷却中，强制切换到下一个 provider（全部失败也要换一个返回！）
                     fallback = self._get_best_available_provider(
-                        forbidden=forbidden, min_context_tokens=min_context_tokens, task_id=task_id
+                        forbidden=forbidden,
+                        min_context_tokens=min_context_tokens,
+                        task_id=task_id,
                     )
                     if fallback and fallback in self.providers:
                         logger.warning(f"[LLMConfig] {target_provider}在冷却中，切换到: {fallback}")

@@ -1,51 +1,51 @@
 """
-Provider 分配账本与同优先级轮换选择器（事务#2307）
+Provider 空闲度账本与同优先级轮换选择器（事务#2307，重构版）
 
-需求（消息#10863）
-----------------
-优先级相同的多个 provider 应该**轮流使用**：restart/start 新启动的事务优先选择
-**比较空闲**的 provider；resume 继续运行的事务默认**不换** provider（除非不可用）。
+需求（消息#10863，风主强调）
+--------------------------
+优先级相同的多个 provider 应该**轮流使用**：restart/start 新启动的事务，**优先
+选择比较空闲的provider**；resume 继续运行的事务默认不换 provider，除非不可用。
 
-为什么必须跨进程
-----------------
-peng 的每个事务都在独立子进程中执行（runner.py → executor → PengAgent →
-GLMClient），配置对象 ``LLMConfig.current_provider`` 与各 client 的
-``self.provider`` 都是**进程私有**状态。旧实现在同优先级 tier 内永远取
-shifts 的第一个（dict 插入顺序），因此多个同优先级 provider 时新事务全部
-压到同一个最"忙"的 provider 上，其余同优先级 provider 空转。
+为什么必须查 DB（风主指示，根本性方案）
+------------------------------------
+每个事务在独立 runner 子进程运行，各进程的配置/客户端状态私有。第一版用
+"每进程私有账本文件+读方聚合"，实测暴露致命缺陷：**只有自动选择路径会登记**，
+显式 @provider 强制指定、锁定、粘性（resume）路径都不登记 → 账本常年为空 →
+空闲度永远 0:0 → 退化为字典序固定选第一个 → 所有事务挤在同一个 provider。
 
-设计：每进程私有账本 + 读方聚合（无共享写争用）
---------------------------------------------
-- 每个进程只写自己的账本文件 ``data/provider_balance/p{pid}.json``
-  （与 throughput_tracker 同构：写方单一 ⇒ 无需文件锁、无互相覆盖）；
-- 选择器聚合所有进程的账本，得到每个 provider 的：
-  - ``active``：活跃分配数（= 该 provider 上活跃事务数）
-  - ``last_assigned``：最近一次**被分配**的时刻（LRU 轮转依据）
-- 排序键（同 priority tier 内）：``(active 升序, last_assigned 升序, 名称)``
-  - 从未分配过的 provider ``last_assigned=0`` 排最前（新部署时自然轮流铺开）
-  - LRU 让"都空闲"时的选择自动轮转，等价于 round-robin
-- 租约 TTL：分配条目 ``updated_at`` 超过 ``ASSIGN_TTL`` 秒视为失效（事务
-  归档/结束不再刷新，自动掉出账本）；进程死亡（``process_exists`` False）
-  时整个文件忽略；进程退出时 ``atexit`` 删除自己的文件。
+DB ``tasks`` 表才是跨进程天然真值：``chat_stream`` 每轮都把实际使用的 provider
+写回 ``task.provider``，事务状态（running/accepting）由 DB 权威记录——**任何
+路径**（强制指定/锁定/粘性/自动）选定 provider 后都会体现在 DB 里。因此空闲度
+主信号 = DB 聚合各 provider 上的活跃事务数（风主场景实测：iq3=2、wen=1 →
+新事务应选 wen）。
 
-与"粘性 provider"的关系
-----------------------
-resume（keep_context=True）保留 DB ``task.provider`` 作为粘性记录，进程重启后
-首轮选择直接复用它（``get_provider`` 的"没有出错就不切换"原则）；只有
-restart/start（清空上下文）才重新按本模块的空闲度/轮换规则分配。本模块只在
-**自动选择**路径记录分配，不覆盖用户显式 @provider 意图。
+LRU 轮换指针（同空闲度时轮流）
+-----------------------------
+活跃数相同时必须真正"轮流"，因此需要跨进程共享的最近分配时刻：单一共享账本
+``data/provider_balance.json``，由 flock 独占锁保护（锁文件 inode 稳定永不删除，
+沿用 llm/concurrency.py 的关键教训——filelock unlink 换 inode 会破坏互斥）。
+记录时机：**新分配**（restart/start/首次自动选择）才推进 LRU；粘性复用不推进
+（它不改变归属）。
+
+排序键（同 priority tier 内；tier 间仍按 priority 降序）
+------------------------------------------------------
+``(DB活跃事务数↑, last_assigned↑[从未分配=0最优先], 名称)``
+
+DB 不可用时降级为纯 LRU 账本排序（保持轮换语义）。
+
+历史教训（实测风主场景后修订）：曾尝试"扣除自己+已分配排最前"的稳定性优化，
+结果 current=iq3(2-1=1) 与 wen(1) 打平退化为名字序 → 新事务永远选 iq3，与需求
+"优先选择比较空闲的provider"直接冲突。稳定性本就由 get_provider"没有出错就不
+切换"原则在 rank 之前保证（rank 只在真正需要新分配/切换时介入），故排序键必须
+是纯原始负载。
 """
 
 from __future__ import annotations
 
-import atexit
 import json
 import logging
 import os
-import re
-import threading
 import time
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -53,301 +53,286 @@ logger = logging.getLogger(__name__)
 
 # ============ 核心参数 ============
 
-#: 分配租约存活时间（秒）：超过则条目失效。事务运行期每轮 chat_stream 都会
-#: 刷新（touch），归档/结束的事务停止刷新后自动掉出账本；进程崩溃时账本文件
-#: 由 atexit（正常退出）或删除检测兜底。
-ASSIGN_TTL = 600.0
+#: DB 活跃事务数聚合缓存（秒）：provider 选择每事务每迭代都可能发生，
+#: 缓存窗口内复用，避免高频查询打DB（本地PG单查询<1ms，窗口小即可）
+DB_CACHE_TTL = 3.0
 
-#: 账本文件最大存活时间（秒）：mtime 超过此值直接删除（进程死亡后的兜底清理）
-FILE_TTL = 1800.0
+#: LRU 账本读取缓存（秒），同上
+LEDGER_CACHE_TTL = 2.0
 
-#: 聚合快照缓存（秒）：避免每轮迭代高频读盘（同进程多次选择复用）
-SNAPSHOT_CACHE_TTL = 2.0
+#: 跨进程文件锁获取重试
+LOCK_RETRY_SECONDS = 1.0
+LOCK_RETRY_INTERVAL = 0.02
 
-#: 本进程账本落盘最小间隔（秒）：节流高频写（同进程内字典即时生效，不受影响）
-MIN_WRITE_INTERVAL = 1.0
+_LEDGER_NAME = "provider_balance.json"
+_LOCK_SUFFIX = ".lock"
 
-_DIR_NAME = "provider_balance"
-_FILE_PREFIX = "p"
+#: 参与"活跃负载"统计的事务状态（paused/归档的事务不消耗provider算力）
+ACTIVE_STATUSES = ("running", "accepting")
 
 
 def _get_data_dir() -> Path:
-    """账本目录（<project_root>/data/provider_balance）"""
+    """数据目录（<project_root>/data）"""
     try:
         from peng.config import get_project_root
 
-        return get_project_root() / "data" / _DIR_NAME
+        return get_project_root() / "data"
     except Exception:
-        return Path("data") / _DIR_NAME
+        return Path("data")
 
 
-def _sanitize_pid(pid: int) -> str:
-    return re.sub(r"[^0-9A-Za-z_.-]", "_", str(pid))
+def _ledger_path() -> Path:
+    return _get_data_dir() / _LEDGER_NAME
+
+
+def _lock_path() -> Path:
+    return _get_data_dir() / (_LEDGER_NAME + _LOCK_SUFFIX)
+
+
+# ============ 跨进程文件锁（稳定inode，参考 llm/concurrency.py） ============
+
+if os.name == "nt":  # pragma: no cover - Windows
+    import msvcrt
+
+    # msvcrt锁定API只存在于Windows平台typeshed桩（其他平台空桩），显式按Any使用
+    _msvcrt: Any = msvcrt
+
+    def _flock_exclusive(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+
+    def _funlock(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
+
+else:
+
+    def _flock_exclusive(fd: int) -> None:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _funlock(fd: int) -> None:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 class ProviderBalance:
-    """Provider 分配账本（同优先级轮换 + 空闲度排序）
+    """Provider 空闲度账本（DB活跃聚合 + 共享LRU轮换）
 
     用法::
 
         balance = get_provider_balance()
-        ranked = balance.rank(candidates, task_id=task_id)   # tier内按空闲度排序
-        balance.record(provider, task_id)                    # 自动分配命中后登记
-        balance.release(task_id)                             # 事务结束时释放
+        ranked = balance.rank(candidates, task_id=tid, current=cur)
+        balance.record_assignment(provider, task_id=tid)   # 新分配时推进LRU
     """
 
     _instance = None
-    _instance_lock = threading.Lock()
-
-    def __new__(cls) -> ProviderBalance:
-        with cls._instance_lock:
-            if cls._instance is None:
-                cls._instance = super().__new__(cls)
-        return cls._instance
 
     def __init__(self) -> None:
-        if getattr(self, "_initialized", False):
-            return
-        self._initialized = True
-        self._lock = threading.Lock()
         self._pid = os.getpid()
-        # 本进程账本（内存真值，落盘供其他进程读取）
-        # task_id(str) -> {"provider": str, "assigned_at": float, "updated_at": float}
-        self._self_entries: dict[str, dict[str, Any]] = {}
-        self._last_write = 0.0
-        # 聚合快照缓存：{"built_at": float, "others": [...]}
-        self._cache: dict[str, Any] | None = None
+        self._db_cache: dict[str, int] | None = None
+        self._db_cache_built = 0.0
+        self._ledger_cache: dict[str, Any] | None = None
+        self._ledger_cache_built = 0.0
 
-    # ---------------- 写入（仅本进程） ----------------
+    # ---------------- 跨进程锁 ----------------
 
-    def _self_file(self) -> Path:
-        return _get_data_dir() / f"{_FILE_PREFIX}{_sanitize_pid(self._pid)}.json"
+    class _FileLock:
+        """flock 独占锁（锁文件永不删除 ⇒ inode 稳定，互斥语义可靠）"""
 
-    def record(self, provider: str, task_id: int | None = None) -> None:
-        """登记/刷新本进程的分配（自动选择命中时调用）
+        def __init__(self, path: Path) -> None:
+            self.path = path
+            self._fd: int | None = None
 
-        - 新登记：``assigned_at=now``（LRU 时间戳，决定同 tier 内的轮转顺序）
-        - 已登记：只刷新 ``updated_at``（续租），不移动 ``assigned_at``
-          （否则最忙的 provider 会因为频繁续租而永远排最前）
+        def acquire(self) -> bool:
+            deadline = time.time() + LOCK_RETRY_SECONDS
+            while True:
+                fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o666)
+                try:
+                    _flock_exclusive(fd)
+                    self._fd = fd
+                    return True
+                except OSError as e:
+                    os.close(fd)
+                    if e.errno not in (getattr(__import__("errno"), "EWOULDBLOCK", 11), 13):
+                        logger.debug(f"[ProviderBalance] 文件锁异常: {self.path}: {e}")
+                        return False
+                    if time.time() >= deadline:
+                        return False
+                    time.sleep(LOCK_RETRY_INTERVAL)
+
+        def release(self) -> None:
+            if self._fd is None:
+                return
+            try:
+                _funlock(self._fd)
+            except Exception:
+                pass
+            os.close(self._fd)
+            self._fd = None
+
+    # ---------------- DB 活跃事务数（跨进程真值，主信号） ----------------
+
+    def active_counts(self, use_cache: bool = True) -> dict[str, int]:
+        """各 provider 上的活跃事务数（DB tasks 聚合）
+
+        ``chat_stream`` 每轮把实际 provider 写回 task.provider，状态由DB权威记录，
+        因此该聚合天然涵盖强制指定/锁定/粘性/自动选择**所有路径**（第一版账本
+        只覆盖自动选择路径，正是"完全无效"的根因）。
+
+        Returns:
+            {provider: 活跃事务数}；DB 不可用时返回 {}（降级为纯LRU轮换）
+        """
+        now = time.time()
+        if use_cache and self._db_cache is not None and now - self._db_cache_built < DB_CACHE_TTL:
+            return self._db_cache
+
+        counts: dict[str, int] = {}
+        try:
+            from peng.task.database import TaskDatabase
+
+            placeholders = ", ".join(["%s"] * len(ACTIVE_STATUSES))
+            # 不用ORM/自研适配层，直接聚合（列名来自固定白名单，无注入面）
+            with TaskDatabase()._get_connection() as conn:
+                cursor = conn.execute(
+                    f"SELECT provider, COUNT(*) AS n FROM tasks "
+                    f"WHERE status IN ({placeholders}) AND provider <> '' "
+                    f"GROUP BY provider",
+                    tuple(ACTIVE_STATUSES),
+                )
+                for raw in cursor.fetchall():
+                    row = dict(raw)  # 项目DB层返回RealDictRow（与既有查询风格一致）
+                    name = row.get("provider")
+                    if name:
+                        counts[str(name)] = int(row.get("n") or 0)
+        except Exception as e:
+            logger.debug(f"[ProviderBalance] DB活跃事务聚合失败(降级纯LRU): {e}")
+            counts = {}
+
+        self._db_cache = counts
+        self._db_cache_built = now
+        return counts
+
+    # ---------------- LRU 共享账本（同空闲度时的轮换依据） ----------------
+
+    def _load_ledger(self, use_cache: bool = True) -> dict[str, Any]:
+        """读取共享 LRU 账本 {providers: {name: {"last_assigned": ts}}}"""
+        now = time.time()
+        if (
+            use_cache
+            and self._ledger_cache is not None
+            and now - self._ledger_cache_built < LEDGER_CACHE_TTL
+        ):
+            return self._ledger_cache
+
+        data: dict[str, Any] = {"providers": {}}
+        path = _ledger_path()
+        try:
+            if path.exists():
+                with open(path, encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict) and isinstance(loaded.get("providers"), dict):
+                    data = loaded
+        except Exception as e:
+            logger.debug(f"[ProviderBalance] 账本读取失败(忽略): {e}")
+
+        self._ledger_cache = data
+        self._ledger_cache_built = now
+        return data
+
+    def last_assigned(self, provider: str) -> float:
+        """该 provider 最近一次被新分配的时刻（0=从未，LRU最优先）"""
+        entry = self._load_ledger().get("providers", {}).get(provider) or {}
+        return float(entry.get("last_assigned", 0) or 0)
+
+    def record_assignment(self, provider: str, task_id: int | None = None) -> None:
+        """新分配命中时推进该 provider 的 LRU 时刻（跨进程共享，flock保护）
+
+        只对"新分配"调用（restart/start/首次自动选择）；粘性复用不推进——它不
+        改变归属，推进会让刚被 resume 的 provider 永远排到 tier 末尾。
         """
         if not provider:
             return
-        key = str(task_id) if task_id is not None else f"pid{self._pid}"
-        now = time.time()
-        with self._lock:
-            entry = self._self_entries.get(key)
-            if entry is None or entry.get("provider") != provider:
-                self._self_entries[key] = {
-                    "provider": provider,
-                    "assigned_at": now,
-                    "updated_at": now,
-                }
-            else:
-                entry["updated_at"] = now
-            should_write = (now - self._last_write) >= MIN_WRITE_INTERVAL
-            if should_write:
-                self._last_write = now
-        if should_write:
-            self._dump_self()
-
-    def release(self, task_id: int | None = None) -> None:
-        """释放本进程的某个分配（事务结束/归档时调用）"""
-        key = str(task_id) if task_id is not None else f"pid{self._pid}"
-        with self._lock:
-            if self._self_entries.pop(key, None) is None:
-                return
-        self._dump_self(force=True)
-
-    def _dump_self(self, force: bool = False) -> None:
-        """原子写本进程账本文件（tmp + os.replace）"""
+        lock = self._FileLock(_lock_path())
+        if not lock.acquire():
+            logger.debug("[ProviderBalance] 获取账本锁失败，跳过LRU推进")
+            return
         try:
-            with self._lock:
-                data = {
-                    "pid": self._pid,
-                    "updated_at": time.time(),
-                    "assignments": dict(self._self_entries),
-                }
-            if not force and not data["assignments"]:
-                return
-            from pathlib import Path
+            data = self._load_ledger(use_cache=False)
+            providers = data.setdefault("providers", {})
+            entry = providers.setdefault(provider, {})
+            entry["last_assigned"] = time.time()
+            if task_id is not None:
+                entry.setdefault("by", {})[str(task_id)] = self._pid
+            self._write_ledger(data)
+        except Exception as e:
+            logger.debug(f"[ProviderBalance] LRU推进失败(忽略): {e}")
+        finally:
+            lock.release()
 
-            data_dir = _get_data_dir()
-            if not data_dir.exists():
-                try:
-                    from peng.common.paths import ensure_dir_with_owner
-
-                    ensure_dir_with_owner(data_dir)
-                except Exception:
-                    data_dir.mkdir(parents=True, exist_ok=True)
-            filepath = Path(data_dir) / f"{_FILE_PREFIX}{_sanitize_pid(self._pid)}.json"
-            tmp = filepath.with_suffix(".tmp")
+    def _write_ledger(self, data: dict[str, Any]) -> None:
+        """原子写共享账本（tmp + os.replace，同目录同 inode）"""
+        path = _ledger_path()
+        try:
+            tmp = path.with_name(path.name + f".tmp{self._pid}")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f)
-            os.replace(str(tmp), str(filepath))
+            os.replace(str(tmp), str(path))
             try:
                 from peng.common.paths import chown_to_project_owner
 
-                chown_to_project_owner(filepath)
+                chown_to_project_owner(path)
             except Exception:
                 pass
-        except Exception as e:  # pragma: no cover - 账本失败不影响主流程
-            logger.debug(f"[ProviderBalance] 写入账本失败: {e}")
-
-    # ---------------- 聚合读取 ----------------
-
-    def _iter_other_files(self) -> Iterator[Path]:
-        try:
-            data_dir = _get_data_dir()
-            if not data_dir.exists():
-                return
-            for filepath in data_dir.glob(f"{_FILE_PREFIX}*.json"):
-                if filepath.name == f"{_FILE_PREFIX}{_sanitize_pid(self._pid)}.json":
-                    continue  # 本进程用内存真值
-                yield filepath
-        except Exception as e:  # pragma: no cover
-            logger.debug(f"[ProviderBalance] 扫描账本目录失败: {e}")
-
-    def _aggregate(self, use_cache: bool = True) -> dict[str, dict[str, Any]]:
-        """聚合所有进程的账本 → {provider: {"active": int, "last_assigned": float}}
-
-        缓存只覆盖**其他进程文件**部分（IO 昂贵）；本进程账本（内存真值）每次
-        实时合并——否则同进程连续分配时看不到刚登记的条目，轮转不生效。
-        """
-        now = time.time()
-        cache = self._cache
-        if not (use_cache and cache and now - cache.get("built_at", 0) < SNAPSHOT_CACHE_TTL):
-            cache = {"built_at": now, "others": self._scan_other_entries()}
-            self._cache = cache
-
-        load: dict[str, dict[str, Any]] = {}
-
-        def _add(provider: str, assigned_at: float, updated_at: float) -> None:
-            if not provider or now - updated_at > ASSIGN_TTL:
-                return
-            slot = load.setdefault(provider, {"active": 0, "last_assigned": 0.0})
-            slot["active"] += 1
-            if assigned_at > slot["last_assigned"]:
-                slot["last_assigned"] = float(assigned_at)
-
-        # 其他进程（缓存的条目，按当前时间重新过滤TTL）
-        for provider, assigned_at, updated_at in cache["others"]:
-            _add(provider, assigned_at, updated_at)
-
-        # 本进程（内存真值，实时）
-        with self._lock:
-            self_snapshot = [dict(v) for v in self._self_entries.values()]
-        for entry in self_snapshot:
-            _add(entry.get("provider", ""), entry.get("assigned_at", 0), entry.get("updated_at", 0))
-
-        return load
-
-    def _scan_other_entries(self) -> list[tuple[str, float, float]]:
-        """扫描其他进程账本文件 → [(provider, assigned_at, updated_at), ...]"""
-        from pathlib import Path
-
-        from peng.common.platform import process_exists
-
-        now = time.time()
-        entries: list[tuple[str, float, float]] = []
-        for filepath in self._iter_other_files():
-            try:
-                p = Path(filepath)
-                if now - p.stat().st_mtime > FILE_TTL:
-                    self._unlink_quietly(p)
-                    continue
-                with open(p, encoding="utf-8") as f:
-                    data = json.load(f)
-                if not isinstance(data, dict):
-                    continue
-                pid = data.get("pid")
-                if pid and not process_exists(int(pid)):
-                    self._unlink_quietly(p)
-                    continue
-                assignments = data.get("assignments") or {}
-                if not isinstance(assignments, dict):
-                    continue
-                for entry in assignments.values():
-                    if isinstance(entry, dict):
-                        entries.append(
-                            (
-                                entry.get("provider", ""),
-                                float(entry.get("assigned_at", 0) or 0),
-                                float(entry.get("updated_at", 0) or 0),
-                            )
-                        )
-            except Exception:
-                continue
-        return entries
-
-    @staticmethod
-    def _unlink_quietly(path: Path) -> None:
-        try:
-            path.unlink()
-        except Exception:
-            pass
-
-    def get_load(self, provider: str) -> dict[str, Any]:
-        """单个 provider 的负载视图 {"active": int, "last_assigned": float}"""
-        return self._aggregate().get(provider, {"active": 0, "last_assigned": 0.0})
+            self._ledger_cache = data
+            self._ledger_cache_built = time.time()
+        except Exception as e:
+            logger.debug(f"[ProviderBalance] 账本写入失败(忽略): {e}")
 
     # ---------------- 排序 ----------------
 
     def rank(self, candidates: list[str], task_id: int | None = None) -> list[str]:
-        """同优先级 tier 内按空闲度排序（调用方已按 priority 分好组）
-
-        排序键：活跃分配数升序 → 最近分配时刻升序（LRU，从未分配=0最优先）
-        → 名称字典序（稳定 tie-break）。
+        """同优先级 tier 内排序：DB活跃事务数↑ → LRU↑（从未=0最优先）→ 名称
 
         Args:
-            candidates: 同一优先级 tier 内的 provider 名称列表
-            task_id: 本事务 id。若本进程已把某 provider 分配给自己，
-                该 provider 排最前（同事务重选时保持稳定，避免来回抖动）
+            candidates: 同一优先级 tier 的 provider（调用方已分组）
+            task_id: 本事务 id（记录进账本 by，供审计）
         """
         if not candidates:
             return []
         if len(candidates) == 1:
             return list(candidates)
 
-        load = self._aggregate()
-        mine: str | None = None
-        if task_id is not None:
-            with self._lock:
-                entry = self._self_entries.get(str(task_id))
-            if entry:
-                mine = entry.get("provider")
+        counts = self.active_counts()
 
-        def key(name: str) -> tuple[int, int, float, str]:
-            info = load.get(name, {"active": 0, "last_assigned": 0.0})
-            return (0 if name == mine else 1, info["active"], info["last_assigned"], name)
+        def key(name: str) -> tuple[int, float, str]:
+            # 需求"优先选择比较空闲的provider"=直接按DB活跃数排（实测教训：曾加
+            # "扣除自己"优化，结果风主场景下 current=iq3(2-1=1) 与 wen(1) 打平退
+            # 化名字序永远选iq3——风主骂对了。稳定性由get_provider"没出错不切换"
+            # 原则在rank之前保证，rank只在真正需要换/新分配时介入，无需扣除。）
+            return (counts.get(name, 0), self.last_assigned(name), name)
 
-        return sorted(candidates, key=key)
+        ranked = sorted(candidates, key=key)
+        if len(set(key(c) for c in candidates)) > 1:
+            logger.info(
+                "[ProviderBalance] 同优先级轮换排序: "
+                + " | ".join(f"{c}(活跃{counts.get(c, 0)})" for c in ranked)
+            )
+        return ranked
 
-    # ---------------- 清理 ----------------
-
-    def cleanup(self) -> None:
-        """删除过期/死进程账本文件（供周期性清理调用）"""
-        from pathlib import Path
-
-        now = time.time()
-        from peng.common.platform import process_exists
-
-        for filepath in self._iter_other_files():
-            try:
-                p = Path(filepath)
-                pid_str = p.stem[len(_FILE_PREFIX) :]
-                if not pid_str.isdigit():
-                    continue
-                if not process_exists(int(pid_str)):
-                    self._unlink_quietly(p)
-                    continue
-                if now - p.stat().st_mtime > FILE_TTL:
-                    self._unlink_quietly(p)
-            except Exception:
-                continue
-
-    def snapshot_summary(self) -> dict[str, dict[str, Any]]:
-        """调试/展示用：{provider: {"active": n, "last_assigned": ts}}（只含非零项）"""
-        return {k: v for k, v in self._aggregate(use_cache=False).items() if v["active"] > 0}
+    def snapshot(self) -> dict[str, dict[str, Any]]:
+        """展示/诊断用：{provider: {"active": db计数, "last_assigned": ts}}"""
+        counts = self.active_counts(use_cache=False)
+        ledger = self._load_ledger(use_cache=False).get("providers", {})
+        result: dict[str, dict[str, Any]] = {}
+        for name in set(counts) | set(ledger):
+            result[name] = {
+                "active": counts.get(name, 0),
+                "last_assigned": float((ledger.get(name) or {}).get("last_assigned", 0) or 0),
+            }
+        return result
 
 
 # ============ 全局单例 ============
@@ -355,26 +340,9 @@ class ProviderBalance:
 _balance: ProviderBalance | None = None
 
 
-def _cleanup_on_exit() -> None:
-    """进程退出时删除本进程账本文件"""
-    try:
-        balance = get_provider_balance()
-        with balance._lock:
-            entries = dict(balance._self_entries)
-        if not entries:
-            return
-        path = balance._self_file()
-        if path.exists():
-            path.unlink()
-            logger.debug(f"[ProviderBalance] 进程退出，已删除账本: {path.name}")
-    except Exception:
-        pass
-
-
 def get_provider_balance() -> ProviderBalance:
-    """获取全局分配账本单例"""
+    """获取全局空闲度账本单例"""
     global _balance
     if _balance is None:
         _balance = ProviderBalance()
-        atexit.register(_cleanup_on_exit)
     return _balance

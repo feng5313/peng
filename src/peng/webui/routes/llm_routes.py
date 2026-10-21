@@ -163,12 +163,12 @@ async def get_llm_providers(detail: bool = False) -> dict[str, Any]:
         merged_config = _load_peng_json_merged()
         raw_providers: dict[str, dict] = merged_config.get("llm", {}).get("providers", {})
 
-        # 🔧 事务#2307：跨进程分配账本快照（同优先级轮换/空闲度），前端可显示
-        # 每个provider当前挂了多少活跃事务，验证"轮流使用"是否生效
+        # 🔧 事务#2307：各provider活跃事务数（DB tasks聚合，跨进程真值）+ LRU轮换
+        # 时刻快照，前端可显示每个provider挂了多少活跃事务，验证"轮流使用"是否生效
         try:
             from peng.llm.provider_balance import get_provider_balance
 
-            balance_load = get_provider_balance().snapshot_summary()
+            balance_load = get_provider_balance().snapshot()
         except Exception:
             balance_load = {}
 

@@ -1,17 +1,19 @@
 """事务#2307 回归测试：优先级相同的多个provider轮流使用（消息#10863）
 
-需求：
-1. restart/start 新启动的事务，优先选择比较空闲的provider（同优先级tier内轮换）；
-2. resume 继续运行的事务默认不换provider，除非不可用。
+需求（风主原话拆解）：
+1. 优先级相同的多个provider应该**轮流使用**；
+2. restart/start新启动的事务，**优先选择比较空闲的provider**（空闲度=DB各provider
+   上活跃事务数——风主实测场景：iq3有2个、wen有1个（他自己强制指定），下一个
+   restart/start新启动的事务应该选wen）；
+3. resume继续运行的事务**默认不换provider**，除非不可用。
 
-覆盖：
-- provider_balance 账本：本进程登记、跨进程聚合、死进程/TTL失效、LRU轮换
-- LLMConfig 排序：tier间priority降序不变，tier内空闲优先+LRU；开关关闭=旧行为
-- get_provider 集成：同tier连续自动选择轮转；current可用时保持（resume粘性）
+架构：空闲度主信号=DB tasks聚合（跨进程真值，涵盖强制指定/锁定/粘性/自动所有
+路径）；同空闲度时按共享LRU账本轮换（data/provider_balance.json + flock）。
+单元测试不依赖真实DB数值——fixture把active_counts桩为{}（纯LRU模式），
+DB驱动行为由专门用例注入计数验证。
 """
 
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -22,29 +24,8 @@ from peng.config.loader import LLMConfig, ProviderConfig  # noqa: E402
 from peng.llm import provider_balance as pb  # noqa: E402
 
 
-def _fresh_balance(tmp_path):
-    """构造指向tmp_path账本目录的隔离实例（不污染真实data/）"""
-    balance = pb.ProviderBalance()
-    balance._self_entries = {}
-    balance._cache = None
-    return balance
-
-
-@pytest.fixture
-def balance(tmp_path, monkeypatch):
-    """隔离账本：数据目录指向tmp_path，且loader的get_provider_balance()返回本实例
-
-    （provider_balance是模块级单例，loader内部通过get_provider_balance()取用；
-    不patch会读写真实data/目录，测试间互相污染）
-    """
-    monkeypatch.setattr(pb, "_get_data_dir", lambda: tmp_path)
-    instance = _fresh_balance(tmp_path)
-    monkeypatch.setattr(pb, "get_provider_balance", lambda: instance)
-    return instance
-
-
 def _cfg_tier_same() -> LLMConfig:
-    """三个同优先级provider（轮换测试）"""
+    """三个同优先级provider（轮换/空闲度测试）"""
     cfg = LLMConfig()
     cfg.providers = {
         "p-alpha": ProviderConfig(api_key="k", base_url="http://a", model="m1", priority=90),
@@ -54,122 +35,97 @@ def _cfg_tier_same() -> LLMConfig:
     return cfg
 
 
-def _cfg_tier_mixed() -> LLMConfig:
-    """两个高优先级 + 一个低优先级（tier间priority优先不受轮换影响）"""
-    cfg = LLMConfig()
-    cfg.providers = {
-        "hi-a": ProviderConfig(api_key="k", base_url="http://a", model="m1", priority=95),
-        "hi-b": ProviderConfig(api_key="k", base_url="http://a", model="m2", priority=95),
-        "lo-c": ProviderConfig(api_key="k", base_url="http://a", model="m3", priority=90),
-    }
-    return cfg
+@pytest.fixture
+def balance(tmp_path, monkeypatch):
+    """隔离账本实例：账本目录→tmp_path，DB聚合桩为{}（纯LRU模式，测试确定性）
+
+    provider_balance是模块级单例且loader通过get_provider_balance()取用，必须
+    patch 才不读写真实data/目录与真实DB。
+    """
+    monkeypatch.setattr(pb, "_get_data_dir", lambda: tmp_path)
+    instance = pb.ProviderBalance()
+    monkeypatch.setattr(instance, "active_counts", lambda use_cache=True: {})
+    monkeypatch.setattr(pb, "get_provider_balance", lambda: instance)
+    return instance
 
 
-class TestBalanceLedger:
-    """账本登记与聚合"""
+class TestLedgerLRURotation:
+    """纯LRU模式（同空闲度）：新分配推进LRU，实现轮流使用"""
 
-    def test_record_and_snapshot(self, balance):
-        balance.record("p-alpha", task_id=101)
-        balance.record("p-beta", task_id=102)
-        snap = balance.snapshot_summary()
-        assert snap["p-alpha"]["active"] == 1
-        assert snap["p-beta"]["active"] == 1
-        assert "p-gamma" not in snap
-
-    def test_release(self, balance):
-        balance.record("p-alpha", task_id=101)
-        balance.release(101)
-        assert "p-alpha" not in balance.snapshot_summary()
-
-    def test_cross_process_aggregation(self, balance, monkeypatch, tmp_path):
-        """其他进程账本文件参与聚合（伪造存活进程文件）"""
-        import json
-
-        other_pid = 999_999
-        (tmp_path / f"p{other_pid}.json").write_text(
-            json.dumps(
-                {
-                    "pid": other_pid,
-                    "updated_at": time.time(),
-                    "assignments": {
-                        "77": {
-                            "provider": "p-alpha",
-                            "assigned_at": time.time(),
-                            "updated_at": time.time(),
-                        }
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-        monkeypatch.setattr("peng.common.platform.process_exists", lambda pid: pid == other_pid)
-        assert balance.get_load("p-alpha")["active"] == 1
-
-    def test_dead_process_file_ignored(self, balance, tmp_path):
-        import json
-
-        (tmp_path / "p999998.json").write_text(
-            json.dumps(
-                {
-                    "pid": 999_998,
-                    "updated_at": time.time(),
-                    "assignments": {
-                        "77": {
-                            "provider": "p-alpha",
-                            "assigned_at": time.time(),
-                            "updated_at": time.time(),
-                        }
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-        assert balance.get_load("p-alpha")["active"] == 0
-
-    def test_ttl_expired_entry_dropped(self, balance, monkeypatch):
-        monkeypatch.setattr(pb, "ASSIGN_TTL", 5.0)
-        balance.record("p-alpha", task_id=101)
-        with balance._lock:
-            balance._self_entries["101"]["updated_at"] = time.time() - 10
-        assert balance.get_load("p-alpha")["active"] == 0
-
-    def test_touch_keeps_lease_but_not_lru(self, balance):
-        """续租刷新updated_at但不移动assigned_at（否则最忙的永远排最前）"""
-        balance.record("p-alpha", task_id=101)
-        with balance._lock:
-            assigned0 = balance._self_entries["101"]["assigned_at"]
-        balance.record("p-alpha", task_id=101)  # touch
-        with balance._lock:
-            assert balance._self_entries["101"]["assigned_at"] == assigned0
-
-
-class TestRankRotation:
-    """同tier轮换排序：空闲优先 + LRU"""
-
-    def test_all_idle_lru_rotation(self, balance):
+    def test_concurrent_new_tasks_round_robin(self, balance):
         cfg = _cfg_tier_same()
-        order1 = cfg.get_shifts()
-        # 模拟本进程给一个事务分配了p-beta → 其余两个（未分配）优先，p-beta最后
-        balance.record("p-beta", task_id=201)
-        order2 = cfg.get_shifts()
-        assert order1 == ["p-alpha", "p-beta", "p-gamma"]
-        assert order2[-1] == "p-beta" or order2 != order1  # p-beta已占用应后移
+        chosen = [cfg._get_best_available_provider(task_id=tid) for tid in (601, 602, 603)]
+        assert len(set(chosen)) == 3, f"同优先级应轮流使用，实际: {chosen}"
 
-    def test_idle_preferred_over_loaded(self, balance):
-        balance.record("p-alpha", task_id=301)
-        balance.record("p-alpha", task_id=302)
+    def test_fourth_picks_least_recently_assigned(self, balance):
+        """前三个tier成员各分配一个后，第四个事务应拿LRU最早者（实现真轮转）"""
+        cfg = _cfg_tier_same()
+        first = [cfg._get_best_available_provider(task_id=t) for t in (701, 702, 703)]
+        fifth = cfg._get_best_available_provider(task_id=704)
+        assert fifth == first[0], f"轮转应回到最早分配的{first[0]}，实际{fifth}"
+
+    def test_record_advances_lru(self, balance):
+        balance.record_assignment("p-alpha", task_id=801)
         ranked = balance.rank(["p-alpha", "p-beta"])
-        assert ranked[0] == "p-beta", "负载少的provider应排前（优先选择比较空闲的）"
+        assert ranked[0] == "p-beta", "刚被分配的provider应后移（LRU）"
 
-    def test_sticky_own_assignment_first(self, balance):
-        """本进程已分配给自己的provider排最前（同事务重选稳定）"""
-        balance.record("p-alpha", task_id=401)
-        ranked = balance.rank(["p-alpha", "p-beta", "p-gamma"], task_id=401)
-        assert ranked[0] == "p-alpha"
+    def test_no_task_id_no_ledger_record(self, balance):
+        """无task_id（UI展示等）不推进账本"""
+        cfg = _cfg_tier_same()
+        cfg._get_best_available_provider(task_id=None)
+        assert balance.snapshot() == {}
+
+    def test_shared_ledger_visible_across_instances(self, balance, monkeypatch, tmp_path):
+        """跨进程视角：另一实例（模拟别的runner进程）写的账本立即可见"""
+        other = pb.ProviderBalance()
+        other._load_ledger = lambda use_cache=True: balance._load_ledger(use_cache=False)
+        monkeypatch.setattr(other, "active_counts", lambda use_cache=True: {})
+        other.record_assignment("p-alpha", task_id=901)  # 写入共享文件（flock保护）
+        # balance实例缓存失效后从文件读到p-alpha已分配 → 排序应把p-alpha排后
+        ranked = balance.rank(["p-alpha", "p-beta"], task_id=902)
+        assert ranked[0] == "p-beta"
+
+
+class TestDbDrivenIdlePreference:
+    """空闲度主信号=DB活跃事务聚合（风主实测场景驱动）"""
+
+    def test_windmaster_scenario_prefers_idle(self, balance):
+        """风主场景：本tier两个provider，一个已被占2个事务、一个0 → 新事务选空闲的"""
+        cfg = _cfg_tier_same()
+        monkey_counts = {"p-alpha": 2}  # p-alpha已挂2个活跃事务，p-beta/p-gamma空闲
+        monkeypatch_balance = balance
+        monkeypatch_balance.active_counts = lambda use_cache=True: dict(monkey_counts)
+        chosen = cfg._get_best_available_provider(task_id=1001)
+        assert chosen in ("p-beta", "p-gamma"), f"应选空闲provider，实际{chosen}"
+
+    def test_fewer_active_wins(self, balance):
+        balance.active_counts = lambda use_cache=True: {"p-alpha": 3, "p-beta": 0}
+        ranked = balance.rank(["p-alpha", "p-beta"], task_id=1010)
+        assert ranked[0] == "p-beta", "活跃事务数少的provider优先（需求：优先选择比较空闲的）"
+
+    def test_raw_db_load_decides_no_deduction(self, tmp_path, monkeypatch):
+        """实测教训用例：排序必须用原始DB负载（曾有"扣除自己"优化，风主场景实测
+        直接失效——current=iq3(2-1=1)与wen(1)打平退化名字序永远选iq3）"""
+        monkeypatch.setattr(pb, "_get_data_dir", lambda: tmp_path)
+        b = pb.ProviderBalance()
+        b.active_counts = lambda use_cache=True: {"p-beta": 1, "p-alpha": 2}
+        # p-beta原始负载1 < p-alpha原始负载2 → p-beta胜（不管调用者"自己"在哪个）
+        assert b.rank(["p-alpha", "p-beta"], task_id=1020)[0] == "p-beta"
+
+    def test_degrade_to_lru_when_db_unavailable(self, balance):
+        """DB不可用时（active_counts返回{}）降级为纯LRU轮换，不崩"""
+        cfg = _cfg_tier_same()
+        chosen = [cfg._get_best_available_provider(task_id=t) for t in (1031, 1032)]
+        assert chosen[0] != chosen[1], "纯LRU下仍应轮换"
 
     def test_priority_tier_preserved(self, balance):
-        """tier间仍按priority降序，轮换只发生在同tier内"""
-        cfg = _cfg_tier_mixed()
+        """tier间priority降序优先，轮换只发生在同tier内"""
+        cfg = LLMConfig()
+        cfg.providers = {
+            "hi-a": ProviderConfig(api_key="k", base_url="http://a", model="m", priority=95),
+            "hi-b": ProviderConfig(api_key="k", base_url="http://a", model="m", priority=95),
+            "lo-c": ProviderConfig(api_key="k", base_url="http://a", model="m", priority=90),
+        }
         order = cfg.get_shifts()
         assert set(order[:2]) == {"hi-a", "hi-b"}
         assert order[2] == "lo-c"
@@ -177,84 +133,34 @@ class TestRankRotation:
     def test_rotation_disabled_keeps_legacy(self, balance):
         cfg = _cfg_tier_same()
         cfg.provider_rotation = False
-        balance.record("p-alpha", task_id=501)
-        # 关闭开关：同tier保持providers定义顺序（旧行为）
-        assert cfg.get_shifts() == ["p-alpha", "p-beta", "p-gamma"]
+        balance.record_assignment("p-alpha", task_id=1040)
+        assert cfg.get_shifts() == ["p-alpha", "p-beta", "p-gamma"], "开关关闭=旧行为"
 
 
-class TestGetProviderRotation:
-    """get_provider集成：新事务连续自动选择应轮转（模拟多事务并发启动）"""
-
-    def test_concurrent_new_tasks_round_robin(self, balance):
-        cfg = _cfg_tier_same()
-        chosen = []
-        for tid in (601, 602, 603):
-            r = cfg._get_best_available_provider(task_id=tid)
-            chosen.append(r)
-        assert len(set(chosen)) == 3, f"同优先级应轮流使用，实际: {chosen}"
-
-    def test_no_task_id_no_ledger_record(self, balance):
-        """无task_id（UI展示等）不污染账本"""
-        cfg = _cfg_tier_same()
-        cfg._get_best_available_provider(task_id=None)
-        assert balance.snapshot_summary() == {}
+class TestGetProviderSticky:
+    """get_provider层：resume粘性默认不换（除非不可用），新启动走空闲轮换"""
 
     def test_resume_sticky_current_kept(self, balance):
-        """resume粘性：current可用时保持原provider，不被轮换抢走"""
         cfg = _cfg_tier_same()
-        # 本进程账本已把p-gamma分配给别的任务（负载更高）
-        balance.record("p-gamma", task_id=702)
-        r = cfg.get_provider(current="p-gamma", favorites=None, locked=False, task_id=701)
+        # p-gamma上挂着别的事务（不空闲），但p-gamma是本事务current → 默认不换
+        balance.active_counts = lambda use_cache=True: {"p-gamma": 2}
+        r = cfg.get_provider(current="p-gamma", favorites=None, locked=False, task_id=1101)
         assert r["provider"] == "p-gamma", "无错不切换：resume默认不换provider"
 
-    def test_sticky_unavailable_switches(self, balance):
-        """粘性provider不可用（未启用）时按空闲度重选"""
+    def test_sticky_unavailable_switches_to_idle(self, balance):
         cfg = _cfg_tier_same()
-        cfg.providers["p-gamma"].enable = False
-        r = cfg.get_provider(current="p-gamma", favorites=None, locked=False, task_id=801)
-        assert r["provider"] in ("p-alpha", "p-beta")
+        cfg.providers["p-gamma"].enable = False  # 粘性目标被禁用 → 不可用
+        balance.active_counts = lambda use_cache=True: {"p-beta": 2}
+        r = cfg.get_provider(current="p-gamma", favorites=None, locked=False, task_id=1102)
+        assert r["provider"] in ("p-alpha", "p-gamma") and r["provider"] != "p-gamma"
 
-
-class TestCrossProcessBalance:
-    """跨进程视角：其他进程账本参与空闲度排序（真实部署形态）"""
-
-    def test_prefers_provider_free_of_other_processes(self, balance, monkeypatch):
+    def test_explicit_at_provider_beats_rotation(self, balance):
+        """content显式@provider用户意图优先于空闲轮换（事务#1793语义不变）"""
         cfg = _cfg_tier_same()
-        import json
-
-        other_pid = 999_997
-        from peng.llm.provider_balance import _get_data_dir
-
-        _get_data_dir().mkdir(parents=True, exist_ok=True)
-        (_get_data_dir() / f"p{other_pid}.json").write_text(
-            json.dumps(
-                {
-                    "pid": other_pid,
-                    "updated_at": time.time(),
-                    "assignments": {
-                        "70": {
-                            "provider": "p-alpha",
-                            "assigned_at": time.time(),
-                            "updated_at": time.time(),
-                        }
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-        monkeypatch.setattr("peng.common.platform.process_exists", lambda pid: pid == other_pid)
-        # 其他进程已占用p-alpha → 新事务（本进程）应选另外两个之一
-        chosen = cfg._get_best_available_provider(task_id=901)
-        assert chosen in ("p-beta", "p-gamma"), f"应避开其他进程占用的provider，实际{chosen}"
-
-    def test_restart_rebalances_by_idle(self, balance, monkeypatch):
-        """restart/start（无粘性、current=None）→ 优先选最空闲的provider"""
-        cfg = _cfg_tier_same()
-        # 模拟另两个provider已被本进程其他事务占用，只剩p-gamma空闲
-        balance.record("p-alpha", task_id=911)
-        balance.record("p-beta", task_id=912)
-        chosen = cfg._get_best_available_provider(task_id=910)
-        assert chosen == "p-gamma", f"新事务应选最空闲的provider，实际{chosen}"
+        cfg.providers["p-beta"].icon = "🐱"
+        balance.active_counts = lambda use_cache=True: {"p-beta": 5}  # 强制指定再忙也用
+        r = cfg.get_provider(current=None, favorites=["p-beta"], locked=False, task_id=1103)
+        assert r["provider"] == "p-beta"
 
 
 class TestManagerStickyLifecycle:
@@ -314,12 +220,11 @@ class TestManagerStickyLifecycle:
 
     @pytest.mark.asyncio
     async def test_restart_keeps_explicit_at_provider(self):
-        """content显式@provider（🐱=z-glm5.3-flash真实配置图标）→ 清除后仍尊重意图"""
+        """content显式@provider（🐱真实config图标）→ 清除后仍尊重用户意图"""
         tm = self._make_manager(
             {"id": 902, "content": "@🐱 干活", "status": "completed", "context": "", "provider": ""}
         )
         await tm.restart_task(902, keep_context=False)
-        # 🐱在真实config里是z-glm5.3-flash（测试环境依赖真实config图标，宽松断言）
         from peng.config.loader import load_config
 
         fav = load_config().llm.fetch_providers("@🐱 干活")
@@ -357,7 +262,7 @@ class TestWarmupStickyRestore:
                 self.provider = data["provider"]
 
     @staticmethod
-    def _warmup(llm, db_provider: str, content: str = ""):
+    def _warmup(llm, db_provider: str, content: str = "") -> str:
         """复刻tool_engine首轮预热路径（事务#2307新增段）：DB粘性provider→client→refresh"""
         if llm.provider is None:
             sticky = db_provider or ""
@@ -367,34 +272,32 @@ class TestWarmupStickyRestore:
         return llm.provider
 
     def test_resume_keeps_db_provider(self, balance):
-        """DB provider=粘性记录存在 → warmup恢复它（即使别的provider更空闲）"""
-        # 其他两个provider已被别的进程事务占用，p-alpha是本事务的粘性记录
-        balance.record("p-beta", task_id=921)
-        balance.record("p-gamma", task_id=922)
-        llm = self.FakeLLM(_cfg_tier_same())
+        """DB粘性记录存在 → warmup恢复它（即使别的provider更空闲）"""
+        cfg = _cfg_tier_same()
+        # 其他两个provider各有2个活跃事务，p-alpha是粘性记录（本事务一直用的）
+        balance.active_counts = lambda use_cache=True: {"p-beta": 2, "p-gamma": 2}
+        llm = self.FakeLLM(cfg)
         assert self._warmup(llm, "p-alpha") == "p-alpha", "resume默认不换provider（粘性）"
 
     def test_fresh_start_picks_idle(self, balance):
-        """DB provider为空（全新start/restart）→ 按空闲度分配最空闲的provider"""
-        balance.record("p-alpha", task_id=931)
-        balance.record("p-beta", task_id=932)
-        llm = self.FakeLLM(_cfg_tier_same())
+        """DB provider为空（全新start/restart）→ 优先选最空闲的"""
+        cfg = _cfg_tier_same()
+        balance.active_counts = lambda use_cache=True: {"p-alpha": 3, "p-beta": 2}
+        llm = self.FakeLLM(cfg)
         assert self._warmup(llm, "") == "p-gamma", "全新启动应选最空闲的provider"
 
     def test_sticky_unavailable_reselects_by_idle(self, balance):
         """粘性provider不可用（未启用）→ 落入空闲优先轮换"""
         cfg = _cfg_tier_same()
-        cfg.providers["p-alpha"].enable = False  # 粘性目标被禁用
-        balance.record("p-beta", task_id=941)  # p-beta被别处占用
+        cfg.providers["p-alpha"].enable = False
+        balance.active_counts = lambda use_cache=True: {"p-beta": 2}
         llm = self.FakeLLM(cfg)
-        assert self._warmup(llm, "p-alpha") == "p-gamma", "不可用时应换到空闲provider"
+        assert self._warmup(llm, "p-alpha") in ("p-gamma",), "不可用时应换最空闲的provider"
 
-    def test_explicit_at_provider_beats_rotation(self, balance):
-        """content显式@provider意图优先于轮换（事务#1793语义不变）"""
-        balance.record("p-beta", task_id=951)
-        balance.record("p-gamma", task_id=952)
+    def test_explicit_marker_beats_sticky_and_idle(self, balance):
+        """content显式@provider意图优先（与粘性/轮换都冲突时用户意图胜出）"""
         cfg = _cfg_tier_same()
         cfg.providers["p-beta"].icon = "🐱"
+        balance.active_counts = lambda use_cache=True: {"p-beta": 5}
         llm = self.FakeLLM(cfg)
-        # p-alpha虽有粘性但content显式@🐱(p-beta) → 显式意图优先
         assert self._warmup(llm, "p-alpha", content="@🐱 干活") == "p-beta"

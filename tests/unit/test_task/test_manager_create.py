@@ -374,7 +374,11 @@ class TestTaskDatabaseCreateTask:
 
         assert task_id == 500
         # 验证 INSERT 参数中包含 timer 值
-        insert_call = mock_conn.execute.call_args_list[0]
+        # 🔧 事务#2307：@标记会触发provider自动选择（同优先级轮换查DB活跃数），
+        # INSERT不再保证是第0个execute调用 → 按SQL关键字定位INSERT
+        insert_call = next(
+            c for c in mock_conn.execute.call_args_list if "INSERT" in str(c[0][0]).upper()
+        )
         insert_params = insert_call[0][1] if len(insert_call[0]) > 1 else ()
         # timer_int 应为 600（在 insert_values 元组中）
         assert 600 in insert_params
