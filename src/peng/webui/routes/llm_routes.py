@@ -163,6 +163,15 @@ async def get_llm_providers(detail: bool = False) -> dict[str, Any]:
         merged_config = _load_peng_json_merged()
         raw_providers: dict[str, dict] = merged_config.get("llm", {}).get("providers", {})
 
+        # 🔧 事务#2307：跨进程分配账本快照（同优先级轮换/空闲度），前端可显示
+        # 每个provider当前挂了多少活跃事务，验证"轮流使用"是否生效
+        try:
+            from peng.llm.provider_balance import get_provider_balance
+
+            balance_load = get_provider_balance().snapshot_summary()
+        except Exception:
+            balance_load = {}
+
         for name, prov_config in config.llm.providers.items():
             item = {
                 "name": name,
@@ -171,6 +180,8 @@ async def get_llm_providers(detail: bool = False) -> dict[str, Any]:
                 "icon": prov_config.icon,
                 "priority": prov_config.priority,
                 "is_current": name == config.llm.current_provider,
+                # 跨进程账本：该provider上的活跃分配数（0=空闲）
+                "active_tasks": balance_load.get(name, {}).get("active", 0),
             }
             if detail:
                 item.update(

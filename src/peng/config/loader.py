@@ -1258,54 +1258,121 @@ class LLMConfig(BaseModel):
     # 自动降级开关（当当前 provider 失败时，是否自动切换到下一个 provider）
     enable_fallback: bool = True
 
+    # 同优先级 provider 轮换开关（事务#2307，消息#10863）：
+    # True=优先级相同的多个provider按空闲度（跨进程分配账本）+LRU轮换排序，
+    # 新启动的事务优先选择比较空闲的provider；False=同tier保持配置顺序（旧行为）。
+    # 仅影响"自动选择"路径；显式 @provider / 锁定 / 粘性（resume）不受影响。
+    provider_rotation: bool = True
+
     # 允许锁定provider强制使用未启用的provider（不改变启用状态）
     allow_locked_disabled: bool = True
 
     # 发送给大模型的提示字符串（可通过配置文件实时修改）
     prompts: LLMPromptsConfig = Field(default_factory=LLMPromptsConfig)
 
-    def get_shifts(self) -> list[str]:
+    def _sort_providers_by_priority(
+        self, names: list[str], *, balanced: bool = True, task_id: int | None = None
+    ) -> list[str]:
+        """按priority降序排列，**同priority tier内按空闲度轮换排序**（事务#2307）
+
+        需求（消息#10863）：优先级相同的多个provider应该轮流使用，新启动的事务
+        优先选择比较空闲的provider。跨进程空闲度/LRU数据来自
+        ``peng.llm.provider_balance``（每进程账本文件聚合，无共享写争用）。
+
+        Args:
+            names: 待排序provider名称列表
+            balanced: False=纯priority排序（同tier保持传入顺序，旧行为）
+            task_id: 本事务id，用于"本进程已分配给自己的provider排最前"
+
+        Returns:
+            排序后的provider名称列表（tier间priority降序，tier内空闲优先+LRU）
+        """
+        if not names:
+            return []
+        tiers: dict[int, list[str]] = {}
+        for name in names:
+            prov_config = self.providers.get(name)
+            priority = prov_config.priority if prov_config else 0
+            tiers.setdefault(priority, []).append(name)
+        result: list[str] = []
+        for priority in sorted(tiers.keys(), reverse=True):
+            tier = tiers[priority]
+            if balanced and self.provider_rotation and len(tier) > 1:
+                try:
+                    from peng.llm.provider_balance import get_provider_balance
+
+                    tier = get_provider_balance().rank(tier, task_id=task_id)
+                except Exception as e:  # 账本异常不影响选择（退化为原顺序）
+                    logger.debug(f"[LLMConfig] provider轮换排序失败(退化原顺序): {e}")
+            result.extend(tier)
+        return result
+
+    def get_shifts(
+        self, *, balanced: bool = True, task_id: int | None = None
+    ) -> list[str]:
         """获取轮换列表（自动从 providers 中获取所有启用的且非vision-only的，按priority降序排序）
 
         不再需要手动配置 shifts 列表，自动从 llm.providers 中获取所有 enable=true 且 vision!="only" 的 provider。
-        排序规则：priority 越高，优先级越高，排在越前面。
+        排序规则：priority 越高，优先级越高，排在越前面；**同priority的provider
+        按空闲度轮换排序**（事务#2307，开关 llm.provider_rotation）。
         """
         enabled_providers = [
-            (p, config.priority)
+            p
             for p, config in self.providers.items()
             if config.enable and not config.is_vision_only()
         ]
-        # 按priority降序排序（priority越高，优先级越高）
-        enabled_providers.sort(key=lambda x: x[1], reverse=True)
-        return [p for p, _ in enabled_providers]
+        return self._sort_providers_by_priority(
+            enabled_providers, balanced=balanced, task_id=task_id
+        )
 
-    def _get_enabled_providers_sorted(self) -> list[str]:
+    def _get_enabled_providers_sorted(
+        self, *, balanced: bool = True, task_id: int | None = None
+    ) -> list[str]:
         """
         获取所有启用的provider列表（排除vision-only），按priority降序排序
 
         Returns:
-            启用的provider名称列表（不含vision-only），priority越高越靠前
+            启用的provider名称列表（不含vision-only），priority越高越靠前；
+            同priority按空闲度轮换排序（事务#2307）
         """
         enabled_providers = [
-            (p, config.priority)
+            p
             for p, config in self.providers.items()
             if config.enable and not config.is_vision_only()
         ]
-        # 按priority降序排序（priority越高，优先级越高）
-        enabled_providers.sort(key=lambda x: x[1], reverse=True)
-        return [p for p, _ in enabled_providers]
+        return self._sort_providers_by_priority(
+            enabled_providers, balanced=balanced, task_id=task_id
+        )
+
+    def _note_auto_assignment(self, provider: str, task_id: int | None) -> str:
+        """自动选择命中后登记跨进程分配（事务#2307）
+
+        仅自动选择路径登记：显式 @provider / 锁定的归属由调用方决定。
+        有 task_id 才登记（无事务归属的调用如UI展示不污染账本）。
+        """
+        if provider and task_id is not None and self.provider_rotation:
+            try:
+                from peng.llm.provider_balance import get_provider_balance
+
+                get_provider_balance().record(provider, task_id=task_id)
+            except Exception as e:  # 账本失败不影响选择
+                logger.debug(f"[LLMConfig] provider分配登记失败(忽略): {e}")
+        return provider
 
     def _get_best_available_provider(
         self,
         forbidden: list[str] | None = None,
         prefer_vision: bool = False,
         min_context_tokens: int | None = None,
+        task_id: int | None = None,
     ) -> str | None:
         """
         获取当前最佳可用 provider（优先级最高且不在冷却中的）
 
         从 shifts 列表（已按 priority 降序排列）中找到第一个不在冷却中的 provider。
         如果所有 provider 都在冷却中，返回第一个（priority 最高的）。
+        **同优先级 tier 内按空闲度+LRU 轮换排序**（事务#2307，
+        开关 llm.provider_rotation），使优先级相同的多个 provider 轮流使用。
 
         Args:
             forbidden: 禁止使用的provider列表，这些provider会被跳过
@@ -1316,11 +1383,12 @@ class LLMConfig(BaseModel):
                 vision-only 的provider不参与（它们不支持普通LLM任务）。
             min_context_tokens: 估算的请求输入token数（事务#1807）。
                 上下文能力装不下当前请求的provider被跳过，防止切换后必然400。
+            task_id: 事务id（事务#2307）。传入时同tier按空闲度轮换排序并登记分配。
 
         Returns:
             最佳可用 provider 名称，如果没有可用 provider 则返回 None
         """
-        shifts = self.get_shifts()
+        shifts = self.get_shifts(task_id=task_id)
         if not shifts:
             return None
 
@@ -1362,10 +1430,10 @@ class LLMConfig(BaseModel):
                 continue
             failure_info = self._get_failure_info(candidate)
             if not failure_info:
-                return candidate
+                return self._note_auto_assignment(candidate, task_id)
             # 检查冷却时间是否已过
             if current_time - failure_info.last_failure_time > failure_info.cooldown:
-                return candidate
+                return self._note_auto_assignment(candidate, task_id)
 
         # 所有 provider 都在冷却中，选择冷却时间最短的（而非固定返回第一个）
         best_candidate = None
@@ -1386,7 +1454,7 @@ class LLMConfig(BaseModel):
         logger.warning(
             f"[LLMConfig] 所有 provider 都在冷却中，使用冷却时间最短的: {best_candidate}"
         )
-        return best_candidate
+        return self._note_auto_assignment(best_candidate, task_id)
 
     def get_min_cooldown_remaining(self) -> float:
         """获取所有provider中最短的剩余冷却时间（秒）
@@ -2026,6 +2094,7 @@ class LLMConfig(BaseModel):
                 forbidden=forbidden,
                 prefer_vision=prefer_vision,
                 min_context_tokens=min_context_tokens,
+                task_id=task_id,
             )
             auto_selected = True
         else:
@@ -2038,7 +2107,7 @@ class LLMConfig(BaseModel):
             else:
                 # 所有favorites都被禁止，使用自动选择
                 target_provider = self._get_best_available_provider(
-                    forbidden=forbidden, min_context_tokens=min_context_tokens
+                    forbidden=forbidden, min_context_tokens=min_context_tokens, task_id=task_id
                 )
                 auto_selected = True
 
@@ -2087,7 +2156,7 @@ class LLMConfig(BaseModel):
                 if current_time - failure_info.last_failure_time <= failure_info.cooldown:
                     # 还在冷却中，强制切换到下一个 provider（全部失败也要换一个返回！）
                     fallback = self._get_best_available_provider(
-                        forbidden=forbidden, min_context_tokens=min_context_tokens
+                        forbidden=forbidden, min_context_tokens=min_context_tokens, task_id=task_id
                     )
                     if fallback and fallback in self.providers:
                         logger.warning(f"[LLMConfig] {target_provider}在冷却中，切换到: {fallback}")

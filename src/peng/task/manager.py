@@ -552,6 +552,11 @@ class TaskManager(metaclass=MetaSingleton):
                 "report": "",
                 "heartbeat_at": datetime.now().isoformat(),
                 "started_at": datetime.now().isoformat(),
+                # 🔧 事务#2307（消息#10863）：全新重启清除粘性provider记录，让新进程
+                # 按"同优先级空闲优先+LRU轮换"重新分配（restart/start优先选比较空闲
+                # 的provider）；content显式@provider的用户意图保留。resume（保留上下文）
+                # 走上面分支不清除——继续运行的事务默认不换provider，除非不可用。
+                "provider": self.db._parse_provider_from_content(task.get("content") or ""),
             }
 
         success = self.db.update_task(task_id, **update_kwargs)

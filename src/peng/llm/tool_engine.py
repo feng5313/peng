@@ -3976,6 +3976,18 @@ class ToolExecutionEngine:
                 # 自动选择会污染self.provider，导致chat_stream锁定语法失效）
                 warmup_task = self.task_manager.get_task(task_id)
                 warmup_content = warmup_task.get("content") if warmup_task else None
+                # 🔧 事务#2307（消息#10863）：resume继续运行的事务默认不换provider。
+                # task.provider 是粘性记录（chat_stream 每次选中provider都会写回），
+                # 进程重启后先恢复到client，get_provider"没有出错就不切换"原则自然
+                # 保持原provider；仅当它不可用（未启用/冷却/能力不足）才按空闲度
+                # 轮换重选。全新重启(keep_context=False)/start时manager已清除粘性，
+                # content显式@provider意图由下面的content解析路径优先决定。
+                sticky_provider = (warmup_task or {}).get("provider") or ""
+                if sticky_provider and sticky_provider in self.llm.config.providers:
+                    self.llm.provider = sticky_provider
+                    logger.info(
+                        f"[ToolEngine] 事务#{task_id} 恢复粘性provider: {sticky_provider}"
+                    )
                 self.llm.refresh_provider_vars(content=warmup_content + history.get_system())
             except Exception as e:
                 logger.debug(f"[ToolEngine] provider临时变量预热失败(忽略): {e}")
