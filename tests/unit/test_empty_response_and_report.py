@@ -10,6 +10,9 @@
 """
 
 import ast
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 import pytest
 
@@ -140,7 +143,7 @@ class TestToolEngineEmptyResponseSource:
 
     def test_empty_retry_branch_sets_should_complete_false(self):
         """空响应 <=2 分支必须包含 should_complete = False 赋值"""
-        source = open("src/peng/llm/tool_engine.py", encoding="utf-8").read()
+        source = open(_PROJECT_ROOT / "src/peng/llm/tool_engine.py", encoding="utf-8").read()
         branch = self._load_branch(source)
         found = any(
             isinstance(stmt, ast.Assign)
@@ -155,7 +158,7 @@ class TestToolEngineEmptyResponseSource:
 
     def test_empty_retry_branch_writes_system_output(self):
         """空响应 <=2 分支应写入系统提示（用户可见）"""
-        source = open("src/peng/llm/tool_engine.py", encoding="utf-8").read()
+        source = open(_PROJECT_ROOT / "src/peng/llm/tool_engine.py", encoding="utf-8").read()
         branch = self._load_branch(source)
         found = any(
             isinstance(node, ast.Call)
@@ -168,7 +171,7 @@ class TestToolEngineEmptyResponseSource:
     def test_compact_branch_still_sets_should_complete_false(self):
         """compact分支（原有逻辑）仍设置 should_complete = False，未被本次修改破坏"""
 
-        source = open("src/peng/llm/tool_engine.py", encoding="utf-8").read()
+        source = open(_PROJECT_ROOT / "src/peng/llm/tool_engine.py", encoding="utf-8").read()
         tree = ast.parse(source)
         found = False
         for node in ast.walk(tree):

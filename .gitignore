@@ -68,6 +68,14 @@ parts2/
 nest.json
 test_large_file.py
 
+# 🔧 事务#2402：项目根散落的调试截图/临时图像（窗口截屏、UI状态图等
+# 调试会话产物，曾随 auto 提交误入库；根锚定不影响 res/、static/ 等子目录合法资源）
+/*.bmp
+/*.png
+/*.jpg
+/*.jpeg
+/*.webp
+
 # Debug scripts
 debug_*.py
 check_config.py

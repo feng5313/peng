@@ -7,7 +7,11 @@
 content用content_dead_loop_threshold(8)。
 """
 
+from pathlib import Path
+
 from peng.llm.tool_engine import ToolExecutionEngine
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 PHRASE = "these are all independent so I'll batch them together now — "
@@ -167,7 +171,7 @@ class TestRepeatedPhraseConfig:
         """config/peng.json llm段含repeated_phrase_maxlen=256"""
         import json
 
-        cfg = json.load(open("config/peng.json", encoding="utf-8"))
+        cfg = json.load(open(_PROJECT_ROOT / "config/peng.json", encoding="utf-8"))
         assert cfg["llm"]["repeated_phrase_maxlen"] == 256
 
 

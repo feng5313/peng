@@ -264,7 +264,11 @@ def _manifest_file(task_id: int) -> Path:
 
 
 def manifest_add(task_id: int, file_paths: list[str]) -> None:
-    """累积记录本事务 external 备份的文件路径（并集；原子写，失败仅日志）"""
+    """累积记录本事务 external 备份的文件路径（并集；原子写，失败仅日志）
+
+    🔧 事务#2402：兜底剔除 Windows 保留设备名（nul 等——上游过滤漏网时
+    也不会写成永久死条目：设备名 check_changes 恒报变更、恢复恒跳过）。
+    """
     if not task_id or not file_paths:
         return
     try:
@@ -280,6 +284,8 @@ def manifest_add(task_id: int, file_paths: list[str]) -> None:
                     existing = []
             seen = {ToolBackupManager._path_key(p) for p in existing}
             for fp in file_paths:
+                if _is_windows_device_path(fp):
+                    continue
                 k = ToolBackupManager._path_key(fp)
                 if k not in seen:
                     seen.add(k)
@@ -624,6 +630,57 @@ def _skip_reason_for_path(fp: str, is_dir: bool) -> str | None:
     if is_dir and not dir_backup_allowed_static(fp):
         return f"一级目录（整树复制规模失控风险） {fp}"
     return None
+
+
+# 🔧 事务#2402：Windows 保留设备名（basename 不区分大小写，允许带扩展名——
+# "NUL.txt" 在 Windows 上同样落入设备语义）。cmd 的 `2>nul` 重定向目标会被
+# 命令解析收集为"写入路径"，且设备名 os.path.exists 恒真（伪存在），存在性
+# 过滤拦不住——task#2332 的 D:/work/fcc/nul 就这样进了备份 manifest，
+# check_changes 恒报变更、回滚窗口永远显示"待恢复"。设备名不是普通文件，
+# 从提取源头到恢复全程剔除。
+_WINDOWS_DEVICE_STEMS = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{i}" for i in range(1, 10)}
+    | {f"lpt{i}" for i in range(1, 10)}
+)
+
+
+def _is_windows_device_path(path: str) -> bool:
+    """路径 basename（去扩展名）是否为 Windows 保留设备名（nul/con/com1…）"""
+    base = str(path).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    if not base:
+        return False
+    return base.split(".", 1)[0].lower() in _WINDOWS_DEVICE_STEMS
+
+
+def _is_workdir_ancestor(path: str, workdir: str) -> bool:
+    """path 是否为 workdir 本身或其祖先目录（归一化 + 大小写不敏感比较）
+
+    workdir 的祖先必然是目录（如 workdir D:/work/fcc 的父 D:/work），
+    绝不能进入 external 单文件备份/变更检测/恢复列表——task#2332 曾把
+    D:/work 收进 manifest：check_changes 对目录 git hash-object 必失败
+    → 恒报"已变更"；restore 的 git show 对 tree 基线成功 → open(目录,'wb')
+    抛 IsADirectoryError 中断整个恢复脚本。workdir 内容由 git 快照负责，
+    祖先目录一概不管（不备份、不检测、不恢复）。
+    """
+    if not path or not workdir:
+        return False
+    p_raw = str(path).replace("\\", "/")
+    w_raw = str(workdir).replace("\\", "/")
+    p = os.path.normpath(p_raw)
+    w = os.path.normpath(w_raw)
+    if not p or not w:
+        return False
+    # 相对路径无法与绝对 workdir 构成祖先关系（normpath 不解析盘符差异）；
+    # 绝对性用原始形态判定（posixpath.normpath("D:/")→"D:" 会丢失斜杠，
+    # ntpath.isabs("D:")=False，先 normpath 再判会把盘根误判为相对路径）
+    if _is_abs_cross_platform(p_raw) != _is_abs_cross_platform(w_raw):
+        return False
+    p_l = p.lower().rstrip("/")
+    w_l = w.lower().rstrip("/")
+    if not p_l or not w_l:
+        return False
+    return w_l == p_l or w_l.startswith(p_l + "/")
 
 
 def _strip_drive_rel(file_path: str) -> str:
@@ -1369,10 +1426,16 @@ class ToolBackupManager:
             file_paths, workdir, nest_name, scope
         )
         # 🔧 事务#2088：盘根路径不参与检测/预览/恢复（历史误备份基线兜底）
+        # 🔧 事务#2402：Windows 保留设备名（`2>nul` 的 nul 等）+ workdir
+        # 本身/祖先目录（如 workdir D:/work/fcc 的父 D:/work）不进备份——
+        # 前者存在性恒真过滤不掉，后者是目录：hash-object 必失败恒报变更，
+        # 恢复时 open(目录,'wb') 会炸掉整个恢复脚本
         return [
             fp for fp in kept
             if not ToolBackupManager._is_system_or_temp_path(fp)
             and not is_root_volume_path(fp)
+            and not _is_windows_device_path(fp)
+            and not _is_workdir_ancestor(fp, workdir)
         ]
 
     @staticmethod
@@ -1386,17 +1449,25 @@ class ToolBackupManager:
         )
 
     @staticmethod
-    def _filter_manifest_paths(file_paths: list[str]) -> list[str]:
+    def _filter_manifest_paths(
+        file_paths: list[str], workdir: str | None = None,
+    ) -> list[str]:
         """manifest 恢复集轻过滤：仅剔除系统路径/盘根/强制排除目录
 
         不剔 git 管理文件——manifest 是本事务显式备份的精确集合，不存在
         跨事务混入问题（🔧 事务#2107）。
+        🔧 事务#2402：新增剔除 Windows 保留设备名；提供 workdir 时同步剔除
+        workdir 本身/祖先目录（历史 manifest 的死条目——曾被误收的 D:/work
+        等一级目录：check_changes 对目录恒报变更、restore open(目录) 会炸，
+        读取侧过滤让存量脏数据自动失效，无需逐任务清洗）。
         """
         return [
             fp for fp in file_paths
             if not ToolBackupManager._is_system_or_temp_path(fp)
             and not is_root_volume_path(fp)
             and not _is_abs_path_excluded(fp)
+            and not _is_windows_device_path(fp)
+            and not (workdir and _is_workdir_ancestor(fp, workdir))
         ]
 
     @staticmethod
@@ -3073,7 +3144,7 @@ class ToolBackupManager:
                     ext_manifest = rollback_meta.get("external_manifest")
                     if ext_manifest:
                         abs_paths = ToolBackupManager._filter_manifest_paths(
-                            list(ext_manifest)
+                            list(ext_manifest), workdir,
                         )
                     else:
                         abs_paths = ExternalFileBackup.list_baseline_files(
@@ -3717,6 +3788,17 @@ class ToolBackupManager:
             # 备份它=备份全盘；workdir 内部路径不受影响——normpath 后不会是根）
             if is_root_volume_path(p):
                 continue
+            # 🔧 事务#2402：Windows 保留设备名不提取——cmd `2>nul` 的重定向
+            # 目标 nul 被 join(workdir) 成 .../nul 后，设备名在 Windows 上
+            # os.path.exists 恒真（伪存在），存在性过滤拦不住（task#2332
+            # 的 D:/work/fcc/nul 死条目来源）
+            if _is_windows_device_path(p):
+                continue
+            # 🔧 事务#2402：workdir 本身/祖先目录不提取（cp/mv 等动词参数里
+            # 的 D:/work 是目录——进 external 后 hash-object 恒失败误报变更，
+            # 恢复 open(目录,'wb') 会炸恢复脚本；workdir 内容归 git 快照管）
+            if workdir and _is_workdir_ancestor(p, workdir):
+                continue
             unique.append(p)
         existing = _paths_exist_batch(unique, nest_name)
         return [p for p in unique if p in existing]
@@ -3831,7 +3913,9 @@ class ToolBackupManager:
         try:
             ext_manifest = rollback_meta.get("external_manifest")
             if ext_manifest:
-                files = ToolBackupManager._filter_manifest_paths(list(ext_manifest))
+                files = ToolBackupManager._filter_manifest_paths(
+                    list(ext_manifest), rollback_meta.get("workdir"),
+                )
             else:
                 files = ExternalFileBackup.list_baseline_files(
                     task_id, ext_commit, nest_name=nest_name
@@ -5212,6 +5296,10 @@ class ExternalFileBackup:
             "    if seg_count(fp) == 0: continue\n"
             "    dr = drive_of(fp)\n"
             "    if not dr: continue\n"
+            # 🔧 事务#2402：目录不参与变更检测——git hash-object 对目录必失败
+            # （旧逻辑直接 append changed → workdir 父目录 D:/work 曾恒报
+            # "已变更"，回滚窗口永远把它列为待恢复文件）
+            "    if os.path.isdir(fp): continue\n"
             "    repo = repo_for(dr)\n"
             "    base = (spec or {}).get(dr) or 'HEAD'\n"
             "    rel = rel_of(fp)\n"
@@ -5221,7 +5309,9 @@ class ExternalFileBackup:
             "        continue\n"
             "    r = git(repo, 'hash-object', fp)\n"
             "    if r.returncode != 0:\n"
-            "        changed.append(fp); continue\n"
+            # 🔧 事务#2402：hash 失败（权限/特殊文件）≠ 已变更——旧逻辑恒
+            # append 会把无法比较的对象永久误标为"待恢复"，宁缺勿滥
+            "        continue\n"
             "    r2 = git(repo, 'rev-parse', base + ':' + rel)\n"
             "    if r2.returncode != 0 or r2.stdout.strip() != r.stdout.strip():\n"
             "        changed.append(fp)\n"
@@ -5244,18 +5334,33 @@ class ExternalFileBackup:
             f"files = {file_paths!r}\n"
             f"spec = {spec!r}\n"
             "restored = 0\n"
+            "skipped = 0\n"
             "for fp in files:\n"
             "    dr = drive_of(fp)\n"
             "    if not dr: continue\n"
+            # 🔧 事务#2402：目标是目录绝不写回——旧逻辑 git show 对 tree 基线
+            # （曾被整目录 copytree 备份的 D:/work 等）返回 ls-tree 文本且 rc=0，
+            # 随后 open(目录,'wb') 抛 IsADirectoryError 直接炸掉整个恢复脚本
+            "    if os.path.isdir(fp): skipped += 1; continue\n"
             "    repo = repo_for(dr)\n"
             "    base = (spec or {}).get(dr)\n"
             "    if not base: continue\n"
-            "    r = git_bytes(repo, 'show', base + ':' + rel_of(fp))\n"
+            "    rel = rel_of(fp)\n"
+            "    r = git_bytes(repo, 'show', base + ':' + rel)\n"
             "    if r.returncode != 0: continue\n"
+            # 🔧 事务#2402：基线对象必须是 blob——tree/commit(gitlink) 的
+            # git show 同样 rc=0 但内容非文件字节，写回=制造垃圾文件
+            "    t = git(repo, 'cat-file', '-t', base + ':' + rel)\n"
+            "    if t.returncode == 0 and t.stdout.strip() != 'blob': skipped += 1; continue\n"
             "    os.makedirs(os.path.dirname(fp), exist_ok=True)\n"
-            "    with open(fp, 'wb') as f: f.write(r.stdout)\n"
+            "    try:\n"
+            "        with open(fp, 'wb') as f: f.write(r.stdout)\n"
+            "    except OSError:\n"
+            # 🔧 事务#2402：单文件失败（占用/权限）不中断整批恢复
+            "        skipped += 1; continue\n"
             "    restored += 1\n"
             "out['restored'] = restored\n"
+            "out['skipped'] = skipped\n"
             "print(json.dumps(out))\n"
         )
         data = ExternalFileBackup._remote_run(nest_name, py, timeout=90)
@@ -5680,6 +5785,11 @@ class ExternalFileBackup:
                 # 🔧 事务#2088：盘根路径不参与变更检测（防 hash-object 失败误报）
                 if is_root_volume_path(fp):
                     continue
+                # 🔧 事务#2402：目录/Windows保留设备名不参与检测——目录
+                # hash-object 必失败（旧逻辑恒 append changed 误报"待恢复"），
+                # 设备名（nul等）os.path.exists 恒真但非普通文件
+                if os.path.isdir(fp) or _is_windows_device_path(fp):
+                    continue
                 repo, repo_key, base = ExternalFileBackup._resolve_base(task_id, fp, commit_hash)
                 if base is None:
                     # 基线 dict 缺该仓库条目 → 视为新增文件
@@ -5707,7 +5817,8 @@ class ExternalFileBackup:
                     timeout=5,
                 )
                 if result.returncode != 0:
-                    changed.append(fp)  # 无法判断，保守认为有变化
+                    # 🔧 事务#2402：无法 hash（权限/特殊文件）≠ 有变化——
+                    # 恒 append 会把无法比较的对象永久误标为"待恢复"
                     continue
                 current_hash = result.stdout.strip()
 
@@ -5759,10 +5870,27 @@ class ExternalFileBackup:
             restored = 0
 
             for fp in file_paths:
+                # 🔧 事务#2402：目标是目录/Windows保留设备名绝不写回——
+                # 目录 open(wb) 抛 IsADirectoryError 中断整批恢复；tree 基线
+                # （曾整目录 copytree 的 D:/work 等）git show rc=0 返回的
+                # 是 ls-tree 文本而非文件字节
+                if os.path.isdir(fp) or _is_windows_device_path(fp):
+                    logger.warning(f"外部文件恢复: 跳过非普通文件 {fp}")
+                    continue
                 repo, repo_key, source = ExternalFileBackup._resolve_base(task_id, fp, commit_hash)
                 if source is None:
                     continue  # 基线 dict 缺该仓库条目：无备份可恢复
                 rel = ExternalFileBackup._repo_rel(fp, repo_key)
+
+                # 🔧 事务#2402：基线对象必须是 blob（tree/gitlink 的 git show
+                # 同样成功但内容非文件字节，写回=制造垃圾）
+                tcheck = subprocess.run(
+                    ["git", "cat-file", "-t", f"{source}:{rel}"],
+                    cwd=repo, capture_output=True, text=True, timeout=5,
+                )
+                if tcheck.returncode == 0 and tcheck.stdout.strip() != "blob":
+                    logger.warning(f"外部文件恢复: 基线非blob，跳过 {source}:{rel}")
+                    continue
 
                 # 用 git show 直接从 commit 读取文件内容，不污染工作树
                 result = subprocess.run(
@@ -5776,8 +5904,13 @@ class ExternalFileBackup:
                     continue
 
                 Path(os.path.dirname(fp)).mkdir(parents=True, exist_ok=True)
-                with open(fp, "wb") as f:
-                    f.write(result.stdout)
+                try:
+                    with open(fp, "wb") as f:
+                        f.write(result.stdout)
+                except OSError as e:
+                    # 🔧 事务#2402：单文件失败（占用/权限）不中断整批恢复
+                    logger.warning(f"外部文件恢复: 写入失败跳过 {fp}: {e}")
+                    continue
                 restored += 1
 
             logger.info(
@@ -5966,7 +6099,10 @@ class ExternalFileBackup:
         try:
             if manifest:
                 # 精确恢复集：轻过滤（系统路径/盘根/排除目录，不剔 git）
-                abs_paths = ToolBackupManager._filter_manifest_paths(list(manifest))
+                # 🔧 事务#2402：传 workdir 剔除祖先目录死条目（D:/work 等）
+                abs_paths = ToolBackupManager._filter_manifest_paths(
+                    list(manifest), workdir,
+                )
             else:
                 abs_paths = ExternalFileBackup.list_baseline_files(
                     task_id, commit_spec, nest_name
