@@ -326,3 +326,48 @@ class TestSnapshotTransientGuard:
         )
         assert m2 == {"type": "git", "commit_hash": "abc123"}
         assert state["n"] == 2  # 第二次真的执行了（没被缓存挡住）
+
+
+class TestNoBaselineGuard:
+    """🔧 事务#2402 追加：无基线/基线键失配的文件不报"变更"（#2354 P盘误报）
+
+    显示必须与恢复一致：restore 无基线 git show 失败跳过 → 检测也不得
+    把这些文件列为"待恢复变更"（旧逻辑视为新增恒报：P盘32文件误报源头）。
+    """
+
+    def test_missing_repo_key_not_reported(self, default_repo, tmp_path):
+        """基线 dict 缺仓库条目（备份从未成功）→ 不报变更"""
+        f = tmp_path / "proj" / "d.txt"
+        f.parent.mkdir(parents=True)
+        f.write_text("v1", encoding="utf-8")
+        ExternalFileBackup.backup(997001, [str(f)], "l1")  # 默认仓库(key='')
+        # 模拟：spec 只有别的盘符条目，缺 ''（默认仓库）条目
+        changed = ExternalFileBackup.check_changes(
+            997001, [str(f)], {"X": "deadbeef"}, strict_baseline=True
+        )
+        assert changed == []
+
+    def test_case_drift_key_not_reported(self, default_repo, tmp_path):
+        """路径大小写形态漂移（git仓库键大小写敏感）→ 不报变更
+
+        备份时 X.txt（仓库键 .../X.txt），检测传 x.txt：hash 成功但基线
+        无 .../x.txt 键 → 恢复也会跳过 → 不显示。
+        """
+        import os
+        f = tmp_path / "proj" / "X.txt"
+        f.parent.mkdir(parents=True)
+        f.write_text("v1", encoding="utf-8")
+        commit = ExternalFileBackup.backup(997001, [str(f)], "l1")
+        # 构造小写同名不同内容文件（Windows 上不可行，跳过——仅 POSIX 测）
+        if os.path.exists(str(f).replace("X.txt", "x.txt")):
+            pytest.skip("大小写不敏感文件系统")
+        f2 = tmp_path / "proj" / "x.txt"
+        f2.write_text("DIFFERENT", encoding="utf-8")
+        changed = ExternalFileBackup.check_changes(
+            997001, [str(f2)], commit, strict_baseline=True
+        )
+        # 默认模式（非恢复集）保留 #2107 旧语义：基线无键 → 报"新增"
+        assert ExternalFileBackup.check_changes(
+            997001, [str(f2)], commit
+        ) == [str(f2)]
+        assert changed == []

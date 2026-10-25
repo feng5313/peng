@@ -1823,7 +1823,7 @@ class ToolBackupManager:
                 ext_commit = rollback_meta.get("external_backup_commit")
                 changed = ExternalFileBackup.check_changes(
                     int(rollback_meta.get("task_id", 0) or 0), ext_files, ext_commit,
-                    nest_name=nest_name,
+                    nest_name=nest_name, strict_baseline=True,
                 )
                 if not changed:
                     return None
@@ -1890,7 +1890,7 @@ class ToolBackupManager:
                 if external_files:
                     ext_changed = ExternalFileBackup.check_changes(
                         rollback_meta.get("task_id", 0), external_files,
-                        nest_name=nest_name,
+                        nest_name=nest_name, strict_baseline=True,
                     )
                     if ext_changed:
                         rollback_meta["changed_files"] = ext_changed
@@ -1932,7 +1932,7 @@ class ToolBackupManager:
             if external_files:
                 ext_changed = ExternalFileBackup.check_changes(
                     rollback_meta.get("task_id", 0), external_files,
-                    nest_name=nest_name,
+                    nest_name=nest_name, strict_baseline=True,
                 )
                 if ext_changed:
                     rollback_meta["changed_files"] = rollback_meta["changed_files"] + ext_changed
@@ -2096,7 +2096,7 @@ class ToolBackupManager:
             if external_files:
                 ext_changed = ExternalFileBackup.check_changes(
                     rollback_meta.get("task_id", 0), external_files,
-                    nest_name=nest_name,
+                    nest_name=nest_name, strict_baseline=True,
                 )
                 if ext_changed:
                     rollback_meta["changed_files"] = ext_changed
@@ -2121,7 +2121,8 @@ class ToolBackupManager:
         external_files = rollback_meta.get("external_files", [])
         if external_files:
             ext_changed = ExternalFileBackup.check_changes(
-                rollback_meta.get("task_id", 0), external_files, nest_name=nest_name
+                rollback_meta.get("task_id", 0), external_files,
+                nest_name=nest_name, strict_baseline=True,
             )
             if ext_changed:
                 rollback_meta["changed_files"] = rollback_meta["changed_files"] + ext_changed
@@ -3226,7 +3227,8 @@ class ToolBackupManager:
                             abs_paths, workdir, nest_name
                         )
                     if abs_paths and ExternalFileBackup.check_changes(
-                        task_id, abs_paths, ext_head, nest_name=nest_name
+                        task_id, abs_paths, ext_head, nest_name=nest_name,
+                        strict_baseline=True,
                     ):
                         ext_changed_flag = True
                 except Exception as e:
@@ -3245,7 +3247,8 @@ class ToolBackupManager:
                 rollback_meta["external_files"] = external_files
             ext_commit = rollback_meta.get("external_backup_commit")
             if external_files and ExternalFileBackup.check_changes(
-                task_id, external_files, ext_commit, nest_name=nest_name
+                task_id, external_files, ext_commit, nest_name=nest_name,
+                strict_baseline=True,
             ):
                 ext_changed_flag = True
 
@@ -3999,7 +4002,8 @@ class ToolBackupManager:
             if not files:
                 return result
             changed = ExternalFileBackup.check_changes(
-                task_id, files, ext_commit, nest_name=nest_name
+                task_id, files, ext_commit, nest_name=nest_name,
+                strict_baseline=True,
             )
             if changed:
                 result["changed_files"] = list(result.get("changed_files") or []) + changed
@@ -5360,14 +5364,19 @@ class ExternalFileBackup:
     def _remote_check_changes(
         nest_name: str, task_id: int, file_paths: list[str],
         commit_spec: str | dict[str, str] | None,
+        strict_baseline: bool = False,
     ) -> list[str]:
-        """远程变更检测：逐文件 hash-object 对比基线（nest端），单次HTTP"""
+        """远程变更检测：逐文件 hash-object 对比基线（nest端），单次HTTP
+
+        strict_baseline 语义见 check_changes（恢复集模式：无基线跳过）。
+        """
         if not file_paths:
             return []
         spec = commit_spec if isinstance(commit_spec, dict) else None
         py = ExternalFileBackup._remote_py_head(task_id) + (
             f"files = {file_paths!r}\n"
             f"spec = {spec!r}\n"
+            f"strict = {bool(strict_baseline)!r}\n"
             "changed = []\n"
             "for fp in files:\n"
             # 🔧 事务#2088：盘根路径不参与变更检测（历史误备份数据兜底）
@@ -5379,7 +5388,18 @@ class ExternalFileBackup:
             # "已变更"，回滚窗口永远把它列为待恢复文件）
             "    if os.path.isdir(fp): continue\n"
             "    repo = repo_for(dr)\n"
-            "    base = (spec or {}).get(dr) or 'HEAD'\n"
+            # 🔧 事务#2402：基线解析——恢复集模式（strict）下本事务 dict 基线
+            # 缺该盘符条目 = 该盘备份从未成功（如 task#2354 的 P:\.peng\backups
+            # 仓库不存在，32 个 P 盘文件 manifest 照记）→ 跳过，绝不 HEAD
+            # 兜底（共享仓库其他任务的 HEAD 当基线 → 恒报"变更"误导）；
+            # 默认模式保留旧语义（None/str 基线 → HEAD 兜底，缺键视为新增）
+            "    if spec is None:\n"
+            "        base = 'HEAD'\n"
+            "    else:\n"
+            "        base = spec.get(dr)\n"
+            "        if not base:\n"
+            "            if strict: continue\n"
+            "            base = 'HEAD'\n"
             "    rel = rel_of(fp)\n"
             "    if not os.path.exists(fp):\n"
             "        if git(repo, 'cat-file', '-e', base + ':' + rel).returncode == 0:\n"
@@ -5391,7 +5411,14 @@ class ExternalFileBackup:
             # append 会把无法比较的对象永久误标为"待恢复"，宁缺勿滥
             "        continue\n"
             "    r2 = git(repo, 'rev-parse', base + ':' + rel)\n"
-            "    if r2.returncode != 0 or r2.stdout.strip() != r.stdout.strip():\n"
+            "    if r2.returncode != 0:\n"
+            # 🔧 事务#2402：基线无此路径键（备份后路径大小写形态漂移——git
+            # 仓库键大小写敏感，c:/users/... vs 备份时 C:/Users/...；或该
+            # 文件实际未备份成功）——恢复集模式（strict）下恢复同样跳过，
+            # 显示与恢复一致不报；默认模式保留旧语义（视为新增）
+            "        if strict: continue\n"
+            "        changed.append(fp); continue\n"
+            "    if r2.stdout.strip() != r.stdout.strip():\n"
             "        changed.append(fp)\n"
             "out['changed'] = changed\n"
             "print(json.dumps(out))\n"
@@ -5836,6 +5863,7 @@ class ExternalFileBackup:
         task_id: int,
         file_paths: list[str],
         commit_hash: str | dict[str, str] | None = None,
+        strict_baseline: bool = False,
     ) -> list[str]:
         """检查外部文件是否有变化（🔧 按文件定位备份仓库，支持多仓库基线；本地执行）
 
@@ -5870,7 +5898,13 @@ class ExternalFileBackup:
                     continue
                 repo, repo_key, base = ExternalFileBackup._resolve_base(task_id, fp, commit_hash)
                 if base is None:
-                    # 基线 dict 缺该仓库条目 → 视为新增文件
+                    if strict_baseline:
+                        # 🔧 事务#2402：恢复集模式（manifest 来源）——基线缺条目
+                        # = 备份从未成功（manifest 照记的死条目），恢复同样跳过，
+                        # 显示与恢复一致：不能恢复的绝不列为"待恢复变更"
+                        # （task#2354 的 P 盘 32 文件误报源头）
+                        continue
+                    # 默认语义（#2107）：dict 缺仓库条目 → 视为新增文件
                     changed.append(fp)
                     continue
                 rel = ExternalFileBackup._repo_rel(fp, repo_key)
@@ -5909,7 +5943,12 @@ class ExternalFileBackup:
                     timeout=5,
                 )
                 if result.returncode != 0:
-                    # 基准commit中不存在 → 新增文件
+                    if strict_baseline:
+                        # 🔧 事务#2402：恢复集模式——基线无此路径键（路径大小写
+                        # 形态漂移，git 仓库键大小写敏感；或备份实际未成功）→
+                        # 恢复同样跳过，不显示
+                        continue
+                    # 默认语义：基准中不存在 → 新增文件
                     changed.append(fp)
                 elif result.stdout.strip() != current_hash:
                     changed.append(fp)
@@ -6061,8 +6100,14 @@ class ExternalFileBackup:
         file_paths: list[str],
         commit_hash: str | dict[str, str] | None = None,
         nest_name: str | None = None,
+        strict_baseline: bool = False,
     ) -> list[str]:
-        """检查外部文件是否有变化（本地+远程nest分派，多仓库基线兼容 str|dict|None）"""
+        """检查外部文件是否有变化（本地+远程nest分派，多仓库基线兼容 str|dict|None）
+
+        🔧 事务#2402：strict_baseline=True 为恢复集模式（files 来自累积
+        manifest）——无基线/基线键失配的文件跳过不报（显示与恢复一致，
+        恢复时它们同样被跳过）；默认 False 保留 #2107 语义（缺键视为新增）。
+        """
         if not file_paths:
             return []
         local_files, remote_files = ExternalFileBackup._split_local_remote(
@@ -6071,12 +6116,14 @@ class ExternalFileBackup:
         changed: list[str] = []
         if local_files:
             changed.extend(
-                ExternalFileBackup._check_changes_local(task_id, local_files, commit_hash)
+                ExternalFileBackup._check_changes_local(
+                    task_id, local_files, commit_hash, strict_baseline
+                )
             )
         if remote_files:
             changed.extend(
                 ExternalFileBackup._remote_check_changes(
-                    nest_name, task_id, remote_files, commit_hash
+                    nest_name, task_id, remote_files, commit_hash, strict_baseline
                 )
             )
         return changed

@@ -427,7 +427,7 @@ class TestIterationRollbackManifest:
         )
         checks = {}
 
-        def fake_check(task_id, files, commit, nest_name=None):
+        def fake_check(task_id, files, commit, nest_name=None, strict_baseline=False):
             checks["files"] = list(files)
             return ["/my/ext/f.txt"]
 
@@ -533,7 +533,7 @@ class TestIterationRollbackManifest:
         )
         monkeypatch.setattr(
             ExternalFileBackup, "check_changes",
-            staticmethod(lambda task_id, files, commit, nest_name=None: list(files)),
+            staticmethod(lambda task_id, files, commit, nest_name=None, strict_baseline=False: list(files)),
         )
         meta = self._meta(manifest=["/my/ext/f.txt"])
         result = ToolBackupManager.preview_rollback_diff_with_external(meta)
@@ -549,7 +549,7 @@ class TestLegacyMetaFallback:
         """旧工具快照 meta（无 policy）：external_files 全量 git 剔除保持"""
         checks = {}
 
-        def fake_check(task_id, files, commit, nest_name=None):
+        def fake_check(task_id, files, commit, nest_name=None, strict_baseline=False):
             checks["files"] = list(files)
             return []
 
@@ -573,7 +573,7 @@ class TestLegacyMetaFallback:
         """新 meta（workdir_scope）：外部 git 仓库文件保留检测"""
         checks = {}
 
-        def fake_check(task_id, files, commit, nest_name=None):
+        def fake_check(task_id, files, commit, nest_name=None, strict_baseline=False):
             checks["files"] = list(files)
             return []
 
