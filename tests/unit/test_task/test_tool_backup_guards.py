@@ -27,6 +27,7 @@ from peng.service import tool_backup
 from peng.service.tool_backup import (
     ExternalFileBackup,
     ToolBackupManager,
+    _SnapshotTransientError,
     _is_windows_device_path,
     _is_workdir_ancestor,
     manifest_add,
@@ -253,3 +254,75 @@ class TestLocalCheckRestore:
         n = ExternalFileBackup._restore_local(997001, [str(f)], commit)
         assert n == 1
         assert f.read_text(encoding="utf-8") == "v1"
+
+
+class TestSnapshotTransientGuard:
+    """🔧 事务#2402：快照临时失败不写粘性探测缓存（#2354 事故回归防护）
+
+    事故：epyc WebSocket 1006 瞬断 70ms 后重连，但快照失败被写入
+    _NON_GIT_WD_CACHE（600s TTL），后续 26 个迭代快照全部降级
+    history_only（无代码备份），回滚窗口全程不显示项目代码变更。
+    """
+
+    def test_transient_error_not_cached(self, monkeypatch):
+        monkeypatch.setattr(
+            ToolBackupManager, "_NON_GIT_WD_CACHE", {}, raising=False
+        )
+        calls = []
+
+        def fake_snapshot_git(*a, **kw):
+            calls.append(1)
+            raise _SnapshotTransientError("nest 'epyc' 未连接")
+
+        monkeypatch.setattr(
+            ToolBackupManager, "_snapshot_git", staticmethod(fake_snapshot_git)
+        )
+        meta = ToolBackupManager._snapshot_git_dispatch(
+            "D:/work/fcc", 1, "bash", {}, "m", "t", "epyc", [],
+        )
+        assert meta is None
+        # 关键：临时失败不写缓存——下轮快照会重试而非直接跳过
+        assert "D:/work/fcc" not in ToolBackupManager._NON_GIT_WD_CACHE
+
+    def test_real_non_git_cached(self, monkeypatch):
+        monkeypatch.setattr(
+            ToolBackupManager, "_NON_GIT_WD_CACHE", {}, raising=False
+        )
+
+        def fake_snapshot_git(*a, **kw):
+            return None  # 真"非git workdir"（rev-parse --git-dir failed）
+
+        monkeypatch.setattr(
+            ToolBackupManager, "_snapshot_git", staticmethod(fake_snapshot_git)
+        )
+        meta = ToolBackupManager._snapshot_git_dispatch(
+            "D:/work/plain", 1, "bash", {}, "m", "t", "epyc", [],
+        )
+        assert meta is None
+        # 确定性"非git"仍写缓存（防每轮白跑探测 HTTP）
+        assert "D:/work/plain" in ToolBackupManager._NON_GIT_WD_CACHE
+
+    def test_transient_then_retry_succeeds(self, monkeypatch):
+        """瞬态失败后下一轮成功：缓存未污染 → 重试后正常返回快照 meta"""
+        monkeypatch.setattr(
+            ToolBackupManager, "_NON_GIT_WD_CACHE", {}, raising=False
+        )
+        state = {"n": 0}
+
+        def fake_snapshot_git(*a, **kw):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise _SnapshotTransientError("命令行太长。")
+            return {"type": "git", "commit_hash": "abc123"}
+
+        monkeypatch.setattr(
+            ToolBackupManager, "_snapshot_git", staticmethod(fake_snapshot_git)
+        )
+        assert ToolBackupManager._snapshot_git_dispatch(
+            "D:/work/fcc", 1, "bash", {}, "m", "t", "epyc", [],
+        ) is None
+        m2 = ToolBackupManager._snapshot_git_dispatch(
+            "D:/work/fcc", 1, "bash", {}, "m", "t", "epyc", [],
+        )
+        assert m2 == {"type": "git", "commit_hash": "abc123"}
+        assert state["n"] == 2  # 第二次真的执行了（没被缓存挡住）

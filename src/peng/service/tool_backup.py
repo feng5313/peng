@@ -683,6 +683,17 @@ def _is_workdir_ancestor(path: str, workdir: str) -> bool:
     return w_l == p_l or w_l.startswith(p_l + "/")
 
 
+class _SnapshotTransientError(Exception):
+    """快照临时失败（网络断连/超时/命令行超限等非确定性错误）
+
+    🔧 事务#2402：与"workdir 非 git 仓库"（确定性，可缓存 600s）区分——
+    临时失败绝不写入 _NON_GIT_WD_CACHE，否则一次瞬断（如 epyc WebSocket
+    1006 断连 70ms 后重连）会让后续整个 TTL 窗口内所有迭代快照持续降级
+    history_only（task#2354 曾因 10:19 一次断连连降 26 个迭代，回滚窗口
+    全程无代码变更，文件备份保护裸奔 10 分钟）。
+    """
+
+
 def _strip_drive_rel(file_path: str) -> str:
     """绝对路径 → 备份仓库内相对路径（去根分隔符；Windows 盘符路径去盘符）
 
@@ -1230,10 +1241,20 @@ class ToolBackupManager:
             ts = ToolBackupManager._NON_GIT_WD_CACHE.get(workdir, 0)
             if time.time() - ts < ToolBackupManager._NON_GIT_WD_TTL:
                 return None
-            meta = ToolBackupManager._snapshot_git(
-                workdir, task_id, tool_name, tool_args, commit_msg, timestamp,
-                nest_name, internal_files,
-            )
+            try:
+                meta = ToolBackupManager._snapshot_git(
+                    workdir, task_id, tool_name, tool_args, commit_msg, timestamp,
+                    nest_name, internal_files,
+                )
+            except _SnapshotTransientError as e:
+                # 🔧 事务#2402：临时失败（网络断连/超时/命令行超限）不写
+                # 探测缓存——本次降级 history_only，下一轮快照自动重试；
+                # 写缓存会造成一次瞬断后整个 TTL 窗口持续降级（#2354 事故）
+                logger.warning(
+                    f"git快照临时失败（不缓存，下轮重试）task#{task_id} "
+                    f"({nest_name}) {workdir}: {e}"
+                )
+                return None
             if meta is None:
                 ToolBackupManager._NON_GIT_WD_CACHE[workdir] = time.time()
             else:
@@ -2369,6 +2390,19 @@ class ToolBackupManager:
         branch_name = f"{BACKUP_BRANCH_PREFIX}{task_id}"
         file_paths = ToolBackupManager._extract_file_paths(tool_name, tool_args, workdir)
 
+        # 🔧 事务#2402：internal_files 相对化瘦身——绝对路径（D:/work/fcc/x.cpp
+        # 平均数十字符）改为相对 workdir 的短路径，脚本端 join 还原；大事务
+        # 涉及文件多时曾撑爆 Windows cmd 8191 字符命令行限制（"命令行太长"
+        # →快照失败）。相对化平均缩短 60-80%，配合超长时丢列表重试双保险
+        wd_norm_key = os.path.normpath(str(workdir)).replace("\\", "/").rstrip("/").lower()
+        rel_files: list[str] = []
+        for fp in (internal_files or []):
+            fp_key = os.path.normpath(str(fp)).replace("\\", "/")
+            if fp_key.lower().startswith(wd_norm_key + "/"):
+                rel_files.append(fp_key[len(wd_norm_key) + 1:])
+            else:
+                rel_files.append(fp_key)  # 意外形态：原样保留（脚本端不 join）
+
         # 构建批量脚本：在远程nest上执行完整快照流程
         py_code = (
             "import subprocess, os, sys, json, uuid, shutil\n"
@@ -2376,7 +2410,9 @@ class ToolBackupManager:
             f"task_id = {task_id!r}\n"
             f"branch_name = {branch_name!r}\n"
             f"commit_msg = {commit_msg!r}\n"
-            f"internal_files = {list(internal_files or [])!r}\n"
+            f"_rel_files = {rel_files!r}\n"
+            # 相对路径还原为绝对路径（嵌套仓库识别需要向上找 .git）
+            "internal_files = [os.path.normpath(os.path.join(workdir, r)) for r in _rel_files]\n"
             f"excl_dirs = {sorted(_FORCE_EXCLUDE_DIR_NAMES)!r}\n"
             f"excl_prefixes = {_FORCE_EXCLUDE_DIR_PREFIXES!r}\n"
             f"result_data = {{}}\n"
@@ -2507,31 +2543,67 @@ class ToolBackupManager:
             "print(json.dumps(result_data))\n"
         )
 
+        # 🔧 事务#2402：精简版脚本（空 internal_files，嵌套识别降级）——
+        # "命令行太长"时用它重试，保住主快照（代码备份/回滚是核心功能）
+        py_code_without_nested = py_code.replace(
+            f"_rel_files = {rel_files!r}\n", "_rel_files = []\n", 1
+        )
+
         # 🔧 持久化增量索引跨快照复用（不删除）；首次可能全量，timeout 放宽
-        result = _run_python_remote(py_code, timeout=360, nest_name=nest_name)
-        if result.returncode != 0:
-            logger.warning(f"远程批量快照失败({nest_name}): {result.stderr[:200]}")
-            return None
+        # 🔧 事务#2402：①nest 瞬断（WebSocket 1006 断连后亚秒级重连）短重试
+        # 一次，避免一次断连废掉整个快照；②"命令行太长"（Windows cmd 8191
+        # 字符限制，脚本+internal_files 经 URL 传输）时丢弃 internal_files
+        # （嵌套仓库识别降级）重建脚本重试一次，保住主快照（代码备份/回滚）
+        result = None
+        for attempt, code in enumerate((py_code, py_code_without_nested)):
+            if attempt > 0:
+                logger.warning(
+                    f"远程批量快照重试（精简internal_files）({nest_name})"
+                )
+            result = _run_python_remote(code, timeout=360, nest_name=nest_name)
+            if result.returncode == 0:
+                break
+            err_txt = (result.stderr or "")[:200]
+            if attempt == 0 and (
+                "未连接" in err_txt or "关闭" in err_txt or "timeout" in err_txt.lower()
+            ):
+                # 瞬断重试（一次）
+                time.sleep(1.5)
+                result = _run_python_remote(code, timeout=360, nest_name=nest_name)
+                if result.returncode == 0:
+                    break
+            if attempt == 0 and "命令行太长" in err_txt:
+                continue  # 换精简脚本重试
+            break
+
+        if result is None or result.returncode != 0:
+            err_txt = (result.stderr if result else "")[:200] if result else ""
+            logger.warning(f"远程批量快照失败({nest_name}): {err_txt}")
+            # 🔧 事务#2402：网络/执行失败=临时错误，绝不写探测缓存（防一次
+            # 瞬断导致 TTL 内所有迭代快照持续降级 history_only，#2354 事故）
+            raise _SnapshotTransientError(f"远程执行失败: {err_txt}")
 
         try:
             data = json.loads(result.stdout.strip().split("\n")[-1])
         except (json.JSONDecodeError, IndexError):
             logger.warning(f"远程批量快照响应解析失败({nest_name}): {result.stdout[:200]}")
-            return None
+            raise _SnapshotTransientError("响应解析失败（远程输出异常）")
 
         if data.get("error"):
             err = str(data.get("error", ""))[:200]
             if "rev-parse --git-dir failed" in err:
                 # workdir 非 git 仓库：正常探测失败（external 备份路径接管），降噪
                 logger.debug(f"workdir非git，走备份仓库路径({nest_name}): {workdir}")
-            else:
-                logger.warning(f"远程批量快照git错误({nest_name}): {err}")
-            return None
+                return None
+            # 🔧 事务#2402：workdir 是 git 仓库但 git 操作失败（索引损坏/占用/
+            # 超时等）——非确定性，不缓存，下轮快照重试
+            logger.warning(f"远程批量快照git错误({nest_name}): {err}")
+            raise _SnapshotTransientError(f"git操作失败: {err}")
 
         commit_hash = data.get("commit_hash", "")
         if not commit_hash:
             logger.warning(f"远程批量快照未返回commit_hash({nest_name})")
-            return None
+            raise _SnapshotTransientError("未返回commit_hash")
 
         rollback_cmd = (
             f"git checkout {commit_hash[:8]} -- ."
@@ -3937,8 +4009,14 @@ class ToolBackupManager:
                 )
                 if rollback_meta.get("type") == "history_only":
                     # 有可展示的文件变更：置 success 让前端渲染变更区块
+                    # 🔧 事务#2402：保留"此快照无文件备份"警示——history_only
+                    # 快照本身无 workdir 代码快照（曾因 nest 瞬断批量降级），
+                    # 明示用户"项目代码不在本快照保护范围"而非笼统"无文件变更"
                     result["success"] = True
-                    result["message"] = f"外部/非git管理文件变更 {len(changed)} 个（见列表）"
+                    result["message"] = (
+                        f"⚠️ 本快照未含项目代码备份（快照创建时备份暂不可用，"
+                        f"仅上下文恢复）；外部/非git管理文件变更 {len(changed)} 个（见列表）"
+                    )
         except Exception as e:
             logger.debug(f"回滚预览外部文件变更检测失败(task#{task_id}): {e}")
         return result
