@@ -195,7 +195,7 @@ class ChecklistTool(Tool):
 **事务启动时必须调用此工具检查checklist，并随工作进展更新checklist。**
 常用功能：
 1. 读取：action=read（获取当前事务的checklist内容）
-2. 重写：action=write checklist_content progress=<0-100整数，必填>（重写checklist内容，同时更新事务总体进度，支持\\n换行符）
+2. 重写：action=write content progress=<0-100整数，必填>（重写checklist内容，同时更新事务总体进度，支持\\n换行符）
 3. 编辑：action=edit oldString newString [replaceAll] [progress=<0-100>，可选不填则保留当前进度]（编辑/替换checklist中部分内容）
 4. 查看其他事务：action=read id=<其他事务ID>（只读，不能修改其他事务的checklist）
 重要：write操作时必须提供progress参数（0-100整数，必填）；edit操作时progress可选（不填保留当前进度）。report工具要求progress=100时才允许汇报！
@@ -215,7 +215,7 @@ checklist 和待办事项无关的已完成且提交git的事项必须从checkli
                     "enum": ["read", "write", "edit"],
                     "description": "操作类型：read=读取检查清单，write=更新检查清单，edit=编辑检查清单（功能类似文件edit工具）",
                 },
-                "checklist_content": {
+                "content": {
                     "type": "string",
                     "description": "检查清单内容（write操作时必填，支持\\n换行符）",
                 },
@@ -246,7 +246,7 @@ checklist 和待办事项无关的已完成且提交git的事项必须从checkli
     async def execute(
         self,
         action: str,
-        checklist_content: str | None = None,
+        content: str | None = None,
         progress: Any = None,
         id: int | None = None,
         oldString: str | None = None,
@@ -259,7 +259,7 @@ checklist 和待办事项无关的已完成且提交git的事项必须从checkli
 
         Args:
             action: 操作类型（read/write/edit）
-            checklist_content: 检查清单内容（write时必填）
+            content: 检查清单内容（write时必填）
             progress: 事务总体进度 0-100（write/edit时可选）
             id: 事务ID（可选，不提供则操作当前事务；其他事务只读）
             oldString: 要替换的文本（edit时必填）
@@ -302,9 +302,9 @@ checklist 和待办事项无关的已完成且提交git的事项必须从checkli
                     summary = f"事务#{target_id}的检查清单：(未设置)"
                     display = summary
 
-                if checklist_content:
-                    summary += "\n checklist_content参数不为空，你是否正确设置了action参数？"
-                    display += "\n ⚠️ checklist_content参数不为空，你是否正确设置了action参数？"
+                if content:
+                    summary += "\n content参数不为空，你是否正确设置了action参数？"
+                    display += "\n ⚠️ content参数不为空，你是否正确设置了action参数？"
                 return DualOutput(summary=summary, display=display)
 
             elif action == "write":
@@ -314,10 +314,10 @@ checklist 和待办事项无关的已完成且提交git的事项必须从checkli
                         summary=f"❌ 无权修改事务#{target_id}的检查清单（只能修改自身事务）",
                         display=f"❌ 无权修改事务#{target_id}的检查清单（只能修改自身事务）",
                     )
-                if not checklist_content:
+                if not content:
                     return DualOutput(
-                        summary="❌ write操作需要提供checklist_content参数",
-                        display="❌ write操作需要提供checklist_content参数",
+                        summary="❌ write操作需要提供content参数",
+                        display="❌ write操作需要提供content参数",
                     )
                 parsed_progress = _parse_progress(progress)
                 if parsed_progress is None:
@@ -327,14 +327,14 @@ checklist 和待办事项无关的已完成且提交git的事项必须从checkli
                     )
                 progress = parsed_progress
                 # 处理转义换行符
-                checklist_content = checklist_content.replace("\\n", "\n")
+                content = content.replace("\\n", "\n")
                 success = task_manager.db.update_task(
-                    target_id, checklist=checklist_content, progress=progress
+                    target_id, checklist=content, progress=progress
                 )
                 if success:
                     summary = f"✅ 事务#{target_id}的检查清单已更新（进度: {progress}%）"
                     display = _format_markdown_for_display(
-                        checklist_content,
+                        content,
                         title=f"📋 事务#{target_id} 检查清单已更新（进度: {progress}%）",
                     )
                 else:
@@ -666,7 +666,9 @@ info字段必须是普通字符串格式，支持\\n换行符。
                 return cmd
 
             # 发送者标识（事务#2089）：接收方info中会显示 [来自 事务#N]
-            sender_tag = f"事务#{self.get_context('task_id')}" if self.get_context("task_id") else None
+            sender_tag = (
+                f"事务#{self.get_context('task_id')}" if self.get_context("task_id") else None
+            )
 
             # 根据info_string参数构建命令
             temp_file = None
