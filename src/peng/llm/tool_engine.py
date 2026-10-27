@@ -3642,12 +3642,12 @@ class ToolExecutionEngine:
 
     @staticmethod
     def _parse_compact_override(text: str) -> int | None:
-        """从文本中解析 @max=<number>[K|M] 指令
+        """从文本中解析 @compact=<number>[K|M] 指令
 
         支持格式：
-        - @max=128K   → 128 * 1024 = 131072
-        - @max=1M     → 1 * 1048576 = 1048576
-        - @max=300000 → 300000（无后缀=原值）
+        - @compact=128K   → 128 * 1024 = 131072
+        - @compact=1M     → 1 * 1048576 = 1048576
+        - @compact=300000 → 300000（无后缀=原值）
 
         如果有多个匹配，取最后一个（最新的）。
 
@@ -3766,7 +3766,7 @@ class ToolExecutionEngine:
         """获取有效的 compact_threshold：检查 @compact 指令覆盖
 
         每轮迭代开始时调用。查询事务最新 content 和所有 info（已读+未读）文本，
-        如果包含 @max=<number>[K|M] 则以此值替代 provider 的 compact_threshold。
+        如果包含 @compact=<number>[K|M] 则以此值替代 provider 的 compact_threshold。
 
         优先级：info 中最新的 > content 中的 > provider 默认值
 
