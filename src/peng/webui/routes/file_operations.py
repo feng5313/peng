@@ -827,9 +827,12 @@ class FileRestoreResponse(BaseModel):
 class ToolRollbackRequest(BaseModel):
     """工具调用回退请求"""
     rollback_meta: dict
-    # 🔧 True=只回滚文件，跳过对话上下文(history)恢复
-    # （用户在确认框取消勾选"恢复对话上下文"时置true）
-    skip_context: bool = False
+    # 🔧 回滚内容勾选框（事务#2476）：四个维度与确认窗口勾选框一一对应，
+    # True=回滚该维度内容（默认全True=全选），False=不回滚该维度
+    rollback_files: bool = True  # 工作目录文件
+    rollback_external: bool = True  # 外部文件（工作目录外）
+    rollback_checklist: bool = True  # checklist
+    rollback_context: bool = True  # 对话上下文(history)
 
 
 class ToolRollbackResponse(BaseModel):
@@ -1574,16 +1577,23 @@ async def tool_rollback(request: ToolRollbackRequest) -> ToolRollbackResponse:
         if not rollback_meta:
             return ToolRollbackResponse(success=False, message="缺少回滚元数据")
 
-        # 🔧 用户取消勾选"恢复对话上下文"：置None——
-        # ToolBackupManager.rollback 内部的 history 恢复（rollback_meta.get("history_commit")）
-        # 与 _detect_rollback_changes 的 history 变更检测均读该字段，置None即自然跳过。
-        # 注：pydantic v2 构造时已对 dict 字段浅拷贝隔离（request.rollback_meta ≠ 调用方
-        # dict），此处再显式拷贝一次副本：不依赖 pydantic 版本实现细节，语义上明确
-        # "传给 rollback 的是去掉 history_commit 的视图，持久化 meta 不受影响"
-        if request.skip_context and rollback_meta.get("history_commit"):
-            rollback_meta = dict(rollback_meta)
-            rollback_meta["history_commit"] = None
-            logger.info("用户选择跳过对话上下文恢复，仅回滚文件")
+        # 🔧 回滚内容勾选框（事务#2476）：四个维度勾选状态直传 rollback——
+        # 未勾选的维度不检测、不恢复（消息中如实汇报未回滚内容）
+        rollback_kwargs = dict(
+            rollback_files=request.rollback_files,
+            rollback_external=request.rollback_external,
+            rollback_checklist=request.rollback_checklist,
+            rollback_context=request.rollback_context,
+        )
+        unchecked = [k for k, v in rollback_kwargs.items() if not v]
+        if unchecked:
+            logger.info(
+                f"用户选择部分回滚（未勾选维度）: {'、'.join(unchecked)}"
+            )
+        if not any(rollback_kwargs.values()):
+            return ToolRollbackResponse(
+                success=False, message="未勾选任何回滚内容，请至少勾选一项"
+            )
 
         task_id = rollback_meta.get("task_id", 0)
 
@@ -1605,7 +1615,7 @@ async def tool_rollback(request: ToolRollbackRequest) -> ToolRollbackResponse:
 
         # 同步执行回滚（返回4元组：成功标志/消息/undo_meta/是否有实际变化）
         success, message, undo_meta, changed = await asyncio.to_thread(
-            ToolBackupManager.rollback, rollback_meta
+            ToolBackupManager.rollback, rollback_meta, **rollback_kwargs
         )
 
         # 🔧 无实际变化：不写回滚记录到output_manager（无回滚链接/撤销链接），

@@ -3057,14 +3057,32 @@ class ToolBackupManager:
             _run_python_remote(code, timeout=30, nest_name=nest_name)
 
     @staticmethod
-    def rollback(rollback_meta: dict[str, Any]) -> tuple[bool, str, dict | None, bool]:
+    def rollback(
+        rollback_meta: dict[str, Any],
+        *,
+        rollback_files: bool = True,
+        rollback_external: bool = True,
+        rollback_checklist: bool = True,
+        rollback_context: bool = True,
+    ) -> tuple[bool, str, dict | None, bool]:
         """执行回滚操作
 
         文件回滚（在 nest 上）和 history 恢复（在本地）完全独立。
 
-        🔧 无变化快速路径：回滚前动态预检测全部恢复对象（工作区tree/外部文件/
+        🔧 回滚内容勾选框（事务#2476）：四个维度独立控制——
+        工作目录文件/外部文件/checklist/上下文（与确认窗口勾选框一一对应，
+        默认全 True=全选）；未勾选的维度不检测、不恢复。
+
+        🔧 无变化快速路径：回滚前动态预检测所选恢复对象（工作区tree/外部文件/
         history/checklist），均无实际变化时不创建undo快照、不执行任何恢复操作，
         直接返回 changed=False（调用方据此跳过output记录与回滚链接生成）。
+
+        Args:
+            rollback_meta: 回滚元数据
+            rollback_files: 是否回滚工作目录文件（workdir 内文件）
+            rollback_external: 是否回滚外部文件（workdir 外文件）
+            rollback_checklist: 是否回滚 checklist
+            rollback_context: 是否回滚对话上下文
 
         Returns:
             (成功标志, 消息, undo_meta, 是否发生实际变化)
@@ -3077,19 +3095,35 @@ class ToolBackupManager:
         is_undo = tool_name.startswith("撤销:")
         is_iteration = tool_name == "iteration_start"
 
+        # 汇总未勾选的维度（消息中如实告知用户）
+        scope_labels = {
+            "files": "工作目录文件", "external": "外部文件",
+            "checklist": "checklist", "context": "上下文",
+        }
+        unchecked = [
+            scope_labels[k] for k, v in (
+                ("files", rollback_files), ("external", rollback_external),
+                ("checklist", rollback_checklist), ("context", rollback_context),
+            ) if not v
+        ]
+        skipped_msg = f"（未回滚：{'、'.join(unchecked)}）" if unchecked else ""
+
         try:
-            # 0. 🔧 回滚预检测：动态检测文件/history/checklist/外部文件实际变化，
-            #    并将检测到的精确变更清单合并进 rollback_meta
+            # 0. 🔧 回滚预检测：动态检测勾选维度（文件/history/checklist/外部文件）
+            #    实际变化，并将检测到的精确变更清单合并进 rollback_meta
             has_actual_changes = ToolBackupManager._detect_rollback_changes(
-                rollback_meta, workdir, nest_name, is_iteration
+                rollback_meta, workdir, nest_name, is_iteration,
+                rollback_files=rollback_files, rollback_external=rollback_external,
+                rollback_checklist=rollback_checklist, rollback_context=rollback_context,
             )
             if not has_actual_changes:
                 logger.info(
-                    f"回滚跳过(task#{task_id}): 文件/history/checklist/外部文件均无实际变化"
+                    f"回滚跳过(task#{task_id}): 所选维度均无实际变化{skipped_msg}"
                 )
-                return True, "无实际变化，跳过回滚", None, False
+                return True, f"所选维度均无实际变化，跳过回滚{skipped_msg}", None, False
 
-            # 1. 回滚前创建 undo 快照（文件+history，用于撤销）
+            # 1. 回滚前创建 undo 快照（文件+history，用于撤销；保持全量，
+            #    不随勾选变化——保证"撤销"永远可恢复完整状态）
             undo_meta = None
             if not is_undo:
                 undo_meta = ToolBackupManager._create_undo_snapshot(
@@ -3097,30 +3131,45 @@ class ToolBackupManager:
                 )
 
             # 2. 文件回滚（在事务的 nest 上执行）
-            if backup_type == "git":
-                success, msg = ToolBackupManager._rollback_git(rollback_meta, nest_name)
-            elif backup_type == "non_git":
-                success, msg = ToolBackupManager._rollback_non_git(rollback_meta, nest_name)
-            elif backup_type == "external":
-                # 🔧 非git workdir 快照：从备份仓库恢复涉及文件（初始设计）
-                ext_files = rollback_meta.get("external_files", [])
-                ext_commit = rollback_meta.get("external_backup_commit")
-                n = ExternalFileBackup.restore(
-                    task_id, ext_files, ext_commit, nest_name=nest_name
+            if not rollback_files and not rollback_external:
+                success, msg = True, "已跳过文件回滚"
+            elif backup_type == "git":
+                success, msg = ToolBackupManager._rollback_git(
+                    rollback_meta, nest_name,
+                    rollback_files=rollback_files, rollback_external=rollback_external,
                 )
-                success, msg = True, f"已从备份仓库恢复 {n} 个文件"
+            elif backup_type == "non_git":
+                success, msg = ToolBackupManager._rollback_non_git(
+                    rollback_meta, nest_name,
+                    rollback_files=rollback_files, rollback_external=rollback_external,
+                )
+            elif backup_type == "external":
+                if not rollback_external:
+                    success, msg = True, "已跳过外部文件回滚"
+                else:
+                    # 🔧 非git workdir 快照：从备份仓库恢复涉及文件（初始设计）
+                    ext_files = rollback_meta.get("external_files", [])
+                    ext_commit = rollback_meta.get("external_backup_commit")
+                    n = ExternalFileBackup.restore(
+                        task_id, ext_files, ext_commit, nest_name=nest_name
+                    )
+                    success, msg = True, f"已从备份仓库恢复 {n} 个文件"
             elif backup_type == "history_only":
                 # 仅 history 备份成功的迭代快照：只恢复上下文，不动文件
                 success, msg = True, "无文件快照，跳过文件回滚"
             else:
-                return False, f"未知的备份类型: {backup_type}", None
+                return False, f"未知的备份类型: {backup_type}", None, True
 
             if success:
-                # 3. history 恢复（在本地执行，与 nest 无关）
+                # 3. history 恢复（在本地执行，与 nest 无关）——
+                #    上下文/checklist 两维度均未勾选时整体不恢复
                 history_commit = rollback_meta.get("history_commit")
-                if history_commit:
+                if history_commit and (rollback_context or rollback_checklist):
                     ctx_msg = HistoryBackupManager.restore(
-                        task_id, history_commit, trim_tool_call=not is_undo and not is_iteration
+                        task_id, history_commit,
+                        trim_tool_call=not is_undo and not is_iteration,
+                        restore_context=rollback_context,
+                        restore_checklist=rollback_checklist,
                     )
                     if ctx_msg:
                         msg += f"，{ctx_msg}"
@@ -3129,7 +3178,7 @@ class ToolBackupManager:
                 # （🔧 多仓库：str=旧格式默认仓库；dict=各仓库基线；
                 #  🔧 事务#2107：有 manifest 时恢复集以其为准——本事务备份的
                 #  精确清单，防共享盘符仓库全量恢复混入他 task 文件）
-                if is_iteration:
+                if is_iteration and rollback_external:
                     ext_head = rollback_meta.get("external_head_commit")
                     if ext_head:
                         ext_restored = ExternalFileBackup.restore_all(
@@ -3159,7 +3208,7 @@ class ToolBackupManager:
                         else f"从备份 {undo_meta.get('backup_repo', '')} 恢复"
                     )
 
-            return success, msg, undo_meta if success else None, success
+            return success, msg + skipped_msg, undo_meta if success else None, success
         except Exception as e:
             logger.error(f"回滚失败: {e}", exc_info=True)
             return False, f"回滚失败: {e}", None, False
@@ -3170,10 +3219,15 @@ class ToolBackupManager:
         workdir: str,
         nest_name: str | None,
         is_iteration: bool,
+        *,
+        rollback_files: bool = True,
+        rollback_external: bool = True,
+        rollback_checklist: bool = True,
+        rollback_context: bool = True,
     ) -> bool:
-        """回滚预检测：检测全部恢复对象是否有实际变化，并填充精确变更清单
+        """回滚预检测：检测勾选维度是否有实际变化，并填充精确变更清单
 
-        检测项（与回滚实际恢复的对象一一对应）：
+        检测项（与回滚实际恢复的对象一一对应；🔧 未勾选的维度不检测）：
         1. 工作区文件（git tree / 备份仓库 tree 对比快照 commit）→
            更新 changed_files/added_files/backup_tree/current_tree
         2. 外部文件：迭代快照对 external_head_commit 基线全量对比；
@@ -3183,14 +3237,15 @@ class ToolBackupManager:
         检测失败时保守返回 True（宁可多回滚不可漏恢复）。
 
         Returns:
-            True=至少一项有实际变化（需要执行回滚）；False=全部无变化
+            True=勾选维度至少一项有实际变化（需要执行回滚）；False=全部无变化
         """
         backup_type = rollback_meta.get("type", "")
         task_id = int(rollback_meta.get("task_id", 0) or 0)
 
-        # 1. 工作区文件检测（git/non_git 均支持；检测结果合并进 rollback_meta）
+        # 1. 工作区文件检测（git/non_git 均支持；检测结果合并进 rollback_meta；
+        #    🔧 未勾选时跳过检测——changed_files 保留 meta 原值（仅信息用途））
         files_changed = False
-        if backup_type in ("git", "non_git"):
+        if rollback_files and backup_type in ("git", "non_git"):
             # 🔧 统一动态检测：工具快照与迭代快照均在回滚时检测精确变更清单
             # （链接生成时的旧检测已过时——后续轮次的新变更不在列表中）
             detected = ToolBackupManager.check_post_tool_changes(
@@ -3207,56 +3262,62 @@ class ToolBackupManager:
 
         # 2. 外部文件检测（对快照记录的基线commit比较，而非HEAD——undo备份会移动HEAD）
         ext_changed_flag = False
-        if is_iteration:
-            ext_head = rollback_meta.get("external_head_commit")
-            if ext_head:
-                try:
-                    # 🔧 事务#2107：优先 manifest（本事务备份文件的精确清单），
-                    # 轻过滤（不剔 git——外部/嵌套 git 仓库文件是合法备份对象）；
-                    # 旧 meta 无 manifest → ls-tree 全量 + 全量 git 剔除兜底
-                    ext_manifest = rollback_meta.get("external_manifest")
-                    if ext_manifest:
-                        abs_paths = ToolBackupManager._filter_manifest_paths(
-                            list(ext_manifest), workdir,
-                        )
-                    else:
-                        abs_paths = ExternalFileBackup.list_baseline_files(
-                            task_id, ext_head, nest_name=nest_name
-                        )
-                        abs_paths = ToolBackupManager._filter_baseline_files(
-                            abs_paths, workdir, nest_name
-                        )
-                    if abs_paths and ExternalFileBackup.check_changes(
-                        task_id, abs_paths, ext_head, nest_name=nest_name,
-                        strict_baseline=True,
-                    ):
-                        ext_changed_flag = True
-                except Exception as e:
-                    logger.debug(f"外部文件基线检测失败(task#{task_id}): {e}")
-        else:
-            external_files = rollback_meta.get("external_files", [])
-            # 🔧 事务#2088：旧 meta 可能含 git 管理文件（斜杠归一化 bug 时期的
-            # 误备份）——检测前过滤，防止误报变更/误恢复跨事务文件。
-            # 🔧 事务#2107：新 meta（workdir_scope）只剔除 workdir 仓库内文件，
-            # 外部/嵌套 git 仓库文件保留检测（它们有本事务 external 备份）
-            if external_files:
-                external_files = ToolBackupManager._filter_unbackupable(
-                    external_files, workdir, nest_name,
-                    scope=ToolBackupManager._meta_scope(rollback_meta),
-                )
-                rollback_meta["external_files"] = external_files
-            ext_commit = rollback_meta.get("external_backup_commit")
-            if external_files and ExternalFileBackup.check_changes(
-                task_id, external_files, ext_commit, nest_name=nest_name,
-                strict_baseline=True,
-            ):
-                ext_changed_flag = True
+        if rollback_external:
+            if is_iteration:
+                ext_head = rollback_meta.get("external_head_commit")
+                if ext_head:
+                    try:
+                        # 🔧 事务#2107：优先 manifest（本事务备份文件的精确清单），
+                        # 轻过滤（不剔 git——外部/嵌套 git 仓库文件是合法备份对象）；
+                        # 旧 meta 无 manifest → ls-tree 全量 + 全量 git 剔除兜底
+                        ext_manifest = rollback_meta.get("external_manifest")
+                        if ext_manifest:
+                            abs_paths = ToolBackupManager._filter_manifest_paths(
+                                list(ext_manifest), workdir,
+                            )
+                        else:
+                            abs_paths = ExternalFileBackup.list_baseline_files(
+                                task_id, ext_head, nest_name=nest_name
+                            )
+                            abs_paths = ToolBackupManager._filter_baseline_files(
+                                abs_paths, workdir, nest_name
+                            )
+                        if abs_paths and ExternalFileBackup.check_changes(
+                            task_id, abs_paths, ext_head, nest_name=nest_name,
+                            strict_baseline=True,
+                        ):
+                            ext_changed_flag = True
+                    except Exception as e:
+                        logger.debug(f"外部文件基线检测失败(task#{task_id}): {e}")
+            else:
+                external_files = rollback_meta.get("external_files", [])
+                # 🔧 事务#2088：旧 meta 可能含 git 管理文件（斜杠归一化 bug 时期的
+                # 误备份）——检测前过滤，防止误报变更/误恢复跨事务文件。
+                # 🔧 事务#2107：新 meta（workdir_scope）只剔除 workdir 仓库内文件，
+                # 外部/嵌套 git 仓库文件保留检测（它们有本事务 external 备份）
+                if external_files:
+                    external_files = ToolBackupManager._filter_unbackupable(
+                        external_files, workdir, nest_name,
+                        scope=ToolBackupManager._meta_scope(rollback_meta),
+                    )
+                    rollback_meta["external_files"] = external_files
+                ext_commit = rollback_meta.get("external_backup_commit")
+                if external_files and ExternalFileBackup.check_changes(
+                    task_id, external_files, ext_commit, nest_name=nest_name,
+                    strict_baseline=True,
+                ):
+                    ext_changed_flag = True
 
-        # 3. history + checklist 检测
+        # 3. history + checklist 检测（两维度均未勾选时不检测；
+        #    has_changes 按维度比较——上下文与 checklist 独立勾选）
         history_changed = False
         history_commit = rollback_meta.get("history_commit")
-        if history_commit and task_id:
-            history_changed = HistoryBackupManager.has_changes(task_id, history_commit)
+        if history_commit and task_id and (rollback_context or rollback_checklist):
+            history_changed = HistoryBackupManager.has_changes(
+                task_id, history_commit,
+                include_context=rollback_context,
+                include_checklist=rollback_checklist,
+            )
 
         return files_changed or ext_changed_flag or history_changed
 
@@ -3367,11 +3428,21 @@ class ToolBackupManager:
             return None
 
     @staticmethod
-    def _rollback_git(rollback_meta: dict[str, Any], nest_name: str | None) -> tuple[bool, str]:
+    def _rollback_git(
+        rollback_meta: dict[str, Any],
+        nest_name: str | None,
+        *,
+        rollback_files: bool = True,
+        rollback_external: bool = True,
+    ) -> tuple[bool, str]:
         """从git备份分支回退
 
         对于修改的文件：git checkout <commit> -- <files>
         对于新增的文件（快照后创建的）：直接删除
+
+        🔧 勾选框维度控制（事务#2476）：工作目录文件与外部文件独立恢复——
+        rollback_files=False 跳过 workdir checkout/删除；rollback_external=False
+        跳过外部文件恢复。
         """
         commit_hash = rollback_meta["commit_hash"]
         workdir = rollback_meta["workdir"]
@@ -3383,60 +3454,65 @@ class ToolBackupManager:
         checkout_files = [f for f in changed_files if f not in added_files]
 
         try:
-            if checkout_files:
-                result = _run_git(
-                    ["checkout", commit_hash, "--"] + checkout_files,
-                    cwd=workdir,
-                    timeout=30,
-                    nest_name=nest_name,
-                )
-                if result.returncode != 0:
-                    # checkout可能失败如果文件在commit tree中不存在（如删除的文件）
-                    # 尝试逐个checkout，跳过失败的
-                    for fp in checkout_files:
-                        _run_git(
-                            ["checkout", commit_hash, "--", fp],
-                            cwd=workdir,
-                            timeout=10,
-                            nest_name=nest_name,
-                        )
-
-            # 删除快照后新增的文件
+            total = 0
             deleted_count = 0
-            for fp in added_files:
-                fp_full = os.path.join(workdir, fp)
-                if _path_exists(fp_full, nest_name):
-                    if not nest_name or nest_name == "local":
-                        p = Path(fp_full)
-                        if p.is_file():
-                            p.unlink()
-                        elif p.is_dir():
-                            shutil.rmtree(str(p))
-                    else:
-                        code = (
-                            "import shutil, os\n"
-                            f"p = {fp_full!r}\n"
-                            "if os.path.isfile(p): os.unlink(p)\n"
-                            "elif os.path.isdir(p): shutil.rmtree(p)\n"
-                        )
-                        _run_python_remote(code, timeout=10, nest_name=nest_name)
-                    deleted_count += 1
+            if rollback_files:
+                if checkout_files:
+                    result = _run_git(
+                        ["checkout", commit_hash, "--"] + checkout_files,
+                        cwd=workdir,
+                        timeout=30,
+                        nest_name=nest_name,
+                    )
+                    if result.returncode != 0:
+                        # checkout可能失败如果文件在commit tree中不存在（如删除的文件）
+                        # 尝试逐个checkout，跳过失败的
+                        for fp in checkout_files:
+                            _run_git(
+                                ["checkout", commit_hash, "--", fp],
+                                cwd=workdir,
+                                timeout=10,
+                                nest_name=nest_name,
+                            )
 
-            total = len(checkout_files) + deleted_count
+                # 删除快照后新增的文件
+                for fp in added_files:
+                    fp_full = os.path.join(workdir, fp)
+                    if _path_exists(fp_full, nest_name):
+                        if not nest_name or nest_name == "local":
+                            p = Path(fp_full)
+                            if p.is_file():
+                                p.unlink()
+                            elif p.is_dir():
+                                shutil.rmtree(str(p))
+                        else:
+                            code = (
+                                "import shutil, os\n"
+                                f"p = {fp_full!r}\n"
+                                "if os.path.isfile(p): os.unlink(p)\n"
+                                "elif os.path.isdir(p): shutil.rmtree(p)\n"
+                            )
+                            _run_python_remote(code, timeout=10, nest_name=nest_name)
+                        deleted_count += 1
+
+                total = len(checkout_files) + deleted_count
+
             msg = f"已回退 {total} 个文件到 {commit_hash[:8]}"
             if deleted_count:
                 msg += f"（含删除 {deleted_count} 个新增文件）"
 
             # 恢复外部文件（在本地执行，与 nest 无关）
-            external_files = rollback_meta.get("external_files", [])
-            if external_files:
-                task_id = rollback_meta.get("task_id", 0)
-                ext_commit = rollback_meta.get("external_backup_commit")
-                ext_restored = ExternalFileBackup.restore(
-                    task_id, external_files, ext_commit, nest_name=nest_name
-                )
-                if ext_restored:
-                    msg += f"，恢复 {ext_restored} 个外部文件"
+            # （未勾选维度的提示由 rollback() 的 skipped_msg 统一拼接）
+            if rollback_external:
+                external_files = rollback_meta.get("external_files", [])
+                if external_files:
+                    task_id = rollback_meta.get("task_id", 0)
+                    ext_commit = rollback_meta.get("external_backup_commit")
+                    ext_restored = ExternalFileBackup.restore(
+                        task_id, external_files, ext_commit, nest_name=nest_name
+                    )
+                    if ext_restored:
+                        msg += f"，恢复 {ext_restored} 个外部文件"
 
             logger.info(f"git回退成功: {msg}")
             return True, msg
@@ -3444,19 +3520,29 @@ class ToolBackupManager:
             return False, f"git回退异常: {e}"
 
     @staticmethod
-    def _rollback_non_git(rollback_meta: dict[str, Any], nest_name: str | None) -> tuple[bool, str]:
+    def _rollback_non_git(
+        rollback_meta: dict[str, Any],
+        nest_name: str | None,
+        *,
+        rollback_files: bool = True,
+        rollback_external: bool = True,
+    ) -> tuple[bool, str]:
         """从非git备份仓库回退（🔧 worktree 模式：--work-tree checkout 恢复+删除新增；
         旧 mirror 模式兼容）
 
         changed_files 可能包含 workdir 内文件和 __external__/ 前缀的外部文件，
         需要分离处理。external_files 保存的是原始绝对路径，也需恢复。
+
+        🔧 勾选框维度控制（事务#2476）：rollback_files=False 跳过 workdir 文件
+        恢复（worktree checkout/mirror 复制/删除新增/全量同步）；rollback_external=False
+        跳过外部文件恢复（__external__/ 复制与 ExternalFileBackup）。
         """
         backup_repo = rollback_meta["backup_repo"]
         workdir = rollback_meta["workdir"]
         commit_hash = rollback_meta["commit_hash"]
         all_changed = rollback_meta.get("changed_files", []) or rollback_meta.get("file_paths", [])
         added_files = rollback_meta.get("added_files", [])
-        external_files = rollback_meta.get("external_files", [])
+        external_files = rollback_meta.get("external_files", []) if rollback_external else []
 
         # 分离 changed_files 中的 workdir 文件和外部文件
         wd_changed: list[str] = []
@@ -3469,9 +3555,11 @@ class ToolBackupManager:
         try:
             # 🔧 worktree 模式：checkout 到 workdir + 删除快照后新增文件（零镜像）
             if rollback_meta.get("repo_mode") == "worktree":
-                restored, deleted = ToolBackupManager._non_git_rollback_worktree(
-                    workdir, backup_repo, commit_hash, wd_changed, added_files, nest_name
-                )
+                restored, deleted = (0, 0)
+                if rollback_files:
+                    restored, deleted = ToolBackupManager._non_git_rollback_worktree(
+                        workdir, backup_repo, commit_hash, wd_changed, added_files, nest_name
+                    )
                 msg = f"已回退 {restored} 个文件到 {commit_hash[:8]}"
                 if deleted:
                     msg += f"（含删除 {deleted} 个新增文件）"
@@ -3494,7 +3582,7 @@ class ToolBackupManager:
 
             restored_count = 0
 
-            if wd_changed:
+            if rollback_files and wd_changed:
                 for fp in wd_changed:
                     src = f"{backup_repo}/{fp}"
                     dst = f"{workdir}/{fp}"
@@ -3545,31 +3633,32 @@ class ToolBackupManager:
                     if ext_restored:
                         restored_count = max(restored_count, ext_restored)
 
-            if not wd_changed and not external_files and not added_files:
+            if rollback_files and not wd_changed and not external_files and not added_files:
                 ToolBackupManager._sync_from_backup_repo(backup_repo, workdir, nest_name)
 
             # 删除快照后新增的文件（这些文件在快照时不存在）
             deleted_count = 0
-            for fp in added_files:
-                if fp.startswith("__external__/"):
-                    continue
-                fp_full = os.path.join(workdir, fp)
-                if _path_exists(fp_full, nest_name):
-                    if not nest_name or nest_name == "local":
-                        p = Path(fp_full)
-                        if p.is_file():
-                            p.unlink()
-                        elif p.is_dir():
-                            shutil.rmtree(str(p))
-                    else:
-                        code = (
-                            "import shutil, os\n"
-                            f"p = {fp_full!r}\n"
-                            "if os.path.isfile(p): os.unlink(p)\n"
-                            "elif os.path.isdir(p): shutil.rmtree(p)\n"
-                        )
-                        _run_python_remote(code, timeout=10, nest_name=nest_name)
-                    deleted_count += 1
+            if rollback_files:
+                for fp in added_files:
+                    if fp.startswith("__external__/"):
+                        continue
+                    fp_full = os.path.join(workdir, fp)
+                    if _path_exists(fp_full, nest_name):
+                        if not nest_name or nest_name == "local":
+                            p = Path(fp_full)
+                            if p.is_file():
+                                p.unlink()
+                            elif p.is_dir():
+                                shutil.rmtree(str(p))
+                        else:
+                            code = (
+                                "import shutil, os\n"
+                                f"p = {fp_full!r}\n"
+                                "if os.path.isfile(p): os.unlink(p)\n"
+                                "elif os.path.isdir(p): shutil.rmtree(p)\n"
+                            )
+                            _run_python_remote(code, timeout=10, nest_name=nest_name)
+                        deleted_count += 1
 
             total = restored_count + deleted_count
             msg = (
@@ -4007,6 +4096,9 @@ class ToolBackupManager:
             )
             if changed:
                 result["changed_files"] = list(result.get("changed_files") or []) + changed
+                # 🔧 事务#2476：外部文件变更独立字段（前端回滚确认窗口勾选框
+                # 联动——"外部文件"勾选框控制该区块显隐）
+                result["external_changed_files"] = list(changed)
                 result["message"] = (
                     (result.get("message") or "")
                     + f"；外部/非git管理文件变更 {len(changed)} 个"
@@ -4738,11 +4830,24 @@ class HistoryBackupManager:
             return False
 
     @staticmethod
-    def has_changes(task_id: int, history_commit: str) -> bool:
+    def has_changes(
+        task_id: int,
+        history_commit: str,
+        include_context: bool = True,
+        include_checklist: bool = True,
+    ) -> bool:
         """检测当前 task db 的 history/checklist 相对指定备份 commit 是否有实际变化
 
         回滚预检测使用：messages 与 checklist 均与备份时相同 → 回滚无意义。
         比较时剥离统计字段（_prompt_tokens 等），只看实质内容。
+
+        Args:
+            task_id: 事务ID
+            history_commit: 备份 commit hash
+            include_context: 是否检测对话上下文变化（🔧 勾选框维度控制：
+                用户取消勾选"上下文"时传 False，跳过 messages 比较）
+            include_checklist: 是否检测 checklist 变化（🔧 勾选框维度控制：
+                用户取消勾选"checklist"时传 False，跳过 checklist 比较）
 
         Returns:
             True=有实质变化（回滚会改变状态）；False=无变化或检测失败时保守返回True
@@ -4753,20 +4858,24 @@ class HistoryBackupManager:
             repo = HistoryBackupManager._get_history_repo(task_id)
 
             # 备份 commit 中的 context messages
-            r = subprocess.run(
-                ["git", "show", f"{history_commit}:context.json"],
-                cwd=repo, capture_output=True, text=True, timeout=10,
-            )
-            if r.returncode != 0:
-                return True  # 无备份内容，视为有变化（保守）
-            backup_messages = strip_context_stats(r.stdout)
+            backup_messages: str | None = None
+            if include_context:
+                r = subprocess.run(
+                    ["git", "show", f"{history_commit}:context.json"],
+                    cwd=repo, capture_output=True, text=True, timeout=10,
+                )
+                if r.returncode != 0:
+                    return True  # 无备份内容，视为有变化（保守）
+                backup_messages = strip_context_stats(r.stdout)
 
             # 备份 commit 中的 checklist
-            r = subprocess.run(
-                ["git", "show", f"{history_commit}:checklist.md"],
-                cwd=repo, capture_output=True, text=True, timeout=10,
-            )
-            backup_checklist = r.stdout if r.returncode == 0 else None
+            backup_checklist: str | None = None
+            if include_checklist:
+                r = subprocess.run(
+                    ["git", "show", f"{history_commit}:checklist.md"],
+                    cwd=repo, capture_output=True, text=True, timeout=10,
+                )
+                backup_checklist = r.stdout if r.returncode == 0 else None
 
             # 当前 task db 的 history/checklist
             from peng.task.manager import TaskManager
@@ -4775,23 +4884,27 @@ class HistoryBackupManager:
             task = tm.db.get_task(task_id)
             if not task:
                 return True
-            current_messages = (
-                strip_context_stats(task.get("context") or "")
-                if task.get("context")
-                else None
-            )
-            current_checklist = task.get("checklist", "") or ""
 
             # messages 比较（备份commit必有context.json；当前无context视为有变化）
-            if current_messages is None:
-                return True
-            if backup_messages != current_messages:
-                return True
+            if include_context:
+                current_messages = (
+                    strip_context_stats(task.get("context") or "")
+                    if task.get("context")
+                    else None
+                )
+                if current_messages is None:
+                    return True
+                if backup_messages != current_messages:
+                    return True
 
             # checklist 比较（备份无checklist.md时：当前非空即有变化）
-            if backup_checklist is None:
-                return bool(current_checklist)
-            return backup_checklist != current_checklist
+            if include_checklist:
+                current_checklist = task.get("checklist", "") or ""
+                if backup_checklist is None:
+                    return bool(current_checklist)
+                if backup_checklist != current_checklist:
+                    return True
+            return False
         except Exception as e:
             logger.debug(f"history变更检测失败(task#{task_id}): {e}")
             return True  # 检测异常保守视为有变化
@@ -4801,6 +4914,8 @@ class HistoryBackupManager:
         task_id: int,
         history_commit: str,
         trim_tool_call: bool = False,
+        restore_context: bool = True,
+        restore_checklist: bool = True,
     ) -> str:
         """从本地 git 仓库恢复 history context 到 task db
 
@@ -4808,6 +4923,10 @@ class HistoryBackupManager:
             task_id: 事务ID
             history_commit: 备份 commit hash
             trim_tool_call: True=删除末尾工具调用+结果
+            restore_context: 是否恢复对话上下文（🔧 勾选框维度控制：
+                用户取消勾选"上下文"时传 False，只恢复 checklist）
+            restore_checklist: 是否恢复 checklist（🔧 勾选框维度控制：
+                用户取消勾选"checklist"时传 False，只恢复上下文）
 
         Returns:
             操作描述消息
@@ -4818,91 +4937,103 @@ class HistoryBackupManager:
         try:
             repo = HistoryBackupManager._get_history_repo(task_id)
 
-            # 从 commit 读取 history 文件
-            result = subprocess.run(
-                ["git", "show", f"{history_commit}:context.json"],
-                cwd=repo,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode != 0:
-                logger.debug(f"History恢复失败: commit {history_commit[:8]} 无 context.json")
-                return ""
+            restored_parts: list[str] = []
 
-            history_json = result.stdout
-            data = json.loads(history_json)
-            messages = data.get("messages", []) if isinstance(data, dict) else data
+            # 1. 对话上下文恢复（context.json → task db context）
+            if restore_context:
+                # 从 commit 读取 history 文件
+                result = subprocess.run(
+                    ["git", "show", f"{history_commit}:context.json"],
+                    cwd=repo,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode != 0:
+                    logger.debug(f"History恢复失败: commit {history_commit[:8]} 无 context.json")
+                else:
+                    history_json = result.stdout
+                    data = json.loads(history_json)
+                    messages = data.get("messages", []) if isinstance(data, dict) else data
 
-            if trim_tool_call:
-                while messages:
-                    last = messages[-1]
-                    if last.get("role") == "tool":
-                        messages.pop()
-                        continue
-                    if last.get("role") == "assistant" and "tool_calls" in last:
-                        messages.pop()
-                        break
-                    if (
-                        last.get("role") == "assistant"
-                        and not last.get("content")
-                        and "tool_calls" not in last
-                        and not last.get("reasoning_content")
-                    ):
-                        messages.pop()
-                        continue
-                    break
+                    if trim_tool_call:
+                        while messages:
+                            last = messages[-1]
+                            if last.get("role") == "tool":
+                                messages.pop()
+                                continue
+                            if last.get("role") == "assistant" and "tool_calls" in last:
+                                messages.pop()
+                                break
+                            if (
+                                last.get("role") == "assistant"
+                                and not last.get("content")
+                                and "tool_calls" not in last
+                                and not last.get("reasoning_content")
+                            ):
+                                messages.pop()
+                                continue
+                            break
 
-            # 读取当前统计信息（token/费用保留最新值）
-            from peng.task.manager import TaskManager
+                    # 读取当前统计信息（token/费用保留最新值）
+                    from peng.task.manager import TaskManager
 
-            tm = TaskManager()
-            task = tm.db.get_task(task_id)
-            current_stats = {}
-            if task and task.get("context"):
-                try:
-                    cur_data = json.loads(task["context"])
-                    if isinstance(cur_data, dict):
-                        for k in (
-                            "_prompt_tokens",
-                            "_total_tokens_consumed",
-                            "_total_cost",
-                            "_total_input_hit_tokens",
-                            "_total_input_miss_tokens",
-                            "_total_output_tokens",
-                            "_pricing",
-                            "_cost_breakdown",
-                        ):
-                            if k in cur_data:
-                                current_stats[k] = cur_data[k]
-                except Exception:
-                    pass
+                    tm = TaskManager()
+                    task = tm.db.get_task(task_id)
+                    current_stats = {}
+                    if task and task.get("context"):
+                        try:
+                            cur_data = json.loads(task["context"])
+                            if isinstance(cur_data, dict):
+                                for k in (
+                                    "_prompt_tokens",
+                                    "_total_tokens_consumed",
+                                    "_total_cost",
+                                    "_total_input_hit_tokens",
+                                    "_total_input_miss_tokens",
+                                    "_total_output_tokens",
+                                    "_pricing",
+                                    "_cost_breakdown",
+                                ):
+                                    if k in cur_data:
+                                        current_stats[k] = cur_data[k]
+                        except Exception:
+                            pass
 
-            # 合并：备份的messages + 当前统计
-            result_data = data if isinstance(data, dict) else {"messages": data}
-            result_data["messages"] = messages
-            result_data.update(current_stats)
-            new_context = json.dumps(result_data, ensure_ascii=False, indent=2)
-            tm.db.update_task(task_id, context=new_context)
+                    # 合并：备份的messages + 当前统计
+                    result_data = data if isinstance(data, dict) else {"messages": data}
+                    result_data["messages"] = messages
+                    result_data.update(current_stats)
+                    new_context = json.dumps(result_data, ensure_ascii=False, indent=2)
+                    tm.db.update_task(task_id, context=new_context)
 
-            # 恢复 checklist
+                    action = "移除末尾工具调用" if trim_tool_call else "完整恢复"
+                    restored_parts.append(f"上下文已恢复（{action}）")
+                    logger.info(
+                        f"事务#{task_id} History已恢复（{action}）from {history_commit[:8]}"
+                    )
+
+            # 2. checklist 恢复（checklist.md → task db checklist）
             # 注意：checklist.md 始终存在（backup时即使空字符串也写入文件）
             # 条件仅检查 returncode==0（旧commit可能无此文件），不检查 stdout 是否为空
-            checklist_msg = ""
-            cl_result = subprocess.run(
-                ["git", "show", f"{history_commit}:checklist.md"],
-                cwd=repo, capture_output=True, text=True, timeout=10,
-            )
-            if cl_result.returncode == 0:
-                tm.db.update_task(task_id, checklist=cl_result.stdout)
-                checklist_msg = "，checklist已恢复"
-            else:
-                # 旧commit可能没有checklist.md（功能添加前），保留当前值不变
-                logger.debug(f"History恢复: commit {history_commit[:8]} 无 checklist.md")
+            if restore_checklist:
+                from peng.task.manager import TaskManager
 
-            action = "移除末尾工具调用" if trim_tool_call else "完整恢复"
-            logger.info(f"事务#{task_id} History已恢复（{action}）from {history_commit[:8]}")
-            return f"上下文已恢复（{action}）{checklist_msg}"
+                tm = TaskManager()
+                cl_result = subprocess.run(
+                    ["git", "show", f"{history_commit}:checklist.md"],
+                    cwd=repo, capture_output=True, text=True, timeout=10,
+                )
+                if cl_result.returncode == 0:
+                    tm.db.update_task(task_id, checklist=cl_result.stdout)
+                    restored_parts.append("checklist已恢复")
+                else:
+                    # 旧commit可能没有checklist.md（功能添加前），保留当前值不变
+                    logger.debug(f"History恢复: commit {history_commit[:8]} 无 checklist.md")
+
+            if not restored_parts:
+                return ""
+            return "，".join(restored_parts)
 
         except Exception as e:
             logger.warning(f"History恢复失败 task#{task_id}: {e}", exc_info=True)

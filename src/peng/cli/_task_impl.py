@@ -3413,6 +3413,32 @@ def cmd_rollback(args):
             print("已取消")
             return 0
 
+    # 🔧 回滚内容维度（事务#2476）：与 WebUI 勾选框一致的四维度（默认全选）
+    rollback_kwargs = dict(
+        rollback_files=not args.no_files,
+        rollback_external=not args.no_external,
+        rollback_checklist=not args.no_checklist,
+        rollback_context=not args.no_context,
+    )
+    unchecked_dims = [
+        k for k, v in {
+            "工作目录文件": rollback_kwargs["rollback_files"],
+            "外部文件": rollback_kwargs["rollback_external"],
+            "checklist": rollback_kwargs["rollback_checklist"],
+            "上下文": rollback_kwargs["rollback_context"],
+        }.items() if not v
+    ]
+    if unchecked_dims:
+        print(
+            f"{Colors.CYAN}🔧 部分回滚（不回滚：{'、'.join(unchecked_dims)}）{Colors.RESET}"
+        )
+        if all(not v for v in rollback_kwargs.values()):
+            print(
+                f"{Colors.RED}❌ 四个维度全部取消勾选，无可回滚内容。请至少保留一个维度。{Colors.RESET}",
+                file=sys.stderr,
+            )
+            return 1
+
     # 暂停运行中的事务（与 WebUI /api/tool-rollback 行为一致）
     was_running = False
     if task.get("status") == "running":
@@ -3430,7 +3456,7 @@ def cmd_rollback(args):
     # 执行回滚（同步方法，与 WebUI 的 asyncio.to_thread 等价）
     # 返回4元组：成功标志/消息/undo_meta/是否有实际变化
     print(f"{Colors.CYAN}⏳ 正在执行回滚 {rid} ...{Colors.RESET}")
-    success, message, undo_meta, changed = ToolBackupManager.rollback(meta)
+    success, message, undo_meta, changed = ToolBackupManager.rollback(meta, **rollback_kwargs)
 
     if not success:
         print(f"{Colors.RED}❌ 回滚失败: {message}{Colors.RESET}", file=sys.stderr)
@@ -3964,6 +3990,24 @@ def main():
     )
     rollback_parser.add_argument("--list", "-l", action="store_true", help="列出全部可用回滚ID")
     rollback_parser.add_argument("-y", "--yes", action="store_true", help="跳过确认直接回滚")
+    # 🔧 回滚内容维度（事务#2476）：与 WebUI 确认窗口四勾选框一致，默认全选；
+    # --no-xxx 取消勾选对应维度（不回滚该内容）
+    rollback_parser.add_argument(
+        "--no-files", action="store_true",
+        help="不回滚工作目录文件（取消勾选\"工作目录文件\"）",
+    )
+    rollback_parser.add_argument(
+        "--no-external", action="store_true",
+        help="不回滚外部文件（取消勾选\"外部文件\"）",
+    )
+    rollback_parser.add_argument(
+        "--no-checklist", action="store_true",
+        help="不回滚 checklist（取消勾选\"checklist\"）",
+    )
+    rollback_parser.add_argument(
+        "--no-context", action="store_true",
+        help="不回滚对话上下文（取消勾选\"上下文\"）",
+    )
     rollback_parser.set_defaults(func=cmd_rollback)
 
     args = parser.parse_args()

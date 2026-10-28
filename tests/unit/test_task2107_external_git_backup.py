@@ -508,7 +508,7 @@ class TestIterationRollbackManifest:
         )
         monkeypatch.setattr(
             ToolBackupManager, "_rollback_git",
-            staticmethod(lambda meta, nest: (True, "ok")),
+            staticmethod(lambda meta, nest, **kw: (True, "ok")),
         )
         undo = mock.Mock(return_value=None)
         monkeypatch.setattr(ToolBackupManager, "_create_undo_snapshot", undo)

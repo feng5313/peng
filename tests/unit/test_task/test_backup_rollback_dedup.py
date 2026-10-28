@@ -276,7 +276,7 @@ class TestRollbackNoChangeFastPath:
             patch.object(
                 HistoryBackupManager,
                 "has_changes",
-                staticmethod(lambda tid, hc: False),  # history无变化
+                staticmethod(lambda tid, hc, **kw: False),  # history无变化（kw=维度include参数）
             ),
             patch.object(
                 ToolBackupManager, "_create_undo_snapshot", staticmethod(fail_undo)
@@ -306,7 +306,7 @@ class TestRollbackNoChangeFastPath:
             patch.object(
                 HistoryBackupManager,
                 "has_changes",
-                staticmethod(lambda tid, hc: True),
+                staticmethod(lambda tid, hc, **kw: True),
             ),
             patch.object(
                 ToolBackupManager,
@@ -316,7 +316,7 @@ class TestRollbackNoChangeFastPath:
             patch.object(
                 HistoryBackupManager,
                 "restore",
-                staticmethod(lambda tid, hc, trim_tool_call=False: "上下文已恢复"),
+                staticmethod(lambda tid, hc, trim_tool_call=False, restore_context=True, restore_checklist=True: "上下文已恢复"),
             ),
         ):
             ok, msg, undo, changed = ToolBackupManager.rollback(meta)
@@ -369,7 +369,7 @@ class TestRollbackNoChangeFastPath:
             patch.object(
                 ToolBackupManager,
                 "_rollback_git",
-                staticmethod(lambda m, n: (True, "已回退 1 个文件")),
+                staticmethod(lambda m, n, **kw: (True, "已回退 1 个文件")),
             ),
         ):
             ok, msg, undo, changed = ToolBackupManager.rollback(meta)

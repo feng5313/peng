@@ -1453,10 +1453,10 @@ function handleRollbackLink(uri) {
     var addedFiles = rollbackMeta.added_files || [];
 
     // 弹出自定义确认框（禁止使用系统confirm）
-    // 🔧 skipContext：用户在确认框取消勾选"恢复对话上下文"时为true
-    showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, backupType, changedFiles, addedFiles, isUndo, function(skipContext) {
+    // 🔧 options：四维度勾选状态（files/external/checklist/context，正向语义）
+    showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, backupType, changedFiles, addedFiles, isUndo, function(options) {
       // 用户确认后调用API
-      executeRollback(rollbackMeta, skipContext);
+      executeRollback(rollbackMeta, options);
     }, rollbackMeta);
   } catch (e) {
     console.error('[Rollback] 解析回滚链接失败:', e);
@@ -1493,9 +1493,9 @@ async function handleRollbackLinkById(metaId) {
     var changedFiles = rollbackMeta.changed_files || [];
     var addedFiles = rollbackMeta.added_files || [];
 
-    // 🔧 skipContext：用户在确认框取消勾选"恢复对话上下文"时为true
-    showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, backupType, changedFiles, addedFiles, isUndo, function(skipContext) {
-      executeRollback(rollbackMeta, skipContext);
+    // 🔧 options：四维度勾选状态（files/external/checklist/context，正向语义）
+    showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, backupType, changedFiles, addedFiles, isUndo, function(options) {
+      executeRollback(rollbackMeta, options);
     }, rollbackMeta);
   } catch (e) {
     console.error('[Rollback] 获取回滚信息失败:', e);
@@ -1572,25 +1572,22 @@ function showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, bac
 
   var headerEl = document.createElement('div');
 
-  // 上下文回滚提示：迭代/undo快照携带 history_commit，回滚会把对话上下文
-  // （模型记忆）恢复到快照时刻——快照后的对话将被模型遗忘，确认前必须知晓
-  var hasHistory = !!(rollbackMeta && rollbackMeta.history_commit);
-  var isHistoryOnly = backupType === 'history_only';
-  var ctxText, ctxColor;
-  if (isUndo) {
-    ctxText = '对话上下文将恢复到回滚前时刻';
-  } else if (isHistoryOnly) {
-    // 🔧 与实际行为一致：非git workdir 迭代回滚恢复上下文+外部/非git管理文件
-    // （文件变更见下方异步预览），不能断言"不动文件"（与预览列表自相矛盾）
-    ctxText = '对话上下文恢复到快照时刻（快照之后的对话记录将被清除）；文件变更见下方预览，如有将一并恢复';
-  } else if (hasHistory) {
-    ctxText = '文件与对话上下文均恢复到快照时刻（快照之后的对话记录将被清除）';
-  } else {
-    ctxText = '仅恢复文件，不影响对话上下文';
-  }
-  ctxColor = (isUndo || !hasHistory) ? '#8b949e' : (isHistoryOnly ? '#39c5cf' : '#f85149');
-  // 上下文是否可由用户选择（快照带history且非undo时显示checkbox）
-  var showCtxOption = hasHistory && !isUndo;
+  // 🔧 回滚内容勾选框（事务#2476）：四维度——工作目录文件/外部文件/
+  // checklist/上下文，默认全选；快照不含的维度disabled置灰。
+  // 各维度可用性由 rollback_meta 字段动态判断（与后端 rollback 实际
+  // 恢复对象一一对应）：
+  // - 工作目录文件：type=git/non_git（workdir 内文件快照存在）
+  // - 外部文件：external_files 非空（工具快照/undo）或 external_head_commit（迭代基线）
+  // - checklist/上下文：history_commit 存在（二者同源于 history 备份 commit）
+  var scopeAvail = {
+    files: backupType === 'git' || backupType === 'non_git',
+    external: !!((rollbackMeta && rollbackMeta.external_files && rollbackMeta.external_files.length)
+      || (rollbackMeta && rollbackMeta.external_head_commit)),
+    checklist: !!(rollbackMeta && rollbackMeta.history_commit),
+    context: !!(rollbackMeta && rollbackMeta.history_commit)
+  };
+  // 撤销快照可能不带 history（备份失败时），context/checklist 照常按字段判断
+  var scopeLabels = { files: '工作目录文件', external: '外部文件', checklist: 'checklist', context: '上下文' };
 
   headerEl.innerHTML = ''
     + '<div style="font-size:16px;font-weight:bold;margin-bottom:12px;color:' + accent + '">'
@@ -1600,11 +1597,6 @@ function showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, bac
     +   '<div style="margin-bottom:8px">'
     +     '<span style="color:#8b949e">快照来源：</span>'
     +     '<span style="color:' + accent + '">事务#' + taskId + ' @ ' + timestamp + '</span>'
-    +   '</div>'
-    +   '<div style="margin-bottom:8px">'
-    +     '<span style="color:#8b949e">上下文：</span>'
-    // （🔧 id=rollback-ctx-desc：checkbox切换时动态改写——见绑定事件）
-    +     '<span id="rollback-ctx-desc" style="color:' + ctxColor + '">' + ctxText + '</span>'
     +   '</div>'
     +   (rollbackCmd
       ?   '<div style="margin-bottom:8px">'
@@ -1640,35 +1632,43 @@ function showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, bac
   var diffContainer = diffSectionEl.querySelector('#rollback-diff-container');
 
   var footerEl = document.createElement('div');
-  // 上下文警示文案（与header的ctxText呼应，footer强调后果）
-  // 🔧 showCtxOption时不再断言上下文必然恢复——是否恢复由checkbox选项决定
-  //（checkbox文字已完整说明后果，此处重复会与"不勾选=不恢复"自相矛盾）
-  var ctxWarn = '';
-  if (isUndo) {
-    ctxWarn = '对话上下文同时恢复到回滚前时刻。';
-  }
 
-  // 上下文恢复选项（checkbox，默认勾选）：
-  // 快照带history且非undo时显示——用户可取消勾选实现"只回滚文件、保留当前对话记忆"
-  var ctxOptionHtml = '';
-  if (showCtxOption) {
-    ctxOptionHtml = ''
-      + '<div style="margin-top:12px;padding:8px 12px;background:rgba(210,153,34,0.08);border:1px solid rgba(210,153,34,0.25);border-radius:4px">'
-      +   '<label for="rollback-ctx-check" style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-size:var(--font-size-ui, 12px);line-height:1.5;color:' + text + '">'
-      +     '<input type="checkbox" id="rollback-ctx-check" checked style="margin-top:2px;accent-color:' + accent + ';cursor:pointer;flex-shrink:0">'
-      +     '<span>同时恢复对话上下文到快照时刻（快照之后的对话记录将被清除，可通过"撤销"找回）<br>'
-      +       '<span style="color:#8b949e">不勾选则仅回滚文件，保留当前对话记忆</span></span>'
-      +   '</label>'
-      + '</div>';
-  }
+  // 🔧 回滚内容勾选框（事务#2476）：四维度默认全选；快照不含的维度
+  // disabled置灰并标注"快照不含"（勾选无意义）。上下文带警示括注
+  // （快照后对话将清除——唯一有"丢失感"后果的维度）
+  var scopeDesc = {
+    files: '工作目录内文件',
+    external: '工作目录外文件',
+    checklist: '事务检查清单',
+    context: '对话记忆（快照后对话将清除）'
+  };
+  var scopeOrder = ['files', 'external', 'checklist', 'context'];
+  var scopeChecksHtml = scopeOrder.map(function(scope) {
+    var avail = scopeAvail[scope];
+    var dim = avail ? text : '#6e7681';
+    var label = scopeLabels[scope];
+    var desc = scopeDesc[scope];
+    return '<label for="rollback-scope-' + scope + '" '
+      + 'style="display:flex;align-items:center;gap:6px;cursor:' + (avail ? 'pointer' : 'not-allowed')
+      + ';font-size:var(--font-size-ui, 12px);color:' + dim + ';padding:2px 0">'
+      +   '<input type="checkbox" id="rollback-scope-' + scope + '" data-scope="' + scope + '" '
+      +     (avail ? 'checked' : '') + (avail ? '' : ' disabled')
+      +     ' style="accent-color:' + accent + ';cursor:pointer;flex-shrink:0;width:14px;height:14px">'
+      +   '<span style="font-weight:bold">' + label + '</span>'
+      +   '<span style="color:#8b949e">' + (avail ? desc : '快照不含') + '</span>'
+      + '</label>';
+  }).join('');
   footerEl.innerHTML = ''
-    + '<div style="margin-top:12px;padding:8px 12px;background:rgba(' + (isUndo ? '63,185,80' : '210,153,34') + ',0.1);border-radius:4px;font-size:var(--font-size-ui, 12px);color:' + (isUndo ? success : accent) + '">'
-    +     (isUndo
-      ?   '⚠️ 撤销将恢复到回滚前的文件状态。' + ctxWarn
-      :   '⚠️ 将恢复到事务#' + taskId + ' @ ' + timestamp + ' 的快照。同期非本事务的变更将丢失，只能从其他事务的快照中找回。' + ctxWarn + '回滚后可通过"撤销"超链接恢复。')
-    +   '</div>'
+    + '<div style="margin-top:12px;padding:8px 12px;background:rgba(210,153,34,0.08);border:1px solid rgba(210,153,34,0.25);border-radius:4px">'
+    +   '<div style="font-size:var(--font-size-ui, 12px);color:' + accent + ';margin-bottom:4px;font-weight:bold">🔧 回滚内容（勾选要恢复到快照时刻的内容）：</div>'
+    +   scopeChecksHtml
+    +   '<div id="rollback-scope-summary" style="font-size:var(--font-size-ui, 12px);margin-top:6px;color:#39c5cf"></div>'
     + '</div>'
-    + ctxOptionHtml
+    + '<div style="margin-top:12px;padding:8px 12px;background:rgba(' + (isUndo ? '63,185,80' : '210,153,34') + ',0.1);border-radius:4px;font-size:var(--font-size-ui, 12px);color:' + (isUndo ? success : accent) + '">'
+    +   (isUndo
+      ?   '⚠️ 撤销将恢复到回滚前的状态。'
+      :   '⚠️ 将恢复到事务#' + taskId + ' @ ' + timestamp + ' 的快照。同期非本事务的变更将丢失，只能从其他事务的快照中找回。回滚后可通过"撤销"超链接恢复。')
+    + '</div>'
     + '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">'
     +   '<button id="rollback-cancel-btn" style="padding:6px 16px;border:1px solid ' + border + ';background:transparent;color:' + text + ';border-radius:4px;cursor:pointer;font-size:var(--font-size-ui, 13px)">取消</button>'
     +   '<button id="rollback-ok-btn" style="padding:6px 16px;border:none;background:' + actionColor + ';color:#fff;border-radius:4px;cursor:pointer;font-size:var(--font-size-ui, 13px);font-weight:bold">确认' + actionLabel + '</button>'
@@ -1692,34 +1692,62 @@ function showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, bac
     overlay.remove();
   });
 
-  // 确认按钮
-  // 🔧 skipContext=用户取消勾选"恢复对话上下文"（无checkbox时undefined→false=默认恢复）
-  document.getElementById('rollback-ok-btn').addEventListener('click', function() {
-    var ctxCheck = document.getElementById('rollback-ctx-check');
-    var skipContext = !!(ctxCheck && !ctxCheck.checked);
-    overlay.remove();
-    if (onConfirm) onConfirm(skipContext);
+  // 🔧 四维度勾选状态：返回 {files, external, checklist, context}
+  // （true=勾选回滚该维度；快照不含的disabled维度为false——后端本就无该内容可回滚）
+  var readScopeOptions = function() {
+    var opts = {};
+    scopeOrder.forEach(function(scope) {
+      var el = document.getElementById('rollback-scope-' + scope);
+      opts[scope] = !!(el && el.checked);
+    });
+    return opts;
+  };
+
+  // 勾选状态 → 汇总行 + 确认按钮可用性 + diff预览区块显隐联动
+  var summaryEl = document.getElementById('rollback-scope-summary');
+  var okBtn = document.getElementById('rollback-ok-btn');
+  var updateScopeUi = function() {
+    var selected = scopeOrder.filter(function(scope) {
+      var el = document.getElementById('rollback-scope-' + scope);
+      return el && el.checked;
+    });
+    if (summaryEl) {
+      if (selected.length) {
+        summaryEl.textContent = '将回滚：' + selected.map(function(s) { return scopeLabels[s]; }).join('、');
+        summaryEl.style.color = '#39c5cf';
+      } else {
+        summaryEl.textContent = '未选择任何回滚内容，请至少勾选一项';
+        summaryEl.style.color = '#f85149';
+      }
+    }
+    if (okBtn) {
+      okBtn.disabled = selected.length === 0;
+      okBtn.style.opacity = selected.length ? '1' : '0.5';
+      okBtn.style.cursor = selected.length ? 'pointer' : 'not-allowed';
+    }
+    // diff预览区块联动：勾选的维度显示对应区块，取消勾选隐藏
+    scopeOrder.forEach(function(scope) {
+      var el = document.getElementById('rollback-scope-' + scope);
+      var show = !!(el && el.checked);
+      var blocks = diffContainer.querySelectorAll('[data-scope-block="' + scope + '"]');
+      blocks.forEach(function(b) { b.style.display = show ? '' : 'none'; });
+    });
+  };
+  scopeOrder.forEach(function(scope) {
+    var el = document.getElementById('rollback-scope-' + scope);
+    if (el) el.addEventListener('change', updateScopeUi);
   });
 
-  // checkbox切换 → header上下文描述联动改写（与实际将执行的行为一致，防文案自相矛盾）
-  var ctxCheckEl = document.getElementById('rollback-ctx-check');
-  var ctxDescEl = document.getElementById('rollback-ctx-desc');
-  if (ctxCheckEl && ctxDescEl) {
-    ctxCheckEl.addEventListener('change', function() {
-      if (this.checked) {
-        // 勾选：恢复上下文（header恢复为初始ctxText/ctxColor）
-        ctxDescEl.textContent = ctxText;
-        ctxDescEl.style.color = ctxColor;
-      } else if (isHistoryOnly) {
-        // history_only快照无文件变更：跳过上下文=本次回滚无实际变化（后端将如实返回）
-        ctxDescEl.textContent = '保留当前对话记忆（不恢复上下文）——此快照无文件变更，本次回滚将无实际变化';
-        ctxDescEl.style.color = '#3fb950';
-      } else {
-        ctxDescEl.textContent = '仅恢复文件到快照时刻，保留当前对话记忆（不恢复上下文）';
-        ctxDescEl.style.color = '#3fb950';
-      }
-    });
-  }
+  // 确认按钮：读取四维度勾选状态，以 options 对象传给回调
+  okBtn.addEventListener('click', function() {
+    if (okBtn.disabled) return;
+    var options = readScopeOptions();
+    overlay.remove();
+    if (onConfirm) onConfirm(options);
+  });
+
+  // 初始化汇总行/按钮状态
+  updateScopeUi();
 
   // 点击遮罩层取消
   overlay.addEventListener('click', function(e) {
@@ -1801,6 +1829,7 @@ async function loadRollbackDiffPreview(rollbackMeta, container) {
     var parts = [];
     var hasChecklistDiff = false;
     var hasFileDiff = false;
+    var hasExternalDiff = false;
 
     // 字节数人性化显示（KB/MB）
     function fmtBytes(n) {
@@ -1809,47 +1838,89 @@ async function loadRollbackDiffPreview(rollbackMeta, container) {
       return n + 'B';
     }
 
+    // 🔧 区块容器（事务#2476）：每个区块包 data-scope-block 容器——
+    // 勾选框取消对应维度时隐藏对应区块（updateScopeUi 联动）
+    function scopeBlock(scope, inner) {
+      return '<div data-scope-block="' + scope + '">' + inner + '</div>';
+    }
+
     // 1. checklist diff 区块（available=False 表示快照未备份checklist，不显示）
     var cl = data.checklist_diff;
     if (cl && cl.available && cl.changed && cl.diff) {
       hasChecklistDiff = true;
-      parts.push('<div style="color:#39c5cf;margin:2px 0 1px">☑️ checklist 变更：</div>');
-      parts.push(renderDiffHtml(cl.diff));
+      var clInner = '<div style="color:#39c5cf;margin:2px 0 1px">☑️ checklist 变更：</div>'
+        + renderDiffHtml(cl.diff);
       if (cl.truncated) {
-        parts.push('<div style="color:' + YELLOW + '">⚠️ checklist diff过长已截断，还有 ' + fmtBytes(cl.truncated_bytes || 0) + ' 内容未显示</div>');
+        clInner += '<div style="color:' + YELLOW + '">⚠️ checklist diff过长已截断，还有 ' + fmtBytes(cl.truncated_bytes || 0) + ' 内容未显示</div>';
       }
+      parts.push(scopeBlock('checklist', clInner));
     }
 
     // 2. 文件 diff 区块（success=False 时显示原因；diff为空显示message）
+    // 🔧 external 类型快照：changed_files 即外部文件变更（preview 直接返回），
+    // 文件diff归"外部文件"维度；其余类型归"工作目录文件"维度
+    var isExternalType = rollbackMeta && rollbackMeta.type === 'external';
+    var extChanged = data.external_changed_files || [];
+    var fileScope = isExternalType ? 'external' : 'files';
     if (data.success) {
       if (data.diff) {
         hasFileDiff = true;
-        parts.push('<div style="color:#39c5cf;margin:' + (hasChecklistDiff ? '8px' : '2px') + ' 0 1px">📄 工作目录文件变更：</div>');
-        parts.push(renderDiffHtml(data.diff));
+        var diffInner = '<div style="color:#39c5cf;margin:' + (hasChecklistDiff ? '8px' : '2px') + ' 0 1px">📄 工作目录文件变更：</div>'
+          + renderDiffHtml(data.diff);
         if (data.truncated) {
-          parts.push('<div style="color:' + YELLOW + ';margin-top:4px">⚠️ diff过长已截断，还有 ' + fmtBytes(data.truncated_bytes || 0) + ' 内容未显示，完整内容请查看备份分支</div>');
+          diffInner += '<div style="color:' + YELLOW + ';margin-top:4px">⚠️ diff过长已截断，还有 ' + fmtBytes(data.truncated_bytes || 0) + ' 内容未显示，完整内容请查看备份分支</div>';
         }
+        parts.push(scopeBlock(fileScope, diffInner));
       } else if (!(data.changed_files && data.changed_files.length) && data.message && data.message !== 'ok') {
         // 无文件变更（diff与变更列表均空）的fallback说明
-        parts.push('<div style="color:' + DIM + '">📄 工作目录文件：' + data.message + '</div>');
+        parts.push(scopeBlock(fileScope, '<div style="color:' + DIM + '">📄 工作目录文件：' + data.message + '</div>'));
       }
     } else {
       // 文件diff不可用（history_only无文件快照、备份类型不支持、git错误等）
       if (!(data.changed_files && data.changed_files.length)) {
-        parts.push('<div style="color:' + DIM + '">📄 工作目录文件：' + (data.message || 'diff预览不可用') + '</div>');
+        parts.push(scopeBlock(fileScope, '<div style="color:' + DIM + '">📄 工作目录文件：' + (data.message || 'diff预览不可用') + '</div>'));
       }
     }
 
-    // 3. 🔧 变更文件列表区块（diff 为空但有 changed_files 时渲染——
-    //    external/非git管理文件的变更（备份仓库基线对比）无 diff 文本，只有列表）
-    if (!data.diff && data.changed_files && data.changed_files.length) {
-      hasFileDiff = true;
-      parts.push('<div style="color:#39c5cf;margin:' + (hasChecklistDiff ? '8px' : '2px') + ' 0 1px">📁 变更文件（' + data.changed_files.length + '，回滚将恢复到快照版本）：</div>');
-      parts.push(data.changed_files.slice(0, 50).map(function(f) {
-        return '<div style="font-size:var(--font-size-ui,12px);color:#c9d1d9;padding:1px 0 1px 12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="' + String(f).replace(/"/g, '&quot;') + '">• ' + String(f).replace(/</g, '&lt;') + '</div>';
-      }).join(''));
-      if (data.changed_files.length > 50) {
-        parts.push('<div style="font-size:var(--font-size-ui,12px);color:' + DIM + ';padding:1px 0 1px 12px">... 共 ' + data.changed_files.length + ' 个文件</div>');
+    // 3. 🔧 变更文件列表区块（无 diff 文本只有列表时渲染）——
+    //    按"工作目录文件/外部文件"两维度拆分（勾选框联动）：
+    //    - 外部文件段：external_changed_files（后端独立字段）；
+    //      external 类型快照 changed_files 全归外部
+    //    - 工作目录文件段：changed_files 排除外部文件后的剩余
+    function renderFileList(list, scopeKey, title) {
+      if (!list || !list.length) return '';
+      var inner = '<div style="color:#39c5cf;margin:' + ((hasChecklistDiff || hasFileDiff) ? '8px' : '2px') + ' 0 1px">📁 ' + title + '（' + list.length + '，回滚将恢复到快照版本）：</div>'
+        + list.slice(0, 50).map(function(f) {
+          return '<div style="font-size:var(--font-size-ui,12px);color:#c9d1d9;padding:1px 0 1px 12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="' + String(f).replace(/"/g, '&quot;') + '">• ' + String(f).replace(/</g, '&lt;') + '</div>';
+        }).join('');
+      if (list.length > 50) {
+        inner += '<div style="font-size:var(--font-size-ui,12px);color:' + DIM + ';padding:1px 0 1px 12px">... 共 ' + list.length + ' 个文件</div>';
+      }
+      return scopeBlock(scopeKey, inner);
+    }
+
+    if (isExternalType) {
+      // external 快照：changed_files 全部是外部文件
+      if (data.changed_files && data.changed_files.length) {
+        hasExternalDiff = true;
+        parts.push(renderFileList(data.changed_files, 'external', '外部文件'));
+      }
+    } else {
+      // 外部文件段（external_changed_files 独立字段）
+      if (extChanged.length) {
+        hasExternalDiff = true;
+        parts.push(renderFileList(extChanged, 'external', '外部/非git管理文件'));
+      }
+      // 工作目录文件段（changed_files 排除外部文件；仅 diff 为空时渲染——
+      // 有 diff 时变更已在上方 diff 区块展示，列表冗余）
+      if (!data.diff && data.changed_files && data.changed_files.length) {
+        var wdList = data.changed_files.filter(function(f) {
+          return extChanged.indexOf(f) < 0;
+        });
+        if (wdList.length) {
+          hasFileDiff = true;
+          parts.push(renderFileList(wdList, 'files', '工作目录文件变更'));
+        }
       }
     }
 
@@ -1859,14 +1930,29 @@ async function loadRollbackDiffPreview(rollbackMeta, container) {
       container.innerHTML = '<span style="color:' + DIM + '">✅ 无任何变更</span>';
     }
 
-    // 更新区块标题（汇总两类变更的有无）
+    // 更新区块标题（汇总各类变更的有无）
     if (titleEl && document.body.contains(titleEl)) {
       var titles = [];
       if (hasChecklistDiff) titles.push('checklist');
       if (hasFileDiff) titles.push('文件');
+      if (hasExternalDiff) titles.push('外部文件');
       titleEl.textContent = titles.length
         ? '📋 回滚变更diff（' + titles.join(' + ') + '）：'
         : '📋 回滚变更diff：';
+    }
+
+    // 🔧 预览区块渲染后按当前勾选状态应用显隐（预览异步加载完成时
+    // 用户可能已取消勾选某些维度）
+    if (document.getElementById('rollback-scope-files')) {
+      ['files', 'external', 'checklist', 'context'].forEach(function(scope) {
+        var el = document.getElementById('rollback-scope-' + scope);
+        if (el) {
+          var show = el.checked;
+          container.querySelectorAll('[data-scope-block="' + scope + '"]').forEach(function(b) {
+            b.style.display = show ? '' : 'none';
+          });
+        }
+      });
     }
   } catch (e) {
     console.error('[Rollback] diff预览加载失败:', e);
@@ -1881,17 +1967,23 @@ async function loadRollbackDiffPreview(rollbackMeta, container) {
 /**
  * 调用API执行回滚
  * @param {object} rollbackMeta - 回滚元数据
- * @param {boolean} [skipContext] - true=只回滚文件，跳过对话上下文(history)恢复
- *   （用户在确认框取消勾选"恢复对话上下文"时传入）
+ * @param {object} [options] - 回滚内容勾选状态（事务#2476 四勾选框，正向直传）：
+ *   {files, external, checklist, context}——true=回滚该维度，false=不回滚
  */
-async function executeRollback(rollbackMeta, skipContext) {
+async function executeRollback(rollbackMeta, options) {
   try {
     showSimpleToast('⏳ 正在执行回滚...', 'info');
-
+    options = options || {};
     var response = await fetch('/api/tool-rollback', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rollback_meta: rollbackMeta, skip_context: !!skipContext })
+      body: JSON.stringify({
+        rollback_meta: rollbackMeta,
+        rollback_files: !!options.files,
+        rollback_external: !!options.external,
+        rollback_checklist: !!options.checklist,
+        rollback_context: !!options.context
+      })
     });
 
     var data = await response.json();
