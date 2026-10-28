@@ -3917,6 +3917,13 @@ class ToolExecutionEngine:
         self._context_overflow_rounds: int = 0
         # 全provider失败等待重试的连续轮次计数（仅用于警告提示，不暂停事务）
         self._all_failed_rounds: int = 0
+        # 🔧 事务#2474：服务不可用(ConnectError/RemoteProtocolError)同provider重试
+        # 耗尽后待切换标志——重试期间chat_stream传failed=False保持同provider
+        # （provider未被标记失败），若耗尽后仅靠retry>0推导failed则公共路径
+        # sleep后continue回外层时retry已重置为0，get_provider(failed=False)会
+        # 直接复用健康的原provider，导致永不切换死循环。故耗尽break前置True，
+        # 下一次chat_stream调用传failed=True显式触发mark_failed+切换后复位。
+        self._provider_switch_pending: bool = False
         # 🔧 事务#2235：网络瞬时错误(ReadError等)熔断计数——
         # _transient_rounds：内层5次重试耗尽的连续轮次（成功一次流即重置）。
         # content非空的断流在TransportError分支直接保留响应走正常收尾（不重试），
@@ -4192,6 +4199,10 @@ class ToolExecutionEngine:
             is_transient_error = (
                 False  # 网络瞬时错误标志(ReadError等)：禁止切换provider，同provider重试
             )
+            is_service_unavailable = (
+                False  # 🔧 事务#2474：服务不可用标志(ConnectError/RemoteProtocolError)：
+                # 同provider重试期间传failed=False保持不切换，连续3次耗尽才切换
+            )
             is_context_overflow = (
                 False  # 🔧 事务#2002：400上下文长度超标标志：禁止切换provider，
                 # compact压缩上下文后重试（上下文是provider无关的，换provider必然同样失败）
@@ -4257,6 +4268,26 @@ class ToolExecutionEngine:
                         if self._force_thinking_disabled and self.llm.thinking_mode == "auto":
                             effective_thinking_override = "disabled"
 
+                    # 🔧 事务#2474：_provider_switch_pending（服务不可用同provider
+                    # 重试3次耗尽置位）优先级最高，显式failed=True触发mark_failed
+                    # +切换provider，然后立刻复位（get_provider在chat_stream内部
+                    # 同步执行，返回即已生效）
+                    if self._provider_switch_pending:
+                        self._provider_switch_pending = False
+                        _failed_arg: bool | None = True
+                    else:
+                        _failed_arg = (
+                            # 429限流/400内容审核/网络瞬时错误/服务不可用重试(#2474)：
+                            # 禁止标记provider失败，不切换不冷却
+                            False
+                            if (
+                                is_rate_limited
+                                or is_content_filtered
+                                or is_transient_error
+                                or is_service_unavailable
+                            )
+                            else None
+                        )
                     stream = self.llm.chat_stream(
                         message_id=message_id,
                         task_id=task_id,
@@ -4265,10 +4296,7 @@ class ToolExecutionEngine:
                         tools=tools,
                         thinking_mode=effective_thinking_override,
                         retry=retry,
-                        # 429限流/400内容审核/网络瞬时错误：禁止标记provider失败，不切换不冷却
-                        failed=False
-                        if (is_rate_limited or is_content_filtered or is_transient_error)
-                        else None,
+                        failed=_failed_arg,
                     )
                     logger.debug("[ToolEngine] chat_stream调用成功，开始迭代")
                     # 每次LLM调用前更新定价（provider可能切换）
@@ -4581,6 +4609,7 @@ class ToolExecutionEngine:
                     retry += 1
                     is_rate_limited = False  # 非429，重置限流标志
                     is_content_filtered = False  # 非内容审核错误，重置标志
+                    is_service_unavailable = False  # 非服务不可用错误，重置标志(事务#2474)
                     provider_name = e.provider or self.llm.provider or "unknown"
                     stall_switched, window_stall_seconds = self._register_stall_event(
                         stall_events, e.timeout
@@ -4612,6 +4641,7 @@ class ToolExecutionEngine:
                     is_rate_limited = False  # 非429，重置限流标志
                     is_content_filtered = False  # 非内容审核错误，重置标志
                     is_transient_error = False  # 非网络瞬时错误，重置标志
+                    is_service_unavailable = False  # 非服务不可用错误，重置标志(事务#2474)
                     provider_name = e.provider or self.llm.provider or "unknown"
                     logger.warning(f"🤖 事务#{task_id}大模型API错误(provider={provider_name}): {e}")
                     self.llm.error = f"{e} (provider={provider_name})"
@@ -4628,6 +4658,7 @@ class ToolExecutionEngine:
                     is_rate_limited = False  # 非429，重置限流标志（下方按状态码重新判断）
                     is_content_filtered = False  # 非内容审核错误，重置标志（下方按状态码重新判断）
                     is_transient_error = False  # 非网络瞬时错误，重置标志
+                    is_service_unavailable = False  # 非服务不可用错误，重置标志(事务#2474)
                     icon = self.llm.config.get_icon(self.llm.provider)
                     # 提取详细的HTTP错误信息：状态码、响应体、请求URL
                     status_code = e.response.status_code
@@ -4857,14 +4888,21 @@ class ToolExecutionEngine:
                     self.exit_on_unexpected_status()
                     continue
                 except httpx.TransportError as e:
-                    # 网络传输错误分层处理（事务#2016）：
+                    # 网络传输错误分层处理（事务#2016/#2474）：
                     # - ConnectError/RemoteProtocolError：无法建立连接/对端异常断开，
-                    #   是服务进程崩溃或重启中的明确信号（如本地sglang段错误自动重启）。
-                    #   同provider快速重试2次抗网络闪断，仍失败则不标记瞬时错误，
-                    #   由外层"所有provider失败"分支按冷却等待后重新选择provider
-                    #   （mark_failed自适应冷却+按优先级切换），绝不无限死磕已崩溃的服务。
-                    #   （原行为：无限重试同一provider直到服务自行恢复，导致事务
-                    #   在服务重启期间长时间卡在prefill状态）
+                    #   可能是服务进程崩溃/重启（如本地sglang段错误自动重启），
+                    #   也可能只是瞬时网络闪断/对端偶发断开。🔧 事务#2474：先同
+                    #   provider快速重试3次（failed=False保持不切换，不mark_failed
+                    #   不冷却），连续3次重试均失败才置_provider_switch_pending，
+                    #   由外层"所有provider失败"分支按冷却等待后显式failed=True
+                    #   切换provider（mark_failed自适应冷却+按优先级切换），
+                    #   绝不无限死磕已崩溃的服务。
+                    #   （#2474修复前：is_transient_error=False使重试调用
+                    #   chat_stream(retry>0,failed=None)推导出failed=True，
+                    #   第1次重试就mark_failed+切换provider，"同provider重试"
+                    #   形同虚设，一次RemoteProtocolError即触发💠已切换）
+                    #   （#2016原行为：无限重试同一provider直到服务自行恢复，导致
+                    #   事务在服务重启期间长时间卡在prefill状态）
                     # - 其他传输错误（ReadTimeout/ReadError/WriteError等）：多为网络
                     #   抖动，保持原策略：同provider重试5次，标记瞬时错误不切换provider。
                     retry += 1
@@ -4879,15 +4917,19 @@ class ToolExecutionEngine:
                     service_unavailable = isinstance(
                         e, (httpx.ConnectError, httpx.RemoteProtocolError)
                     )
-                    max_retry = 2 if service_unavailable else 5
+                    # 🔧 事务#2474：重试期间保持同provider（chat_stream传failed=False，
+                    # 不mark_failed不冷却），连续3次（max_retry=3）全失败才切换
+                    is_service_unavailable = service_unavailable
+                    max_retry = 3 if service_unavailable else 5
                     if service_unavailable:
                         # 关键：清除可能残留的瞬时错误标记（如前一轮ReadTimeout），
-                        # 确保耗尽后走"所有provider失败"分支实现provider切换
+                        # 确保耗尽后走"所有provider失败"分支（而非熔断路径）切换provider
                         is_transient_error = False
                         logger.info(
                             f"{icon} {self.llm.provider} 事务#{task_id}大模型服务不可用"
                             f"({type(e).__name__})，0.5秒后同provider重试"
-                            f"(第{retry}/{max_retry}次)，重试耗尽将切换其他provider。"
+                            f"(第{retry}/{max_retry}次)，连续{max_retry}次重试失败"
+                            f"才切换其他provider。"
                         )
                     else:
                         is_transient_error = True  # 标记瞬时错误，阻止provider切换
@@ -4940,10 +4982,16 @@ class ToolExecutionEngine:
                         )
                     if retry >= max_retry:
                         if service_unavailable:
+                            # 🔧 事务#2474：重试期间failed=False未mark_failed，若仅靠
+                            # retry>0推导，公共路径sleep后continue回外层时retry已重置
+                            # 为0，get_provider(failed=False)会复用健康的原provider，
+                            # 永不切换死循环。故显式置位，下一次chat_stream调用传
+                            # failed=True触发mark_failed+切换provider后自动复位。
+                            self._provider_switch_pending = True
                             logger.warning(
                                 f"{icon} {self.llm.provider} 事务#{task_id}大模型服务不可用"
-                                f"({type(e).__name__})已重试{retry}次仍失败，"
-                                f"按冷却等待后自动切换其他provider。"
+                                f"({type(e).__name__})已连续{retry}次重试失败，"
+                                f"按冷却等待后切换其他provider。"
                                 f"最后错误: {self.llm.error}"
                             )
                         else:
@@ -4961,6 +5009,7 @@ class ToolExecutionEngine:
                     is_rate_limited = False  # 非429错误，重置限流标志
                     is_content_filtered = False  # 非内容审核错误，重置标志
                     is_transient_error = False  # 非网络瞬时错误，重置标志
+                    is_service_unavailable = False  # 非服务不可用错误，重置标志(事务#2474)
                     icon = self.llm.config.get_icon(self.llm.provider)
                     # 使用异常的完整字符串表示，包含具体错误信息
                     err_str = str(e).strip()
