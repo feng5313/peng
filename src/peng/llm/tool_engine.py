@@ -3449,6 +3449,16 @@ class ToolExecutionEngine:
             history: 消息历史对象
         """
         try:
+            # 🔧 事务#2484：退避期内直接跳过——快照失败后立即重试大概率再超时
+            # （每轮烧满预算）；指数退避给系统留出恢复窗口，成功后清零。
+            if time.monotonic() < self._iter_snap_skip_until:
+                logger.debug(
+                    f"迭代备份退避中(task#{task_id}): 剩余 "
+                    f"{self._iter_snap_skip_until - time.monotonic():.0f}s "
+                    f"(连续失败 {self._iter_snap_fail_count} 次)"
+                )
+                return
+
             # 捕获当前 checklist（从 DB 读取，迭代开始时尚未有本批次变更）
             checklist = ""
             try:
@@ -3526,12 +3536,18 @@ class ToolExecutionEngine:
                         nest_name=task_nest,
                     )
             except asyncio.TimeoutError:
+                # 🔧 事务#2484：指数退避（60/120/240/480s 封顶）——失败立即
+                # 重试会每轮烧满预算；退避期间跳过快照，无回滚点为安全降级
+                self._iter_snap_fail_count += 1
+                _backoff = min(60 * (2 ** (self._iter_snap_fail_count - 1)), 480)
+                self._iter_snap_skip_until = time.monotonic() + _backoff
                 logger.warning(
-                    f"迭代快照超预算{_iter_budget}s(task#{task_id}, iter#{iteration})，跳过本轮快照"
+                    f"迭代快照超预算{_iter_budget}s(task#{task_id}, iter#{iteration})，"
+                    f"跳过本轮快照，{_backoff:.0f}s 后自动重试"
                 )
                 _iter_warn = (
                     f"⚠️ 迭代备份快照超过 {_iter_budget}s 预算已跳过"
-                    f"（本轮无回滚点，上一轮快照仍可用）。\n"
+                    f"（本轮无回滚点，上一轮快照仍可用，{_backoff:.0f}s 后重试）。\n"
                 )
                 get_output_manager().write_output(
                     task_id=task_id,
@@ -3540,11 +3556,17 @@ class ToolExecutionEngine:
                 )
                 return
             if not meta:
-                logger.debug(f"迭代备份未生成(task#{task_id}, iter#{iteration})")
+                # 🔧 事务#2484：全部备份失败同样计入退避（轻度：60s 起步）
+                self._iter_snap_fail_count += 1
+                _backoff = min(60 * (2 ** (self._iter_snap_fail_count - 1)), 480)
+                self._iter_snap_skip_until = time.monotonic() + _backoff
+                logger.debug(f"迭代备份未生成(task#{task_id}, iter#{iteration})，{_backoff:.0f}s 后重试")
                 return
 
             # 备份成功：更新指纹基线（全部失败时不更新，下一轮自动重试）
             self._last_backup_fingerprint = fingerprint
+            self._iter_snap_fail_count = 0
+            self._iter_snap_skip_until = 0.0
 
             display = ToolBackupManager.generate_iteration_backup_display(meta)
             if display:
@@ -3901,6 +3923,11 @@ class ToolExecutionEngine:
         # 迭代备份去重指纹重置：run_stream 可能被多次调用（如resume恢复），
         # 每次运行开始重新建立备份基线，避免跨运行误判"无变化"
         self._last_backup_fingerprint = None
+        # 🔧 事务#2484：迭代快照失败指数退避——超时/失败后指纹不更新会
+        # 导致下一轮立即重试再超时，每轮烧满预算（用户痛点）。退避期间
+        # 跳过快照（无回滚点为安全降级），成功后清零。
+        self._iter_snap_fail_count: int = 0
+        self._iter_snap_skip_until: float = 0.0
         # 死循环检测
         self._iteration_strings: list[str] = []
         self._consecutive_dead_loops: int = 0

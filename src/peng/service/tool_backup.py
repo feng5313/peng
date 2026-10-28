@@ -974,6 +974,43 @@ def _run_shell(
         return _run_shell_remote(full_cmd, timeout, nest_name)
 
 
+# 🔧 事务#2484：远程 git 批量脚本 per-(nest, workdir) 串行锁
+# 根因：多事务共用同一 workdir（如 fcc 主仓库的多个 worktree 场景：
+# task#2481/2482/2483 同用 D:/work/worktrees/birds）时，各自每轮迭代发起
+# 的"迭代快照+工具批次快照+变更检查"远程 HTTP git 脚本并发挤兑（每脚本
+# 8+ 个 git 子进程，Windows 进程启动+Defender 扫描开销），单脚本从 3-5s
+# 波动到 60s+ 超预算；超时残留线程（HTTP timeout 360s）与新一轮并发又引
+# 发 peng_backup_idx 索引锁冲突（"File exists"，06:49 task#2481 实锤）。
+# 串行化后单脚本秒级，3-5 个事务排队仍在预算内。
+_REMOTE_WD_LOCKS: dict[tuple[str, str], threading.RLock] = {}
+_REMOTE_WD_LOCKS_GUARD = threading.Lock()
+
+
+def _get_remote_workdir_lock(nest_name: str, workdir: str) -> threading.RLock:
+    """获取 (nest, workdir) 级别的远程 git 脚本串行锁（路径归一防重复键）
+
+    RLock 允许同线程重入（快照内嵌套调用时安全）；不同 workdir 互不阻塞。
+    """
+    key = (
+        str(nest_name),
+        os.path.normpath(str(workdir)).replace("\\", "/").rstrip("/").lower(),
+    )
+    with _REMOTE_WD_LOCKS_GUARD:
+        return _REMOTE_WD_LOCKS.setdefault(key, threading.RLock())
+
+
+# Windows cmd 命令行长度硬限制 8191 字符，预留脚本前缀等余量
+_REMOTE_CMD_LEN_LIMIT = 7500
+
+
+def _estimate_remote_cmd_len(code: str) -> int:
+    """估算 nest exec 传输 python 代码的实际命令行长度（与 _run_python_remote 编码一致）"""
+    b64 = base64.b64encode(code.encode("utf-8")).decode("ascii")
+    return len(
+        f"python -c \"import base64;exec(base64.b64decode('{b64}').decode('utf-8'))\""
+    )
+
+
 def _run_python_remote(
     code: str, timeout: int = 30, nest_name: str = "local"
 ) -> subprocess.CompletedProcess:
@@ -2075,7 +2112,10 @@ class ToolBackupManager:
         )
 
         # 🔧 持久化增量索引保留（与快照共用）；首次全量放宽超时
-        result = _run_python_remote(py_code, timeout=360, nest_name=nest_name)
+        # 🔧 事务#2484：与快照共用 peng_backup_idx 索引——同 workdir 串行锁
+        # 防与快照脚本并发锁冲突（06:49 diff 预览与快照 "File exists" 实锤）
+        with _get_remote_workdir_lock(nest_name, str(workdir)):
+            result = _run_python_remote(py_code, timeout=360, nest_name=nest_name)
         if result.returncode != 0:
             logger.warning(f"远程批量变更检查失败({nest_name}): {result.stderr[:200]}")
             return rollback_meta
@@ -2404,26 +2444,72 @@ class ToolBackupManager:
             else:
                 rel_files.append(fp_key)  # 意外形态：原样保留（脚本端不 join）
 
+        # 🔧 事务#2484：watchdog 自杀时限——超预算后服务端已放弃等待，远程
+        # 进程继续跑只会持有索引锁阻碍下一轮快照（恶性循环：残留→锁冲突
+        # →失败→立即重试→再超时）。预算+30s 强杀整树（含 git 子进程），
+        # 杜绝 360s/300s 级残留。0=预算禁用时不自杀（跟随用户配置语义）。
+        try:
+            from peng.config.loader import get_snapshot_budget_seconds as _gsbs
+
+            _budget_s = _gsbs()
+        except Exception:
+            _budget_s = 60
+        kill_after = (_budget_s + 30) if _budget_s > 0 else 0
+
         # 构建批量脚本：在远程nest上执行完整快照流程
         py_code = (
-            "import subprocess, os, sys, json, uuid, shutil\n"
+            "import subprocess, os, sys, json, uuid, shutil, time, re\n"
             f"workdir = {workdir!r}\n"
             f"task_id = {task_id!r}\n"
             f"branch_name = {branch_name!r}\n"
             f"commit_msg = {commit_msg!r}\n"
             f"_rel_files = {rel_files!r}\n"
+            f"_kill_after = {kill_after!r}\n"
             # 相对路径还原为绝对路径（嵌套仓库识别需要向上找 .git）
             "internal_files = [os.path.normpath(os.path.join(workdir, r)) for r in _rel_files]\n"
             f"excl_dirs = {sorted(_FORCE_EXCLUDE_DIR_NAMES)!r}\n"
             f"excl_prefixes = {_FORCE_EXCLUDE_DIR_PREFIXES!r}\n"
             f"result_data = {{}}\n"
             "temp_index = None\n"
+            # 🔧 事务#2484 watchdog：超时自杀（杀整树含 git 子进程）——
+            # 服务端 wait_for 超时后无人消费结果，继续跑=持锁阻碍下轮快照
+            "if _kill_after > 0:\n"
+            "    import threading as _th\n"
+            "    def _peng_suicide():\n"
+            "        time.sleep(_kill_after)\n"
+            "        try:\n"
+            "            if os.name == 'nt':\n"
+            "                subprocess.run(['taskkill', '/F', '/T', '/PID', str(os.getpid())],\n"
+            "                               capture_output=True, timeout=15)\n"
+            "            else:\n"
+            "                import signal as _sg\n"
+            "                os.kill(os.getpid(), _sg.SIGKILL)\n"
+            "        except Exception:\n"
+            "            pass\n"
+            "    _th.Thread(target=_peng_suicide, daemon=True).start()\n"
+            # 🔧 事务#2484 陈旧锁自愈：peng_backup_idx 索引锁的持有者只可能是
+            # peng 快照脚本（用户 git 不碰它），而脚本全程受 watchdog 上限
+            # （kill_after）约束——锁龄超过 kill_after+10s 必为残留（持有者
+            # 已被杀，task#2439 lock 残留 4 小时致快照永久失败实锤）。
+            # 只清 peng 自己的索引锁，绝不动用户 git 主 index.lock。
+            "_stale_margin = (_kill_after + 10) if _kill_after > 0 else 100\n"
+            "def git(*args, env=None, timeout=30):\n"
+            "    full_env = dict(os.environ)\n"
+            "    if env: full_env.update(env)\n"
+            "    r = subprocess.run(['git'] + list(args), cwd=workdir, env=full_env,\n"
+            "                          capture_output=True, text=True, timeout=timeout)\n"
+            "    if r.returncode != 0 and 'File exists' in (r.stderr or ''):\n"
+            "        m = re.search(r\"Unable to create '([^']+peng_backup_idx[^']+\\\\.lock)'\", r.stderr)\n"
+            "        if m and os.path.isfile(m.group(1)):\n"
+            "            try:\n"
+            "                if time.time() - os.path.getmtime(m.group(1)) > _stale_margin:\n"
+            "                    os.unlink(m.group(1))\n"
+            "                    r = subprocess.run(['git'] + list(args), cwd=workdir, env=full_env,\n"
+            "                                          capture_output=True, text=True, timeout=timeout)\n"
+            "            except OSError:\n"
+            "                pass\n"
+            "    return r\n"
             "try:\n"
-            "    def git(*args, env=None, timeout=30):\n"
-            "        full_env = dict(os.environ)\n"
-            "        if env: full_env.update(env)\n"
-            "        return subprocess.run(['git'] + list(args), cwd=workdir, env=full_env,\n"
-            "                              capture_output=True, text=True, timeout=timeout)\n"
             "    def is_excluded(name):\n"
             "        return name in excl_dirs or name.startswith(excl_prefixes)\n"
             "    def filter_excluded(entries):\n"
@@ -2555,27 +2641,40 @@ class ToolBackupManager:
         # 一次，避免一次断连废掉整个快照；②"命令行太长"（Windows cmd 8191
         # 字符限制，脚本+internal_files 经 URL 传输）时丢弃 internal_files
         # （嵌套仓库识别降级）重建脚本重试一次，保住主快照（代码备份/回滚）
+        # 🔧 事务#2484：①命令行长度本地预判——超长时直接用精简脚本，省一次
+        # 必败 HTTP + 远程 python 启动（此前"命令行太长"重试风暴翻倍负载）；
+        # ②per-(nest,workdir) 串行锁——多事务共用同一 workdir 时远程 git
+        # 批量脚本互斥执行（消除并发挤兑与索引锁冲突，详见锁定义处注释）。
+        first_code = py_code
+        if _estimate_remote_cmd_len(first_code) > _REMOTE_CMD_LEN_LIMIT:
+            logger.info(
+                f"远程快照脚本预判超长({nest_name})，直接使用精简版"
+                f"（嵌套仓库识别降级）"
+            )
+            first_code = py_code_without_nested
+
         result = None
-        for attempt, code in enumerate((py_code, py_code_without_nested)):
-            if attempt > 0:
-                logger.warning(
-                    f"远程批量快照重试（精简internal_files）({nest_name})"
-                )
-            result = _run_python_remote(code, timeout=360, nest_name=nest_name)
-            if result.returncode == 0:
-                break
-            err_txt = (result.stderr or "")[:200]
-            if attempt == 0 and (
-                "未连接" in err_txt or "关闭" in err_txt or "timeout" in err_txt.lower()
-            ):
-                # 瞬断重试（一次）
-                time.sleep(1.5)
+        with _get_remote_workdir_lock(nest_name, str(workdir)):
+            for attempt, code in enumerate((first_code, py_code_without_nested)):
+                if attempt > 0:
+                    logger.warning(
+                        f"远程批量快照重试（精简internal_files）({nest_name})"
+                    )
                 result = _run_python_remote(code, timeout=360, nest_name=nest_name)
                 if result.returncode == 0:
                     break
-            if attempt == 0 and "命令行太长" in err_txt:
-                continue  # 换精简脚本重试
-            break
+                err_txt = (result.stderr or "")[:200]
+                if attempt == 0 and (
+                    "未连接" in err_txt or "关闭" in err_txt or "timeout" in err_txt.lower()
+                ):
+                    # 瞬断重试（一次）
+                    time.sleep(1.5)
+                    result = _run_python_remote(code, timeout=360, nest_name=nest_name)
+                    if result.returncode == 0:
+                        break
+                if attempt == 0 and "命令行太长" in err_txt:
+                    continue  # 换精简脚本重试
+                break
 
         if result is None or result.returncode != 0:
             err_txt = (result.stderr if result else "")[:200] if result else ""
@@ -4471,7 +4570,9 @@ class ToolBackupManager:
             "print(json.dumps(result_data))\n"
         )
 
-        result = _run_python_remote(py_code, timeout=180, nest_name=nest_name)
+        # 🔧 事务#2484：与快照共用 peng_backup_idx 索引——同 workdir 串行锁
+        with _get_remote_workdir_lock(nest_name, str(workdir)):
+            result = _run_python_remote(py_code, timeout=180, nest_name=nest_name)
         if result.returncode != 0:
             logger.warning(f"远程批量diff预览失败({nest_name}): {result.stderr[:200]}")
             return {"success": False, "diff": "", "changed_files": [], "truncated": False,
