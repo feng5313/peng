@@ -502,6 +502,15 @@ class MessageDatabase(metaclass=MetaSingleton):
                 nest = ""
                 workdir = ""
 
+        # 🔧 事务#2435：统一清理 workdir/nest 首尾空白（覆盖所有来源：kwargs传入、
+        # content @workdir解析、回复链继承、config兜底）。尾部空格会被事务继承并进入
+        # 工具context，导致 Windows 下 daemon 包装 bat 的 cd /d "... " 失败、日志重定向
+        # 路径无效。config.webui.workdir 可能被历史版本 set-workdir 写入带尾部空格的值。
+        if workdir:
+            workdir = workdir.strip()
+        if nest:
+            nest = nest.strip()
+
         # 检查重复消息
 
         if receiver == MASTER_NAME:

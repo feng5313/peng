@@ -1623,6 +1623,10 @@ class DaemonTool(BashTool):
         is_local_nest = nest_name == "local"
         task_id = self.get_context("task_id")
         workdir = self.get_context("workdir")
+        if workdir:
+            # 🔧 事务#2435：清理首尾空白（最后防线：尾部空格会导致 Windows 包装 bat
+            # 的 cd /d "... " 失败、日志重定向路径无效，daemon 启动即失败）
+            workdir = workdir.strip()
 
         is_win, _ = self._get_nest_platform()
         platform = self._resolve_platform(is_local_nest, is_win, nest_name)

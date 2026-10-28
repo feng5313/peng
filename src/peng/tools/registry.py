@@ -67,6 +67,14 @@ class ToolRegistry(metaclass=MetaSingleton):
         Args:
             **kwargs: 上下文键值对（如message_id=123, task_id=456）
         """
+        # 🔧 事务#2435：workdir/nest 统一清理首尾空白（context 唯一生产入口）。
+        # 尾部空格会导致 daemon 包装 bat 的 cd /d "... " 失败、日志重定向路径无效
+        workdir = kwargs.get("workdir")
+        if isinstance(workdir, str):
+            kwargs["workdir"] = workdir.strip()
+        nest = kwargs.get("nest")
+        if isinstance(nest, str):
+            kwargs["nest"] = nest.strip()
         self._context.update(kwargs)
 
     def clear_context(self) -> None:

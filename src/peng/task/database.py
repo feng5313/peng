@@ -857,6 +857,15 @@ class TaskDatabase(metaclass=MetaSingleton):
                 if not workdir:
                     workdir = ""
 
+        # 🔧 事务#2435：统一清理 workdir/nest 首尾空白（覆盖所有来源：显式传入、
+        # 消息继承、父事务继承、config兜底）。尾部空格会进入 agent 工具context，
+        # 导致 Windows 下 daemon 包装 bat 的 cd /d "... " 失败、日志重定向路径无效。
+        # config.webui.workdir 可能被历史版本 set-workdir 写入带尾部空格的值。
+        if nest:
+            nest = nest.strip()
+        if workdir:
+            workdir = workdir.strip()
+
         fields["nest"] = nest
         fields["workdir"] = workdir
         return fields

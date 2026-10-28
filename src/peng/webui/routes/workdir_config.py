@@ -94,6 +94,9 @@ def _save_workdir_to_config(workdir: str, config_path: Path | None = None) -> bo
     from peng.config import clear_config_cache, get_project_root
 
     try:
+        # 🔧 事务#2435：写入前清理首尾空白（该值作为消息/事务workdir的兜底默认值，
+        # 带尾部空格会污染后续所有未显式指定workdir的消息和事务，导致daemon等工具失败）
+        workdir = workdir.strip()
         config = _load_webui_json()
         if "webui" not in config:
             config["webui"] = {}
@@ -259,6 +262,11 @@ def _remove_topped_id(key: str, item_id: int) -> None:
 async def validate_workdir(path: str) -> ValidateWorkdirResponse:
     """验证工作目录是否有效"""
     try:
+        # 🔧 事务#2435：路径首尾空白清理（与 set_workdir 保持一致，
+        # 避免 Windows lenient 规范化下带尾部空格的路径通过验证）
+        path = path.strip()
+        if not path:
+            return ValidateWorkdirResponse(valid=False, error="路径为空")
         expanded_path = Path(path).expanduser()
         resolved_path = expanded_path.resolve()
         if resolved_path.is_dir():
@@ -273,6 +281,12 @@ async def validate_workdir(path: str) -> ValidateWorkdirResponse:
 async def set_workdir(path: str, nest: str | None = None, save_only: bool = False) -> SetWorkdirResponse:
     """设置工作目录"""
     global _current_workdir
+
+    # 🔧 事务#2435：路径首尾空白清理（尾部空格会导致下游 bat cd 失败/日志路径无效，
+    # 且 Windows lenient 规范化会在 is_dir/chdir 验证时掩盖该问题，必须入口根治）
+    path = path.strip()
+    if not path:
+        return SetWorkdirResponse(success=False, error="工作目录不能为空")
 
     if save_only:
         _save_workdir_to_config(path)

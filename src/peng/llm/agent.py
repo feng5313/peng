@@ -490,6 +490,9 @@ class PengAgent:
         # 设置工具上下文
         workdir = task.get("workdir")
         if workdir:
+            # 🔧 事务#2435：清理首尾空白（历史数据可能带尾部空格，进入工具context后
+            # 会导致 daemon 包装 bat 的 cd /d "... " 失败、日志重定向路径无效）
+            workdir = workdir.strip()
             import os
 
             if os.path.isdir(workdir):

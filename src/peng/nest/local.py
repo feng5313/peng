@@ -550,8 +550,11 @@ class LocalExecutor:
         """
         import json
 
-        workdir = params.get("workdir", "")
-        nest_name = params.get("nest_name", "")
+        # 🔧 事务#2435：清理首尾空白（Windows lenient 路径规范化会在 is_dir/os.chdir
+        # 验证时剥离尾部空格导致带空格路径通过验证，但 str(expanded) 保留空格
+        # 污染 config/nest.json，下游 bat 的 cd /d "... " 会失败）
+        workdir = str(params.get("workdir", "") or "").strip()
+        nest_name = str(params.get("nest_name", "") or "").strip()
 
         if not workdir:
             return NestResponse.make_error(params.get("_request_id", ""), "workdir不能为空")
