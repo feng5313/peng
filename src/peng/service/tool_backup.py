@@ -884,8 +884,6 @@ def _run_git_remote(
     通过 HTTP POST /api/nest/exec 调用远程nest。
     使用Python脚本包装，跨平台兼容（Windows cmd.exe / Linux bash）。
     """
-    import httpx
-
     # 构建 Python 包装脚本（跨平台兼容，不依赖 shell 语法）
     # 环境变量通过 env dict 设置，工作目录通过 cwd 参数设置
     env_items = ", ".join(f"{k!r}: {v!r}" for k, v in (env or {}).items())
@@ -900,47 +898,11 @@ def _run_git_remote(
         "sys.stderr.write(result.stderr)\n"
         "sys.exit(result.returncode)\n"
     )
-    # 用 _run_python_remote 的底层逻辑发送
-    code_b64 = base64.b64encode(py_code.encode("utf-8")).decode("ascii")
-    full_cmd = f"python -c \"import base64;exec(base64.b64decode('{code_b64}').decode('utf-8'))\""
-
-    try:
-        port = _get_webui_port()
-        api_hosts = _get_api_hosts(port)
-        last_error = None
-        for host in api_hosts:
-            try:
-                url = f"http://{host}:{port}/api/nest/exec"
-                resp = httpx.post(
-                    url,
-                    params={"nest": nest_name, "command": full_cmd, "timeout": timeout},
-                    json={},
-                    timeout=timeout + 10,
-                )
-                result = resp.json()
-                if not result.get("success"):
-                    return subprocess.CompletedProcess(
-                        args=["git"] + args,
-                        returncode=-1,
-                        stdout="",
-                        stderr=result.get("error", "remote exec failed"),
-                    )
-                return subprocess.CompletedProcess(
-                    args=["git"] + args,
-                    returncode=result.get("exit_code", -1),
-                    stdout=result.get("stdout", ""),
-                    stderr=result.get("stderr", ""),
-                )
-            except Exception as e:
-                last_error = e
-                continue
-        return subprocess.CompletedProcess(
-            args=["git"] + args, returncode=-1, stdout="", stderr=str(last_error)
-        )
-    except Exception as e:
-        return subprocess.CompletedProcess(
-            args=["git"] + args, returncode=-1, stdout="", stderr=str(e)
-        )
+    # 🔧 事务#2497：统一委托 _run_python_remote——长命令（多路径 git 参数）
+    # 自动走文件通道，短命令保持单次快路径；保留 args=["git"]+args 展示语义
+    result = _run_python_remote(py_code, timeout=timeout, nest_name=nest_name)
+    result.args = ["git"] + args
+    return result
 
 
 def _run_shell(
@@ -1000,6 +962,11 @@ def _get_remote_workdir_lock(nest_name: str, workdir: str) -> threading.RLock:
 
 
 # Windows cmd 命令行长度硬限制 8191 字符，预留脚本前缀等余量
+# 🔧 事务#2497 语义更新：本值现为"长脚本是否走文件通道"的阈值——
+# ≤阈值走原 `python -c` 直发快路径（单次 HTTP）；>阈值把脚本经协议
+# write 通道下发到远程 temp 再 `python <file>`（HTTP/WS 传输不受命令行
+# 长度限制）。cmd 8191 是远端 OS 硬限，脚本本体 base64 后即可达 8940
+# （实测），历史"精简版重试"瘦身分支对基线脚本无效已删除。
 _REMOTE_CMD_LEN_LIMIT = 7500
 
 
@@ -1011,6 +978,143 @@ def _estimate_remote_cmd_len(code: str) -> int:
     )
 
 
+def _nest_exec_post(
+    command: str,
+    timeout: int,
+    nest_name: str,
+    display_args: list[str] | None = None,
+) -> subprocess.CompletedProcess:
+    """POST /api/nest/exec 统一封装（HTTP 传输本身可携带长内容；
+    8191 硬限在远端 OS 命令行——超长内容改用文件通道，见 _run_python_remote）"""
+    import httpx
+
+    args = display_args if display_args is not None else [command]
+    try:
+        port = _get_webui_port()
+        api_hosts = _get_api_hosts(port)
+        last_error = None
+        for host in api_hosts:
+            try:
+                url = f"http://{host}:{port}/api/nest/exec"
+                resp = httpx.post(
+                    url,
+                    params={"nest": nest_name, "command": command, "timeout": timeout},
+                    json={},
+                    timeout=timeout + 10,
+                )
+                result = resp.json()
+                if not result.get("success"):
+                    return subprocess.CompletedProcess(
+                        args=args, returncode=-1, stdout="",
+                        stderr=result.get("error", "remote exec failed"),
+                    )
+                return subprocess.CompletedProcess(
+                    args=args,
+                    returncode=result.get("exit_code", -1),
+                    stdout=result.get("stdout", ""),
+                    stderr=result.get("stderr", ""),
+                )
+            except Exception as e:
+                last_error = e
+                continue
+        return subprocess.CompletedProcess(
+            args=args, returncode=-1, stdout="", stderr=str(last_error)
+        )
+    except Exception as e:
+        return subprocess.CompletedProcess(args=args, returncode=-1, stdout="", stderr=str(e))
+
+
+def _nest_api_post_json(api_path: str, body: dict, timeout: int = 30) -> dict | None:
+    """向本机 webui API POST JSON（nest 辅助通道统一封装，如 /api/nest/write_file）
+
+    返回解析后的 dict；全部 host 失败返回 None。
+    """
+    import httpx
+
+    last_error = None
+    try:
+        port = _get_webui_port()
+        api_hosts = _get_api_hosts(port)
+        for host in api_hosts:
+            try:
+                resp = httpx.post(f"http://{host}:{port}{api_path}", json=body, timeout=timeout + 10)
+                result = resp.json()
+                if isinstance(result, dict):
+                    return result
+                last_error = f"响应非dict: {result}"
+            except Exception as e:
+                last_error = e
+                continue
+        logger.debug(f"nest API POST失败({api_path}): {last_error}")
+        return None
+    except Exception as e:
+        logger.debug(f"nest API POST异常({api_path}): {e}")
+        return None
+
+
+# 🔧 事务#2497：长脚本文件通道——远程系统 temp 目录（per-nest 缓存；
+# 探测脚本本身极短走快路径，无递归风险）
+_REMOTE_TEMP_DIR_CACHE: dict[str, str] = {}
+_REMOTE_TEMP_DIR_LOCK = threading.Lock()
+
+
+def _remote_temp_dir_cached(nest_name: str) -> str | None:
+    """获取远程 nest 的系统 temp 目录（成功结果缓存；失败不缓存）"""
+    with _REMOTE_TEMP_DIR_LOCK:
+        cached = _REMOTE_TEMP_DIR_CACHE.get(nest_name)
+    if cached:
+        return cached
+    try:
+        r = _run_python_remote(
+            "import tempfile; print(tempfile.gettempdir())", timeout=5, nest_name=nest_name
+        )
+        if r.returncode != 0:
+            return None
+        d = r.stdout.strip().split("\n")[-1].strip()
+    except Exception:
+        return None
+    if not d:
+        return None
+    with _REMOTE_TEMP_DIR_LOCK:
+        _REMOTE_TEMP_DIR_CACHE[nest_name] = d
+    return d
+
+
+def _run_python_remote_via_file(
+    code: str, timeout: int, nest_name: str
+) -> subprocess.CompletedProcess:
+    """长脚本文件通道：脚本经协议 write 下发远程 temp → `python <file>`
+
+    命令行只放路径（短），彻底摆脱远端 OS 命令行长度硬限；执行后尽力
+    删除远程脚本文件（watchdog 被杀场景无法自删，temp 残留无害）。
+    """
+    temp_dir = _remote_temp_dir_cached(nest_name)
+    if not temp_dir:
+        return subprocess.CompletedProcess(
+            args=[code[:100]], returncode=-1, stdout="",
+            stderr="文件通道：远程temp目录获取失败",
+        )
+    remote_path = temp_dir.rstrip("/\\") + "/" + f"peng_pyexec_{uuid.uuid4().hex[:12]}.py"
+    write_res = _nest_api_post_json(
+        "/api/nest/write_file",
+        {"nest": nest_name, "path": remote_path, "content": code, "timeout": 30},
+    )
+    if not isinstance(write_res, dict) or not write_res.get("success"):
+        err = write_res.get("error") if isinstance(write_res, dict) else None
+        return subprocess.CompletedProcess(
+            args=[code[:100]], returncode=-1, stdout="",
+            stderr=f"文件通道写入失败: {str(err or 'write_file无响应')[:200]}",
+        )
+    # 双引号包路径：Windows cmd 与 bash 均接受（uuid/temp 路径无 shell 特殊字符）
+    result = _nest_exec_post(f'python "{remote_path}"', timeout, nest_name)
+    # best-effort 清理（失败仅记日志，不影响执行结果）
+    try:
+        _nest_exec_post(f"python -c \"import os;os.remove(r'{remote_path}')\"", 10, nest_name)
+    except Exception as e:
+        logger.debug(f"文件通道清理失败(忽略): {remote_path}: {e}")
+    return result
+
+
 def _run_python_remote(
     code: str, timeout: int = 30, nest_name: str = "local"
 ) -> subprocess.CompletedProcess:
@@ -1018,48 +1122,17 @@ def _run_python_remote(
 
     通过 nest exec API 发送 `python -c "code"` 命令。
     避免Unix/Windows shell命令差异问题。
+
+    🔧 事务#2497：估算命令行超阈值（Windows cmd 硬限）时改走文件通道——
+    脚本下发远程 temp 后 `python <file>`；阈值内保持单次调用快路径。
     """
-    import httpx
+    if _estimate_remote_cmd_len(code) > _REMOTE_CMD_LEN_LIMIT:
+        return _run_python_remote_via_file(code, timeout, nest_name)
 
     # 将Python代码编码为base64避免shell转义问题
     code_b64 = base64.b64encode(code.encode("utf-8")).decode("ascii")
     cmd = f"python -c \"import base64;exec(base64.b64decode('{code_b64}').decode('utf-8'))\""
-
-    try:
-        port = _get_webui_port()
-        api_hosts = _get_api_hosts(port)
-        last_error = None
-        for host in api_hosts:
-            try:
-                url = f"http://{host}:{port}/api/nest/exec"
-                resp = httpx.post(
-                    url,
-                    params={"nest": nest_name, "command": cmd, "timeout": timeout},
-                    json={},
-                    timeout=timeout + 10,
-                )
-                result = resp.json()
-                if not result.get("success"):
-                    return subprocess.CompletedProcess(
-                        args=cmd,
-                        returncode=-1,
-                        stdout="",
-                        stderr=result.get("error", "remote exec failed"),
-                    )
-                return subprocess.CompletedProcess(
-                    args=cmd,
-                    returncode=result.get("exit_code", -1),
-                    stdout=result.get("stdout", ""),
-                    stderr=result.get("stderr", ""),
-                )
-            except Exception as e:
-                last_error = e
-                continue
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=-1, stdout="", stderr=str(last_error)
-        )
-    except Exception as e:
-        return subprocess.CompletedProcess(args=cmd, returncode=-1, stdout="", stderr=str(e))
+    return _nest_exec_post(cmd, timeout, nest_name)
 
 
 def _run_shell_remote(
@@ -1067,44 +1140,8 @@ def _run_shell_remote(
     timeout: int,
     nest_name: str,
 ) -> subprocess.CompletedProcess:
-    """在远程nest上执行shell命令"""
-    import httpx
-
-    try:
-        port = _get_webui_port()
-        api_hosts = _get_api_hosts(port)
-        last_error = None
-        for host in api_hosts:
-            try:
-                url = f"http://{host}:{port}/api/nest/exec"
-                resp = httpx.post(
-                    url,
-                    params={"nest": nest_name, "command": cmd, "timeout": timeout},
-                    json={},
-                    timeout=timeout + 10,
-                )
-                result = resp.json()
-                if not result.get("success"):
-                    return subprocess.CompletedProcess(
-                        args=cmd,
-                        returncode=-1,
-                        stdout="",
-                        stderr=result.get("error", "remote exec failed"),
-                    )
-                return subprocess.CompletedProcess(
-                    args=cmd,
-                    returncode=result.get("exit_code", -1),
-                    stdout=result.get("stdout", ""),
-                    stderr=result.get("stderr", ""),
-                )
-            except Exception as e:
-                last_error = e
-                continue
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=-1, stdout="", stderr=str(last_error)
-        )
-    except Exception as e:
-        return subprocess.CompletedProcess(args=cmd, returncode=-1, stdout="", stderr=str(e))
+    """在远程nest上执行shell命令（统一走 _nest_exec_post 通道）"""
+    return _nest_exec_post(cmd, timeout, nest_name)
 
 
 def _get_webui_port() -> int:
@@ -2434,7 +2471,8 @@ class ToolBackupManager:
         # 🔧 事务#2402：internal_files 相对化瘦身——绝对路径（D:/work/fcc/x.cpp
         # 平均数十字符）改为相对 workdir 的短路径，脚本端 join 还原；大事务
         # 涉及文件多时曾撑爆 Windows cmd 8191 字符命令行限制（"命令行太长"
-        # →快照失败）。相对化平均缩短 60-80%，配合超长时丢列表重试双保险
+        # →快照失败）。相对化平均缩短 60-80%（🔧事务#2497：超长根治为文件通道，
+        # 相对化仍节省传输载荷，机制保留）
         wd_norm_key = os.path.normpath(str(workdir)).replace("\\", "/").rstrip("/").lower()
         rel_files: list[str] = []
         for fp in (internal_files or []):
@@ -2630,51 +2668,25 @@ class ToolBackupManager:
             "print(json.dumps(result_data))\n"
         )
 
-        # 🔧 事务#2402：精简版脚本（空 internal_files，嵌套识别降级）——
-        # "命令行太长"时用它重试，保住主快照（代码备份/回滚是核心功能）
-        py_code_without_nested = py_code.replace(
-            f"_rel_files = {rel_files!r}\n", "_rel_files = []\n", 1
-        )
+        # 🔧 事务#2497：删除"精简版脚本/命令行超长绕路"分支——超长脚本已由
+        # _run_python_remote 统一走文件通道（下发远程 temp→python <file>），
+        # 长度不再构成失败因素；保留 per-(nest,workdir) 串行锁（#2484，消除
+        # 并发挤兑与索引锁冲突）与 nest 瞬断单次重试（#2402，亚秒级重连窗口）
 
         # 🔧 持久化增量索引跨快照复用（不删除）；首次可能全量，timeout 放宽
-        # 🔧 事务#2402：①nest 瞬断（WebSocket 1006 断连后亚秒级重连）短重试
-        # 一次，避免一次断连废掉整个快照；②"命令行太长"（Windows cmd 8191
-        # 字符限制，脚本+internal_files 经 URL 传输）时丢弃 internal_files
-        # （嵌套仓库识别降级）重建脚本重试一次，保住主快照（代码备份/回滚）
-        # 🔧 事务#2484：①命令行长度本地预判——超长时直接用精简脚本，省一次
-        # 必败 HTTP + 远程 python 启动（此前"命令行太长"重试风暴翻倍负载）；
-        # ②per-(nest,workdir) 串行锁——多事务共用同一 workdir 时远程 git
-        # 批量脚本互斥执行（消除并发挤兑与索引锁冲突，详见锁定义处注释）。
-        first_code = py_code
-        if _estimate_remote_cmd_len(first_code) > _REMOTE_CMD_LEN_LIMIT:
-            logger.info(
-                f"远程快照脚本预判超长({nest_name})，直接使用精简版"
-                f"（嵌套仓库识别降级）"
-            )
-            first_code = py_code_without_nested
-
         result = None
         with _get_remote_workdir_lock(nest_name, str(workdir)):
-            for attempt, code in enumerate((first_code, py_code_without_nested)):
-                if attempt > 0:
-                    logger.warning(
-                        f"远程批量快照重试（精简internal_files）({nest_name})"
-                    )
-                result = _run_python_remote(code, timeout=360, nest_name=nest_name)
-                if result.returncode == 0:
-                    break
+            result = _run_python_remote(py_code, timeout=360, nest_name=nest_name)
+            if result.returncode != 0:
                 err_txt = (result.stderr or "")[:200]
-                if attempt == 0 and (
-                    "未连接" in err_txt or "关闭" in err_txt or "timeout" in err_txt.lower()
+                if (
+                    "未连接" in err_txt
+                    or "关闭" in err_txt
+                    or "timeout" in err_txt.lower()
                 ):
                     # 瞬断重试（一次）
                     time.sleep(1.5)
-                    result = _run_python_remote(code, timeout=360, nest_name=nest_name)
-                    if result.returncode == 0:
-                        break
-                if attempt == 0 and "命令行太长" in err_txt:
-                    continue  # 换精简脚本重试
-                break
+                    result = _run_python_remote(py_code, timeout=360, nest_name=nest_name)
 
         if result is None or result.returncode != 0:
             err_txt = (result.stderr if result else "")[:200] if result else ""

@@ -313,3 +313,40 @@ async def exec_on_nest_stream(nest: str, command: str, timeout: int = 300):
             "X-Accel-Buffering": "no",  # nginx 不缓冲
         },
     )
+
+
+@router.post("/nest/write_file")
+async def write_file_on_nest(request: dict[str, Any]) -> dict[str, Any]:
+    """在指定 nest 上写入文本文件（JSON body: nest/path/content/timeout）
+
+    走 nest 协议 write 通道（WS/JSON 传输），不受远端 OS 命令行长度限制，
+    供 tool_backup 长脚本文件通道下发脚本使用（事务#2497）。
+
+    Returns: {success, data?|error?}
+    """
+    try:
+        from peng.nest.bridge import NestBridgeManager
+        from peng.nest.protocol import NestRequest
+
+        nest = str(request.get("nest") or "")
+        path = str(request.get("path") or "")
+        content = request.get("content")
+        content = content if isinstance(content, str) else ""
+        if not nest or not path:
+            return {"success": False, "error": "缺少 nest/path 参数"}
+
+        mgr = NestBridgeManager.get_instance()
+        conn = mgr.get_connection(nest)
+        if not conn:
+            return {"success": False, "error": f"nest '{nest}' 未连接"}
+
+        response = await conn.send_request(
+            NestRequest(type="write", params={"path": path, "content": content}),
+            timeout=float(request.get("timeout") or 30) + 5.0,
+        )
+        if response.error:
+            return {"success": False, "error": response.error}
+        return {"success": True, "data": response.data or {}}
+    except Exception as e:
+        logger.error(f"nest write_file失败: {e}\n{traceback.format_exc()}")
+        return {"success": False, "error": str(e)}

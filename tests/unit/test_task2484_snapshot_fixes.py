@@ -8,7 +8,9 @@
 1. 远程快照脚本 watchdog 自杀（budget+30s，taskkill /T 杀整树）
 2. 远程脚本 git() 陈旧锁自愈（peng_backup_idx 锁龄>kill_after+10s 清理）
 3. per-(nest,workdir) 串行锁（快照/变更检查/diff预览三处共用）
-4. 命令行长度本地预判（>7500 字符直接用精简脚本）
+4. 命令行长度阈值路由（>7500 走文件通道：脚本下发远程 temp→python <file>，
+   🔧事务#2497 根治——脚本本体 base64 后即可达 8940>cmd 硬限 8191，
+   原"精简版脚本绕路"分支对基线脚本无效已删除）
 5. ToolEngine 迭代快照指数退避（60/120/240/480s 封顶，成功清零）
 """
 import json
@@ -80,15 +82,79 @@ class TestRemoteSnapshotScript:
         )
         assert m and "peng_backup_idx" in m.group(1)
 
-    def test_oversized_script_uses_slim_first(self):
+    def test_oversized_script_passes_full_script(self):
+        # 🔧 事务#2497：超长脚本不再"精简版绕路"——完整脚本原样交给
+        # _run_python_remote（内部按阈值走文件通道），单次调用、不降级
         long_files = [
             f"D:/work/worktrees/birds/dir{i % 20}/sub{i % 50}/file_{i:05d}.cpp"
             for i in range(400)
         ]
         meta, captured = _run_snapshot(long_files)
-        assert len(captured) == 1, "超长时应只发一次（精简版）"
-        assert "_rel_files = []" in captured[0]
+        assert len(captured) == 1, "应只发一次完整脚本（无精简重试）"
+        assert "_rel_files = []" not in captured[0], "不应再降级空列表"
+        assert "dir0/sub0/file_00000.cpp" in captured[0], "相对化清单应内嵌"
         compile(captured[0], "<remote_snapshot2>", "exec")
+
+
+class TestFileChannelRouting:
+    """🔧 事务#2497：_run_python_remote 阈值路由——短脚本直发快路径；
+    超长脚本经 write_file 协议通道下发远程 temp 后 python <file>"""
+
+    def _fake_exec(self, calls):
+        def fake(command, timeout, nest_name, display_args=None):
+            calls.append(command)
+            return subprocess.CompletedProcess(
+                args=command, returncode=0, stdout='{"commit_hash": "abc123"}', stderr=""
+            )
+        return fake
+
+    def _fake_api(self, calls, ok=True):
+        def fake(api_path, body, timeout=30):
+            calls.append((api_path, body))
+            if not ok:
+                return {"success": False, "error": "路径访问被安全策略拒绝"}
+            return {"success": True, "data": {}}
+        return fake
+
+    def _prime_cache(self, monkeypatch):
+        monkeypatch.setitem(tb._REMOTE_TEMP_DIR_CACHE, "testnest", "/tmp")
+
+    def test_short_script_direct_fast_path(self, monkeypatch):
+        exec_calls, api_calls = [], []
+        self._prime_cache(monkeypatch)
+        with patch.object(tb, "_nest_exec_post", side_effect=self._fake_exec(exec_calls)), \
+             patch.object(tb, "_nest_api_post_json", side_effect=self._fake_api(api_calls)):
+            r = tb._run_python_remote("print(1)", timeout=30, nest_name="testnest")
+        assert r.returncode == 0
+        assert len(exec_calls) == 1 and exec_calls[0].startswith("python -c ")
+        assert api_calls == [], "短脚本不应触发文件通道"
+
+    def test_oversized_script_routes_through_file(self, monkeypatch):
+        big_code = "# " + ("payload_line_x" * 480 + "\n")  # ~7KB raw → base64 超阈值
+        assert tb._estimate_remote_cmd_len(big_code) > tb._REMOTE_CMD_LEN_LIMIT
+        exec_calls, api_calls = [], []
+        self._prime_cache(monkeypatch)
+        with patch.object(tb, "_nest_exec_post", side_effect=self._fake_exec(exec_calls)), \
+             patch.object(tb, "_nest_api_post_json", side_effect=self._fake_api(api_calls)):
+            r = tb._run_python_remote(big_code, timeout=60, nest_name="testnest")
+        assert r.returncode == 0 and r.stdout == '{"commit_hash": "abc123"}'
+        assert len(api_calls) == 1 and api_calls[0][0] == "/api/nest/write_file"
+        body = api_calls[0][1]
+        assert body["nest"] == "testnest" and body["content"] == big_code
+        assert body["path"].startswith("/tmp/peng_pyexec_") and body["path"].endswith(".py")
+        # 命令行只放路径 + best-effort 清理
+        assert exec_calls[0] == f'python "{body["path"]}"', "命令行只放路径"
+        assert len(exec_calls) == 2 and "os.remove" in exec_calls[1]
+
+    def test_write_failure_returns_error_without_exec(self, monkeypatch):
+        big_code = "# " + ("payload_line_x" * 480 + "\n")
+        exec_calls, api_calls = [], []
+        self._prime_cache(monkeypatch)
+        with patch.object(tb, "_nest_exec_post", side_effect=self._fake_exec(exec_calls)), \
+             patch.object(tb, "_nest_api_post_json", side_effect=self._fake_api(api_calls, ok=False)):
+            r = tb._run_python_remote(big_code, timeout=60, nest_name="testnest")
+        assert r.returncode == -1 and "文件通道写入失败" in r.stderr
+        assert exec_calls == [], "写入失败不应执行"
 
 
 class TestWorkdirLock:
