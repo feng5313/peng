@@ -60,6 +60,11 @@ class TestCliInjection:
         assert "--nest" in args and "--workdir" in args
 
 
+def _extract_subcmd_items(block: str) -> set[str]:
+    """从源码块提取子命令集合：只接受ASCII小写词（滤除注释中的引号词）"""
+    return {x for x in re.findall(r'"([^"]+)"', block) if re.fullmatch(r"[a-z][a-z0-9-]*", x)}
+
+
 class TestBinMsgInjectionConsistency:
     """bin/msg 内联注入逻辑与 _msg_impl 必须一致（两处各自维护集合，防漂移）"""
 
@@ -68,7 +73,7 @@ class TestBinMsgInjectionConsistency:
         src = path.read_text(encoding="utf-8")
         m = re.search(r"_msg_all_subcommands\s*=\s*\{(.*?)\}", src, re.S)
         assert m, "bin/msg 未找到 _msg_all_subcommands"
-        return set(re.findall(r'"([^"]+)"', m.group(1)))
+        return _extract_subcmd_items(m.group(1))
 
     def _msg_impl_set(self) -> set[str]:
         path = (
@@ -81,7 +86,7 @@ class TestBinMsgInjectionConsistency:
             re.S,
         )
         assert m, "_msg_impl 未找到 _msg_all_subcommands"
-        return set(re.findall(r'"([^"]+)"', m.group(1)))
+        return _extract_subcmd_items(m.group(1))
 
     def test_reply_excluded_from_injection(self):
         for name in (self._bin_msg_set(), self._msg_impl_set()):
@@ -89,6 +94,24 @@ class TestBinMsgInjectionConsistency:
 
     def test_sets_identical(self):
         assert self._bin_msg_set() == self._msg_impl_set()
+
+
+class TestSubcmdWhitelistConsistency:
+    """事务#2502：message工具子命令白名单须与CLI两处子命令清单一致（防漂移）——
+    漏项意味着该子命令会落进"默认子命令send"路径（发送根消息）"""
+
+    def test_whitelist_matches_cli_subcommands(self):
+        from peng.tools.message import _MSG_SUBCMDS
+
+        bin_set = TestBinMsgInjectionConsistency()._bin_msg_set() | {"send"}
+        assert _MSG_SUBCMDS == bin_set, "白名单须等于 bin/msg 子命令集合+send"
+
+        impl = Path(get_project_root()) / "src" / "peng" / "cli" / "_msg_impl.py"
+        src = impl.read_text(encoding="utf-8")
+        m = re.search(r"def parse_legacy_args.*?subcommands\s*=\s*\[(.*?)\]", src, re.S)
+        assert m, "parse_legacy_args 未找到 subcommands 列表"
+        legacy = _extract_subcmd_items(m.group(1))
+        assert _MSG_SUBCMDS == legacy, "白名单须等于 parse_legacy_args 的子命令列表"
 
 
 # ==================== 数据库层：回复消息跟随链首 ====================

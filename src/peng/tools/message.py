@@ -52,6 +52,18 @@ PROJECT_ROOT = get_project_root()
 # reply目标消息ID解析（事务#2502：send禁用后，--to别名与事务ID正则已成死代码并删除）
 _MSG_ID_RE = re.compile(r"^(?:消息#?|#)(\d+)$", re.IGNORECASE)
 
+# bin/msg 合法子命令白名单（含send：send进入专门拒绝分支）。
+# 事务#2502：bin/msg 对"无子命令/非法首参数"的默认处理是转成 send（发送根消息），
+# 因此工具入口必须先校验子命令，彻底封死根消息的默认发送路径；
+# 该集合须与 bin/msg 的 _msg_all_subcommands+send、parse_legacy_args 的
+# subcommands 列表保持一致（测试锁定）
+_MSG_SUBCMDS = {
+    "send", "list", "trees", "show", "content", "title", "nest", "workdir",
+    "reply", "delete", "status", "pause", "cancel", "restart", "resume",
+    "up", "down", "search", "tree", "full-tree", "context", "move",
+    "archive", "unarchive",
+}
+
 
 def _write_temp_file(content: str) -> str:
     """将内容写入临时文件，返回文件路径"""
@@ -152,8 +164,10 @@ class MessageTool(Tool):
 1. 参数中禁止管道操作
 2. 支持换行转义符\\n，允许在参数中使用换行符
 3. 避免使用英文单引号或双引号，建议使用中文引号或不使用引号
-4. 彻底禁止用本工具发送根消息（send已禁用）：所有消息必须通过 reply 挂在已有消息链内，
-   新任务只能由风主🍃发布；reply 必须指明目标消息ID（缺省则回复本事务的链首消息）
+4. 彻底禁止用本工具发送根消息：所有消息必须通过 reply 挂在已有消息链内，
+   新任务只能由风主🍃发布；参数必须以合法子命令开头（send已禁用，
+   不带子命令的裸内容=发送根消息，一律拒绝）；
+   reply 必须指明目标消息ID（缺省则回复本事务的链首消息）
 5. 回复消息的 nest/workdir 自动设置为与根消息一样，无需（也无法）指定 --nest/--workdir，
    显式传入会被剥离
 6. 选项（--timeout 等）必须写在参数**末尾**（内容之后），否则会被当作内容的一部分而失效！
@@ -208,6 +222,26 @@ class MessageTool(Tool):
                     summary=output,
                     display=output,
                 )
+
+            # 事务#2502：子命令白名单校验——bin/msg 对"无子命令/非法首参数"的
+            # 默认处理是转成 send（发送根消息，见 parse_legacy_args），工具入口
+            # 必须彻底拦截该默认路径，只放行 --help/-h 纯帮助
+            if subcmd not in _MSG_SUBCMDS and subcmd not in ("--help", "-h"):
+                if not subcmd:
+                    output = (
+                        "❌  message工具调用失败： 未指定子命令，"
+                        f"禁止发送根消息（新任务只能由{MASTER_NAME}发布）。"
+                        "发送消息请用 reply <消息#ID>，"
+                        "查询请用 trees/show/context 等子命令。"
+                    )
+                else:
+                    output = (
+                        f"❌  message工具调用失败： 非法子命令 {subcmd!r}。"
+                        "不带子命令的裸内容会被bin/msg当作send发送根消息，已彻底禁止；"
+                        "发送消息请用 reply <消息#ID>，"
+                        "其余操作请用合法子命令（trees/show/context/search/tree/full-tree等）。"
+                    )
+                return DualOutput(summary=output, display=output)
 
             # 构建命令 - Windows 上需要通过 python 解释器执行无扩展名的脚本
             msg_script = str(PROJECT_ROOT / "bin" / "msg")

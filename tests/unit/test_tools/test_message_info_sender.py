@@ -168,6 +168,11 @@ class TestMessageToolNoRootMessage:
     @pytest.mark.parametrize(
         "args",
         [
+            # 裸内容/选项开头裸内容：bin/msg默认转send（发送根消息），必须拦截
+            "帮我截屏",
+            "--nest win11 帮我截屏",
+            "-n win11 内容",
+            # 显式send各变体
             "send 帮我截屏",
             "send 帮我截屏 --to peng",
             "send 通知你一下 --to 风主🍃",
@@ -184,8 +189,26 @@ class TestMessageToolNoRootMessage:
         result = await _run_tool(tool, args)
         assert captured.cmds == []
         assert "❌" in result.summary
-        assert "禁用send" in result.summary
         assert "reply" in result.summary
+
+    async def test_empty_args_rejected(self, monkeypatch):
+        """空参数：拒绝（无子命令），不允许默认send发根消息"""
+        tool, captured = _make_tool(monkeypatch)
+        result = await _run_tool(tool, "")
+        assert captured.cmds == []
+        assert "❌" in result.summary and "根消息" in result.summary
+
+    async def test_help_option_allowed(self, monkeypatch):
+        """纯帮助选项放行（只读，不会创建消息）"""
+        tool, captured = _make_tool(monkeypatch)
+        await _run_tool(tool, "--help")
+        assert len(captured.cmds) == 1
+
+    async def test_readonly_subcommand_allowed(self, monkeypatch):
+        """合法只读子命令正常透传"""
+        tool, captured = _make_tool(monkeypatch)
+        await _run_tool(tool, "trees")
+        assert captured.cmds[0][2] == "trees"
 
     async def test_reply_without_id_falls_back_to_own_chain_message(self, monkeypatch):
         """reply 无ID：自动回复本事务链首消息（链内消息，非根消息）"""
