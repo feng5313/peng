@@ -1589,6 +1589,16 @@ function showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, bac
   // 撤销快照可能不带 history（备份失败时），context/checklist 照常按字段判断
   var scopeLabels = { files: '工作目录文件', external: '外部文件', checklist: 'checklist', context: '上下文' };
 
+  // 🔧 文件级勾选列表（事务#2513）：changed_files（含added）∪ external_files
+  // （不在changed_files中的绝对路径）——覆盖回滚恢复的全部文件对象；
+  // 每文件勾选框默认全选，取消勾选则该文件不检测/不恢复/不进undo快照
+  // （executeRollback 传 selected_files：null=全选全量，数组=选中文件）
+  var rollbackExtFiles = (rollbackMeta && rollbackMeta.external_files) || [];
+  var rollbackFileList = (changedFiles || []).slice();
+  rollbackExtFiles.forEach(function(f) {
+    if (rollbackFileList.indexOf(f) < 0) rollbackFileList.push(f);
+  });
+
   headerEl.innerHTML = ''
     + '<div style="font-size:16px;font-weight:bold;margin-bottom:12px;color:' + accent + '">'
     +   typeIcon + ' 确认' + actionLabel + '操作'
@@ -1606,16 +1616,29 @@ function showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, bac
       +     '</code>'
       +   '</div>'
       : '')
-    +   (changedFiles && changedFiles.length > 0
+    +   (rollbackFileList.length > 0
       ?   '<div style="margin-bottom:8px">'
-      +     '<span style="color:#8b949e">' + (isUndo ? '恢复文件' : '影响文件') + '（' + changedFiles.length + '）：</span>'
-      +     '<div style="margin-top:4px;max-height:120px;overflow-y:auto;background:rgba(255,255,255,0.04);border-radius:4px;padding:6px 8px">'
-      +       changedFiles.slice(0, 30).map(function(f) {
-            var isAdded = addedFiles.indexOf(f) >= 0;
-            var tag = isAdded ? (isUndo ? ' <span style="color:#3fb950">[新增]</span>' : ' <span style="color:#f85149">[删除]</span>') : '';
-            return '<div style="font-size:var(--font-size-ui, 12px);color:' + text + ';padding:1px 0;word-break:break-all">• ' + f.replace(/</g, '&lt;').replace(/>/g, '&gt;') + tag + '</div>';
+      +     '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+      +       '<span style="color:#8b949e">' + (isUndo ? '恢复文件' : '影响文件') + '（<span id="rollback-file-count" style="color:#39c5cf">' + rollbackFileList.length + '/' + rollbackFileList.length + '</span>）：</span>'
+      +       '<label for="rollback-file-all" style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:var(--font-size-ui, 12px);color:' + text + '">'
+      +         '<input type="checkbox" id="rollback-file-all" checked style="accent-color:' + accent + ';cursor:pointer;flex-shrink:0;width:13px;height:13px">'
+      +         '<span>全选</span>'
+      +       '</label>'
+      +     '</div>'
+      +     '<div id="rollback-file-list" style="margin-top:4px;max-height:160px;overflow-y:auto;background:rgba(255,255,255,0.04);border-radius:4px;padding:6px 8px">'
+      +       rollbackFileList.map(function(f, idx) {
+            var isAdded = (addedFiles || []).indexOf(f) >= 0;
+            // 标记：新增/删除（added_files）或外部文件（external_files 追加项）
+            var isExtOnly = rollbackExtFiles.indexOf(f) >= 0
+              && (changedFiles || []).indexOf(f) < 0;
+            var tag = isAdded
+              ? (isUndo ? ' <span style="color:#3fb950">[新增]</span>' : ' <span style="color:#f85149">[删除]</span>')
+              : (isExtOnly ? ' <span style="color:#39c5cf">[外部]</span>' : '');
+            return '<label for="rollback-file-' + idx + '" style="display:flex;align-items:flex-start;gap:6px;cursor:pointer;font-size:var(--font-size-ui, 12px);color:' + text + ';padding:1px 0;word-break:break-all">'
+              + '<input type="checkbox" id="rollback-file-' + idx + '" class="rollback-file-check" data-idx="' + idx + '" checked style="accent-color:' + accent + ';cursor:pointer;flex-shrink:0;width:13px;height:13px;margin-top:2px">'
+              + '<span>' + String(f).replace(/</g, '&lt;').replace(/>/g, '&gt;') + tag + '</span>'
+              + '</label>';
           }).join('')
-      +       (changedFiles.length > 30 ? '<div style="font-size:var(--font-size-ui, 12px);color:#8b949e;padding:1px 0">... 共 ' + changedFiles.length + ' 个文件</div>' : '')
       +     '</div>'
       +   '</div>'
       : '')
@@ -1692,14 +1715,38 @@ function showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, bac
     overlay.remove();
   });
 
+  // 🔧 文件级勾选（事务#2513）：文件勾选框读取与选中文件列表——
+  // 全选→null（不过滤=全量回滚，与旧行为一致）；部分勾选→勾选文件数组
+  var getFileChecks = function() {
+    return Array.prototype.slice.call(
+      document.querySelectorAll('#rollback-file-list .rollback-file-check')
+    );
+  };
+  var readSelectedFiles = function() {
+    var checks = getFileChecks();
+    if (!checks.length) return null;  // 无文件列表（history_only 等）→全量
+    var checked = checks.filter(function(cb) { return cb.checked; });
+    if (checked.length === checks.length) return null;  // 全选=不过滤
+    return checked.map(function(cb) {
+      return rollbackFileList[parseInt(cb.getAttribute('data-idx'), 10)];
+    });
+  };
+
   // 🔧 四维度勾选状态：返回 {files, external, checklist, context}
-  // （true=勾选回滚该维度；快照不含的disabled维度为false——后端本就无该内容可回滚）
+  // （true=勾选回滚该维度；快照不含的disabled维度为false——后端本就无该内容可回滚；
+  //  🔧 文件级联动：存在文件列表且全部未勾选时，文件两维度视同未勾选——
+  //  无任何文件将回滚，与后端 selected_files 空数组防御一致）
   var readScopeOptions = function() {
     var opts = {};
     scopeOrder.forEach(function(scope) {
       var el = document.getElementById('rollback-scope-' + scope);
       opts[scope] = !!(el && el.checked);
     });
+    var checks = getFileChecks();
+    if (checks.length && !checks.some(function(cb) { return cb.checked; })) {
+      opts.files = false;
+      opts.external = false;
+    }
     return opts;
   };
 
@@ -1707,10 +1754,27 @@ function showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, bac
   var summaryEl = document.getElementById('rollback-scope-summary');
   var okBtn = document.getElementById('rollback-ok-btn');
   var updateScopeUi = function() {
-    var selected = scopeOrder.filter(function(scope) {
+    // 🔧 文件勾选计数 + 全选主checkbox三态
+    var checks = getFileChecks();
+    var checkedCount = checks.filter(function(cb) { return cb.checked; }).length;
+    var hasFileList = checks.length > 0;
+    var anyFileChecked = checkedCount > 0;
+    var countEl = document.getElementById('rollback-file-count');
+    if (countEl) countEl.textContent = checkedCount + '/' + checks.length;
+    var allCb = document.getElementById('rollback-file-all');
+    if (allCb) {
+      allCb.checked = checkedCount === checks.length;
+      allCb.indeterminate = checkedCount > 0 && checkedCount < checks.length;
+    }
+    // 维度有效性 = 勾选 且（无文件列表 或 有勾选文件——文件级联动）
+    var effectiveScope = function(scope) {
       var el = document.getElementById('rollback-scope-' + scope);
-      return el && el.checked;
-    });
+      if (!el || !el.checked) return false;
+      if (hasFileList && !anyFileChecked
+          && (scope === 'files' || scope === 'external')) return false;
+      return true;
+    };
+    var selected = scopeOrder.filter(effectiveScope);
     if (summaryEl) {
       if (selected.length) {
         summaryEl.textContent = '将回滚：' + selected.map(function(s) { return scopeLabels[s]; }).join('、');
@@ -1727,27 +1791,63 @@ function showRollbackConfirmDialog(toolName, timestamp, taskId, rollbackCmd, bac
     }
     // diff预览区块联动：勾选的维度显示对应区块，取消勾选隐藏
     scopeOrder.forEach(function(scope) {
-      var el = document.getElementById('rollback-scope-' + scope);
-      var show = !!(el && el.checked);
+      var show = effectiveScope(scope);
       var blocks = diffContainer.querySelectorAll('[data-scope-block="' + scope + '"]');
       blocks.forEach(function(b) { b.style.display = show ? '' : 'none'; });
+    });
+    // 🔧 文件级联动：未勾选文件的 diff 块（data-diff-file）与预览
+    // 列表行（data-file-row）隐藏（路径斜杠归一化匹配）
+    var normPath = function(p) { return String(p).replace(/\\/g, '/'); };
+    checks.forEach(function(cb) {
+      var f = rollbackFileList[parseInt(cb.getAttribute('data-idx'), 10)];
+      var disp = cb.checked ? '' : 'none';
+      var fn = normPath(f);
+      diffContainer.querySelectorAll('[data-diff-file]').forEach(function(b) {
+        if (normPath(b.getAttribute('data-diff-file')) === fn) b.style.display = disp;
+      });
+      diffContainer.querySelectorAll('[data-file-row]').forEach(function(row) {
+        if (normPath(row.getAttribute('data-file-row')) === fn) row.style.display = disp;
+      });
     });
   };
   scopeOrder.forEach(function(scope) {
     var el = document.getElementById('rollback-scope-' + scope);
     if (el) el.addEventListener('change', updateScopeUi);
   });
+  // 文件勾选 change（容器事件委托）
+  var fileListEl = document.getElementById('rollback-file-list');
+  if (fileListEl) {
+    fileListEl.addEventListener('change', function(e) {
+      if (e.target && e.target.classList
+          && e.target.classList.contains('rollback-file-check')) {
+        updateScopeUi();
+      }
+    });
+  }
+  // 全选主checkbox：一键全选/全不选
+  var allFileCb = document.getElementById('rollback-file-all');
+  if (allFileCb) {
+    allFileCb.addEventListener('change', function() {
+      getFileChecks().forEach(function(cb) { cb.checked = allFileCb.checked; });
+      updateScopeUi();
+    });
+  }
 
-  // 确认按钮：读取四维度勾选状态，以 options 对象传给回调
+  // 确认按钮：读取四维度勾选状态 + 选中文件列表，以 options 对象传给回调
   okBtn.addEventListener('click', function() {
     if (okBtn.disabled) return;
     var options = readScopeOptions();
+    options.selectedFiles = readSelectedFiles();  // null=全选全量
     overlay.remove();
     if (onConfirm) onConfirm(options);
   });
 
   // 初始化汇总行/按钮状态
   updateScopeUi();
+
+  // 🔧 挂载联动函数供 diff 预览异步渲染完成后调用（维度区块+文件级
+  // diff块/列表行统一显隐；updateScopeUi 已定义，异步访问时安全）
+  diffContainer._updateRollbackUi = updateScopeUi;
 
   // 点击遮罩层取消
   overlay.addEventListener('click', function(e) {
@@ -1783,6 +1883,36 @@ function renderDiffHtml(diffText) {
     else if (line.startsWith('+')) color = GREEN;
     else color = DIM;
     return '<div style="color:' + color + '">' + (esc || '&nbsp;') + '</div>';
+  }).join('');
+}
+
+/**
+ * 🔧 按文件分块渲染 diff（事务#2513）：每个文件块包 data-diff-file 容器——
+ * 确认窗口文件勾选框联动隐藏未勾选文件的 diff（着色同 renderDiffHtml）。
+ * 按 "diff --git a/x b/x" 文件头行分割；非标准 git diff 格式（无文件头）
+ * 整体渲染不包 data-diff-file（不参与文件级联动，显示不受影响）。
+ * @param {string} diffText - 纯文本diff（git diff 格式）
+ * @returns {string} HTML字符串
+ */
+function renderDiffByFile(diffText) {
+  var blocks = [];
+  var cur = null;
+  diffText.split('\n').forEach(function(line) {
+    if (line.indexOf('diff --git ') === 0) {
+      var m = line.match(/^diff --git a\/(.+) b\/(.+)$/);
+      cur = { file: (m && m.length > 2) ? m[2] : '', lines: [line] };
+      blocks.push(cur);
+    } else if (cur) {
+      cur.lines.push(line);
+    }
+  });
+  if (!blocks.length) {
+    return renderDiffHtml(diffText);
+  }
+  return blocks.map(function(b) {
+    return '<div data-diff-file="' + String(b.file).replace(/"/g, '&quot;') + '">'
+      + renderDiffHtml(b.lines.join('\n'))
+      + '</div>';
   }).join('');
 }
 
@@ -1865,8 +1995,9 @@ async function loadRollbackDiffPreview(rollbackMeta, container) {
     if (data.success) {
       if (data.diff) {
         hasFileDiff = true;
+        // 🔧 按文件分块（事务#2513）：文件勾选框联动隐藏未勾选文件的diff
         var diffInner = '<div style="color:#39c5cf;margin:' + (hasChecklistDiff ? '8px' : '2px') + ' 0 1px">📄 工作目录文件变更：</div>'
-          + renderDiffHtml(data.diff);
+          + renderDiffByFile(data.diff);
         if (data.truncated) {
           diffInner += '<div style="color:' + YELLOW + ';margin-top:4px">⚠️ diff过长已截断，还有 ' + fmtBytes(data.truncated_bytes || 0) + ' 内容未显示，完整内容请查看备份分支</div>';
         }
@@ -1887,12 +2018,14 @@ async function loadRollbackDiffPreview(rollbackMeta, container) {
     //    - 外部文件段：external_changed_files（后端独立字段）；
     //      external 类型快照 changed_files 全归外部
     //    - 工作目录文件段：changed_files 排除外部文件后的剩余
+    //    🔧 文件级联动（事务#2513）：每行包 data-file-row——文件勾选框
+    //    联动隐藏未勾选文件行
     function renderFileList(list, scopeKey, title) {
       if (!list || !list.length) return '';
       var inner = '<div style="color:#39c5cf;margin:' + ((hasChecklistDiff || hasFileDiff) ? '8px' : '2px') + ' 0 1px">📁 ' + title + '（' + list.length + '，回滚将恢复到快照版本）：</div>'
         + list.slice(0, 50).map(function(f) {
-          return '<div style="font-size:var(--font-size-ui,12px);color:#c9d1d9;padding:1px 0 1px 12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="' + String(f).replace(/"/g, '&quot;') + '">• ' + String(f).replace(/</g, '&lt;') + '</div>';
-        }).join('');
+            return '<div data-file-row="' + String(f).replace(/"/g, '&quot;') + '" style="font-size:var(--font-size-ui,12px);color:#c9d1d9;padding:1px 0 1px 12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="' + String(f).replace(/"/g, '&quot;') + '">• ' + String(f).replace(/</g, '&lt;') + '</div>';
+          }).join('');
       if (list.length > 50) {
         inner += '<div style="font-size:var(--font-size-ui,12px);color:' + DIM + ';padding:1px 0 1px 12px">... 共 ' + list.length + ' 个文件</div>';
       }
@@ -1942,17 +2075,10 @@ async function loadRollbackDiffPreview(rollbackMeta, container) {
     }
 
     // 🔧 预览区块渲染后按当前勾选状态应用显隐（预览异步加载完成时
-    // 用户可能已取消勾选某些维度）
-    if (document.getElementById('rollback-scope-files')) {
-      ['files', 'external', 'checklist', 'context'].forEach(function(scope) {
-        var el = document.getElementById('rollback-scope-' + scope);
-        if (el) {
-          var show = el.checked;
-          container.querySelectorAll('[data-scope-block="' + scope + '"]').forEach(function(b) {
-            b.style.display = show ? '' : 'none';
-          });
-        }
-      });
+    // 用户可能已取消勾选某些维度/文件）——调用对话框的联动函数
+    // （维度区块 + 文件级 diff 块/列表行，统一由 updateScopeUi 处理）
+    if (container._updateRollbackUi) {
+      container._updateRollbackUi();
     }
   } catch (e) {
     console.error('[Rollback] diff预览加载失败:', e);
@@ -1968,7 +2094,9 @@ async function loadRollbackDiffPreview(rollbackMeta, container) {
  * 调用API执行回滚
  * @param {object} rollbackMeta - 回滚元数据
  * @param {object} [options] - 回滚内容勾选状态（事务#2476 四勾选框，正向直传）：
- *   {files, external, checklist, context}——true=回滚该维度，false=不回滚
+ *   {files, external, checklist, context}——true=回滚该维度，false=不回滚；
+ *   selectedFiles（事务#2513 文件级勾选）——null=全选全量（默认，与旧行为
+ *   一致），数组=只回滚选中的文件（空数组=文件全不选）
  */
 async function executeRollback(rollbackMeta, options) {
   try {
@@ -1982,7 +2110,8 @@ async function executeRollback(rollbackMeta, options) {
         rollback_files: !!options.files,
         rollback_external: !!options.external,
         rollback_checklist: !!options.checklist,
-        rollback_context: !!options.context
+        rollback_context: !!options.context,
+        selected_files: options.selectedFiles || null
       })
     });
 

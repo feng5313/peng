@@ -3175,6 +3175,7 @@ class ToolBackupManager:
         rollback_external: bool = True,
         rollback_checklist: bool = True,
         rollback_context: bool = True,
+        selected_files: list[str] | None = None,
     ) -> tuple[bool, str, dict | None, bool]:
         """执行回滚操作
 
@@ -3183,6 +3184,12 @@ class ToolBackupManager:
         🔧 回滚内容勾选框（事务#2476）：四个维度独立控制——
         工作目录文件/外部文件/checklist/上下文（与确认窗口勾选框一一对应，
         默认全 True=全选）；未勾选的维度不检测、不恢复。
+
+        🔧 文件级勾选（事务#2513）：selected_files 精确选择回滚哪些文件——
+        None=全量（默认：全选/旧客户端/CLI）；部分勾选=只检测/恢复/undo备份
+        选中文件（元素与 meta 各清单字符串一致：changed_files/added_files 为
+        workdir 相对路径、external_files 为绝对路径，斜杠归一化匹配）；
+        空列表=文件维度全不选。
 
         🔧 无变化快速路径：回滚前动态预检测所选恢复对象（工作区tree/外部文件/
         history/checklist），均无实际变化时不创建undo快照、不执行任何恢复操作，
@@ -3194,6 +3201,7 @@ class ToolBackupManager:
             rollback_external: 是否回滚外部文件（workdir 外文件）
             rollback_checklist: 是否回滚 checklist
             rollback_context: 是否回滚对话上下文
+            selected_files: 文件级勾选——只回滚选中的文件（None=全量）
 
         Returns:
             (成功标志, 消息, undo_meta, 是否发生实际变化)
@@ -3205,6 +3213,35 @@ class ToolBackupManager:
         tool_name = rollback_meta.get("tool_name", "")
         is_undo = tool_name.startswith("撤销:")
         is_iteration = tool_name == "iteration_start"
+
+        # 🔧 文件级勾选预处理（事务#2513）：selected_files=None 全量（默认）；
+        # 部分勾选=只回滚选中文件。检测前预过滤外部恢复集（收窄检测范围——
+        # 选中文件均无变化时"无变化快速返回"判定更精确；迭代 manifest 同理）；
+        # 空列表=一个文件都没勾，文件两维度等效未勾选（检测/恢复/消息统一跳过）
+        if selected_files is not None:
+            sel_norm = {str(p).replace("\\", "/") for p in selected_files}
+
+            def _sel_keep(paths: list[str] | None) -> list[str]:
+                """按选中集过滤文件清单（斜杠归一化匹配，保持原清单顺序）"""
+                return [
+                    f for f in (paths or [])
+                    if str(f).replace("\\", "/") in sel_norm
+                ]
+
+            rollback_meta["external_files"] = _sel_keep(
+                rollback_meta.get("external_files")
+            )
+            if rollback_meta.get("external_manifest"):
+                rollback_meta["external_manifest"] = _sel_keep(
+                    rollback_meta.get("external_manifest")
+                )
+            if rollback_meta.get("file_paths"):
+                rollback_meta["file_paths"] = _sel_keep(
+                    rollback_meta.get("file_paths")
+                )
+            if not selected_files:
+                rollback_files = False
+                rollback_external = False
 
         # 汇总未勾选的维度（消息中如实告知用户）
         scope_labels = {
@@ -3222,10 +3259,12 @@ class ToolBackupManager:
         try:
             # 0. 🔧 回滚预检测：动态检测勾选维度（文件/history/checklist/外部文件）
             #    实际变化，并将检测到的精确变更清单合并进 rollback_meta
+            #    （🔧 文件级勾选：检测清单按选中集过滤——见函数内注释）
             has_actual_changes = ToolBackupManager._detect_rollback_changes(
                 rollback_meta, workdir, nest_name, is_iteration,
                 rollback_files=rollback_files, rollback_external=rollback_external,
                 rollback_checklist=rollback_checklist, rollback_context=rollback_context,
+                selected_files=selected_files,
             )
             if not has_actual_changes:
                 logger.info(
@@ -3233,8 +3272,10 @@ class ToolBackupManager:
                 )
                 return True, f"所选维度均无实际变化，跳过回滚{skipped_msg}", None, False
 
-            # 1. 回滚前创建 undo 快照（文件+history，用于撤销；保持全量，
-            #    不随勾选变化——保证"撤销"永远可恢复完整状态）
+            # 1. 回滚前创建 undo 快照（文件+history，用于撤销；维度级勾选保持
+            #    全量——保证"撤销"永远可恢复完整状态；🔧 文件级勾选（事务#2513）
+            #    时 undo 备份基于过滤后清单——未选中文件不会被改动，无需撤销
+            #    备份，全量备份反而会在"撤销"时用旧状态覆盖用户的后续修改）
             undo_meta = None
             if not is_undo:
                 undo_meta = ToolBackupManager._create_undo_snapshot(
@@ -3335,6 +3376,7 @@ class ToolBackupManager:
         rollback_external: bool = True,
         rollback_checklist: bool = True,
         rollback_context: bool = True,
+        selected_files: list[str] | None = None,
     ) -> bool:
         """回滚预检测：检测勾选维度是否有实际变化，并填充精确变更清单
 
@@ -3346,6 +3388,11 @@ class ToolBackupManager:
         3. history + checklist：HistoryBackupManager.has_changes（剥离统计字段）
 
         检测失败时保守返回 True（宁可多回滚不可漏恢复）。
+
+        🔧 文件级勾选（事务#2513）：selected_files 非 None 时工作区检测清单
+        按选中集过滤——用户未勾选的文件（含链接生成后检测新增、确认窗口
+        未展示的文件）不算变化、不进恢复清单；files_changed 按过滤后清单
+        判定（选中文件均无实际变化时不阻塞"无变化快速返回"）。
 
         Returns:
             True=勾选维度至少一项有实际变化（需要执行回滚）；False=全部无变化
@@ -3365,7 +3412,23 @@ class ToolBackupManager:
             if detected is not None:
                 # 将检测到的变更合并到 rollback_meta（保留 history_commit 等字段）
                 rollback_meta.update(detected)
-                files_changed = True
+                # 🔧 文件级勾选（事务#2513）：检测清单按选中集过滤——
+                # 未勾选文件不算变化、不进恢复清单（斜杠归一化匹配）
+                if selected_files is not None:
+                    sel_norm = {str(p).replace("\\", "/") for p in selected_files}
+                    rollback_meta["changed_files"] = [
+                        f for f in rollback_meta.get("changed_files", [])
+                        if str(f).replace("\\", "/") in sel_norm
+                    ]
+                    rollback_meta["added_files"] = [
+                        f for f in rollback_meta.get("added_files", [])
+                        if str(f).replace("\\", "/") in sel_norm
+                    ]
+                # files_changed 按过滤后清单判定（选中文件均无变化→不算）
+                files_changed = bool(
+                    rollback_meta.get("changed_files")
+                    or rollback_meta.get("added_files")
+                )
             else:
                 # 工作区相对快照无变化：仅保留上下文恢复能力
                 rollback_meta["changed_files"] = []

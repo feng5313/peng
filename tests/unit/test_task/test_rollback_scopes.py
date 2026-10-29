@@ -48,7 +48,7 @@ def _meta(**kw) -> dict:
 
 class TestEndpointDims:
     async def test_default_all_selected(self):
-        """默认（不传维度字段）：rollback 收到四个 True（全选）"""
+        """默认（不传维度字段）：rollback 收到四个 True（全选）+ selected_files=None（全量）"""
         req = ToolRollbackRequest(rollback_meta=_meta())
 
         with patch("peng.service.tool_backup.ToolBackupManager.rollback") as rb:
@@ -61,7 +61,8 @@ class TestEndpointDims:
         assert kwargs == {
             "rollback_files": True, "rollback_external": True,
             "rollback_checklist": True, "rollback_context": True,
-        }, "默认必须全选（四维度True），与勾选框默认全选一致"
+            "selected_files": None,
+        }, "默认必须全选（四维度True+文件全量None），与勾选框默认全选一致"
 
     async def test_partial_selection_passed_through(self):
         """部分勾选：状态原样透传（无反转）"""
@@ -379,6 +380,283 @@ def fake_tm(monkeypatch):
     import sys
     monkeypatch.setitem(sys.modules, "peng.task.manager", tm_mod)
     return state
+
+
+# ==================== 5. 文件级勾选（事务#2513）：selected_files ====================
+
+
+class TestSelectedFiles:
+    """🔧 事务#2513：确认窗口"影响文件列表"每文件勾选框——selected_files
+
+    None=全选全量（默认，与旧行为一致）；数组=只检测/恢复/undo备份选中
+    文件；空数组=文件维度全不选（等效两维度未勾选）。
+    """
+
+    def _git_meta(self, tmp_path, **kw):
+        meta = _meta(workdir=str(tmp_path / "wd"))
+        meta.update(kw)
+        return meta
+
+    def test_selected_files_filters_changed_and_added(self, tmp_path):
+        """部分勾选：检测清单按选中集过滤（changed+added），未选文件不进恢复清单"""
+        meta = self._git_meta(tmp_path)
+        captured = {}
+
+        def fake_rollback_git(m, n, **kw):
+            captured["changed"] = list(m.get("changed_files", []))
+            captured["added"] = list(m.get("added_files", []))
+            return True, "文件已恢复"
+
+        with (
+            patch.object(
+                ToolBackupManager, "check_post_tool_changes",
+                staticmethod(lambda m, w, n: {
+                    "changed_files": ["a.txt", "b.txt", "new.py"],
+                    "added_files": ["new.py"],
+                }),
+            ),
+            patch.object(
+                ToolBackupManager, "_create_undo_snapshot",
+                staticmethod(lambda *a, **k: None),
+            ),
+            patch.object(
+                ToolBackupManager, "_rollback_git",
+                staticmethod(fake_rollback_git),
+            ),
+            patch.object(
+                HistoryBackupManager, "has_changes",
+                staticmethod(lambda *a, **k: False),
+            ),
+            patch.object(
+                HistoryBackupManager, "restore", staticmethod(lambda *a, **k: ""),
+            ),
+        ):
+            ok, msg, undo, changed = ToolBackupManager.rollback(
+                meta, selected_files=["a.txt"],
+                rollback_context=False, rollback_checklist=False,
+            )
+
+        assert ok is True and changed is True
+        assert captured["changed"] == ["a.txt"], "未勾选的 b.txt/new.py 必须被过滤"
+        assert captured["added"] == [], "未勾选的 new.py 不进 added 删除清单"
+
+    def test_selected_files_filters_external_before_detect(self, tmp_path):
+        """部分勾选：external_files 检测前预过滤（未选外部文件不进恢复集）"""
+        meta = self._git_meta(
+            tmp_path,
+            external_files=["/tmp/ext_keep.txt", "/tmp/ext_drop.txt"],
+        )
+        captured = {}
+
+        def fake_rollback_git(m, n, **kw):
+            captured["external"] = list(m.get("external_files", []))
+            return True, "文件已恢复"
+
+        with (
+            patch.object(
+                ToolBackupManager, "check_post_tool_changes",
+                staticmethod(lambda m, w, n: {"changed_files": ["a.txt"]}),
+            ),
+            patch.object(
+                ToolBackupManager, "_create_undo_snapshot",
+                staticmethod(lambda *a, **k: None),
+            ),
+            patch.object(
+                ToolBackupManager, "_rollback_git",
+                staticmethod(fake_rollback_git),
+            ),
+            patch.object(
+                HistoryBackupManager, "has_changes",
+                staticmethod(lambda *a, **k: False),
+            ),
+            patch.object(
+                HistoryBackupManager, "restore", staticmethod(lambda *a, **k: ""),
+            ),
+        ):
+            ok, msg, undo, changed = ToolBackupManager.rollback(
+                meta, selected_files=["a.txt", "/tmp/ext_keep.txt"],
+                rollback_context=False, rollback_checklist=False,
+            )
+
+        assert ok is True and changed is True
+        assert captured["external"] == ["/tmp/ext_keep.txt"], (
+            "external_files 必须按选中集过滤（保留勾选的绝对路径）"
+        )
+
+    def test_selected_files_empty_disables_file_dims(self, tmp_path):
+        """空数组=文件全不选：文件两维度等效未勾选——不检测文件、消息如实汇报"""
+        meta = self._git_meta(tmp_path, task_id=998003)
+
+        with (
+            patch.object(
+                ToolBackupManager, "check_post_tool_changes",
+                staticmethod(lambda m, w, n: (_ for _ in ()).throw(
+                    AssertionError("文件全不选时不应检测工作区"))),
+            ),
+            patch.object(
+                ToolBackupManager, "_create_undo_snapshot",
+                staticmethod(lambda *a, **k: None),
+            ),
+            patch.object(
+                HistoryBackupManager, "has_changes",
+                staticmethod(lambda *a, **k: True),
+            ),
+            patch.object(
+                HistoryBackupManager, "restore", staticmethod(lambda *a, **k: "上下文已恢复"),
+            ),
+        ):
+            ok, msg, undo, changed = ToolBackupManager.rollback(
+                meta, selected_files=[],
+            )
+
+        assert ok is True and changed is True
+        assert "已跳过文件回滚" in msg
+        assert "未回滚" in msg and "工作目录文件" in msg and "外部文件" in msg
+
+    def test_selected_files_none_match_treated_as_no_change(self, tmp_path):
+        """选中文件检测后均无匹配变化：files_changed=False——配合 history 无
+        变化走"无变化快速返回"（不建undo快照、不执行恢复）"""
+        meta = self._git_meta(tmp_path)
+
+        with (
+            patch.object(
+                ToolBackupManager, "check_post_tool_changes",
+                staticmethod(lambda m, w, n: {
+                    "changed_files": ["other.txt"],  # 检测到的变更不在选中集
+                    "added_files": [],
+                }),
+            ),
+            patch.object(
+                ToolBackupManager, "_create_undo_snapshot",
+                staticmethod(lambda *a, **k: (_ for _ in ()).throw(
+                    AssertionError("无实际变化时不应创建undo快照"))),
+            ),
+            patch.object(
+                HistoryBackupManager, "has_changes",
+                staticmethod(lambda *a, **k: False),
+            ),
+        ):
+            ok, msg, undo, changed = ToolBackupManager.rollback(
+                meta, selected_files=["a.txt"],
+                rollback_context=True, rollback_checklist=True,
+            )
+
+        assert ok is True and changed is False
+        assert "无实际变化" in msg
+
+    def test_selected_files_none_keeps_full_list(self, tmp_path):
+        """None=全选：检测清单不过滤（与旧行为完全一致）"""
+        meta = self._git_meta(tmp_path)
+        captured = {}
+
+        def fake_rollback_git(m, n, **kw):
+            captured["changed"] = list(m.get("changed_files", []))
+            return True, "文件已恢复"
+
+        with (
+            patch.object(
+                ToolBackupManager, "check_post_tool_changes",
+                staticmethod(lambda m, w, n: {
+                    "changed_files": ["a.txt", "b.txt"],
+                    "added_files": [],
+                }),
+            ),
+            patch.object(
+                ToolBackupManager, "_create_undo_snapshot",
+                staticmethod(lambda *a, **k: None),
+            ),
+            patch.object(
+                ToolBackupManager, "_rollback_git",
+                staticmethod(fake_rollback_git),
+            ),
+            patch.object(
+                HistoryBackupManager, "has_changes",
+                staticmethod(lambda *a, **k: False),
+            ),
+            patch.object(
+                HistoryBackupManager, "restore", staticmethod(lambda *a, **k: ""),
+            ),
+        ):
+            ok, msg, undo, changed = ToolBackupManager.rollback(
+                meta, rollback_context=False, rollback_checklist=False,
+            )
+
+        assert ok is True and changed is True
+        assert captured["changed"] == ["a.txt", "b.txt"], (
+            "selected_files=None 必须全量（全选默认），检测清单不过滤"
+        )
+
+    def test_undo_snapshot_receives_filtered_meta(self, tmp_path):
+        """undo 快照基于过滤后清单——只备份将被回滚的选中文件"""
+        meta = self._git_meta(tmp_path)
+        captured = {}
+
+        def fake_undo_snapshot(m, *a, **k):
+            captured["external"] = list(m.get("external_files", []))
+            return None
+
+        with (
+            patch.object(
+                ToolBackupManager, "check_post_tool_changes",
+                staticmethod(lambda m, w, n: {"changed_files": ["a.txt"]}),
+            ),
+            patch.object(
+                ToolBackupManager, "_create_undo_snapshot",
+                staticmethod(fake_undo_snapshot),
+            ),
+            patch.object(
+                ToolBackupManager, "_rollback_git",
+                staticmethod(lambda m, n, **kw: (True, "文件已恢复")),
+            ),
+            patch.object(
+                HistoryBackupManager, "has_changes",
+                staticmethod(lambda *a, **k: False),
+            ),
+            patch.object(
+                HistoryBackupManager, "restore", staticmethod(lambda *a, **k: ""),
+            ),
+        ):
+            ok, msg, undo, changed = ToolBackupManager.rollback(
+                meta, selected_files=["a.txt"],
+                rollback_context=False, rollback_checklist=False,
+            )
+
+        assert ok is True and changed is True
+        assert captured["external"] == [], (
+            "undo 快照必须基于过滤后清单（未选中外部文件无需备份撤销）"
+        )
+
+    async def test_endpoint_selected_files_passthrough(self):
+        """端点：selected_files 数组原样透传 rollback"""
+        req = ToolRollbackRequest(
+            rollback_meta=_meta(),
+            selected_files=["a.txt", "/tmp/ext.txt"],
+        )
+
+        with patch("peng.service.tool_backup.ToolBackupManager.rollback") as rb:
+            rb.return_value = (True, "ok", None, True)
+            resp = await tool_rollback(req)
+
+        assert resp.success
+        kwargs = rb.call_args.kwargs
+        assert kwargs["selected_files"] == ["a.txt", "/tmp/ext.txt"]
+        assert kwargs["rollback_files"] is True  # 维度勾选不受文件列表影响
+
+    async def test_endpoint_empty_selected_with_all_dims_rejected(self):
+        """端点：维度全不勾时仍拒绝（selected_files=[] 不影响维度拦截）"""
+        req = ToolRollbackRequest(
+            rollback_meta=_meta(),
+            rollback_files=False, rollback_external=False,
+            rollback_checklist=False, rollback_context=False,
+            selected_files=[],
+        )
+
+        with patch("peng.service.tool_backup.ToolBackupManager.rollback") as rb:
+            resp = await tool_rollback(req)
+
+        assert resp.success is False
+        assert "至少勾选" in resp.message
+        rb.assert_not_called()
 
 
 class TestHistoryRestoreDims:

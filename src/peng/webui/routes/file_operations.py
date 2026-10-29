@@ -833,6 +833,11 @@ class ToolRollbackRequest(BaseModel):
     rollback_external: bool = True  # 外部文件（工作目录外）
     rollback_checklist: bool = True  # checklist
     rollback_context: bool = True  # 对话上下文(history)
+    # 🔧 文件级勾选（事务#2513）：确认窗口"影响文件列表"每文件勾选框——
+    # None=全选（默认，全量回滚，与旧行为一致）；部分勾选=勾选文件字符串
+    # 数组（与 meta.changed_files/added_files/external_files 元素一致），
+    # 只检测/恢复/undo备份选中文件；[]（空数组）=文件全不选
+    selected_files: list[str] | None = None
 
 
 class ToolRollbackResponse(BaseModel):
@@ -1584,15 +1589,22 @@ async def tool_rollback(request: ToolRollbackRequest) -> ToolRollbackResponse:
             rollback_external=request.rollback_external,
             rollback_checklist=request.rollback_checklist,
             rollback_context=request.rollback_context,
+            # 🔧 文件级勾选（事务#2513）：None=全选全量；数组=只回滚选中文件
+            selected_files=request.selected_files,
         )
-        unchecked = [k for k, v in rollback_kwargs.items() if not v]
+        unchecked = [k for k, v in rollback_kwargs.items() if v is False]
         if unchecked:
             logger.info(
                 f"用户选择部分回滚（未勾选维度）: {'、'.join(unchecked)}"
             )
-        if not any(rollback_kwargs.values()):
+        if not any(v is True for v in rollback_kwargs.values()):
             return ToolRollbackResponse(
                 success=False, message="未勾选任何回滚内容，请至少勾选一项"
+            )
+        if request.selected_files is not None and request.selected_files:
+            logger.info(
+                f"用户选择部分文件回滚(task#{rollback_meta.get('task_id', 0)}): "
+                f"{len(request.selected_files)} 个文件"
             )
 
         task_id = rollback_meta.get("task_id", 0)
