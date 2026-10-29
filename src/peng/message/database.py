@@ -466,16 +466,34 @@ class MessageDatabase(metaclass=MetaSingleton):
                     chain_head = self.get_chain_head(reply_to)
                     if chain_head:
                         chain_head_id = chain_head["id"]
-                # 回复消息的 nest 和 workdir 必须跟随根消息（链首）
+                # 回复消息的 nest 和 workdir 必须跟随根消息（链首）——事务#2502：
+                # 无条件覆盖调用方传入值（CLI默认注入、content @nest/@workdir标注、
+                # WebUI/远程客户端传入都算覆盖源），保证整条消息链执行环境一致；
+                # 链首值为空时退回被回复消息的值，再由下方 config 兜底。
                 chain_head_msg = self.get_message(chain_head_id) if chain_head_id else original
-                if not workdir:
-                    workdir = chain_head_msg.get("workdir") or original.get("workdir")
-                    logger.debug(
-                        f"[create_message] 从链首消息#{chain_head_id}继承工作目录: {workdir}"
-                    )
-                if not nest:
-                    nest = chain_head_msg.get("nest") or original.get("nest")
-                    logger.debug(f"[create_message] 从链首消息#{chain_head_id}继承nest: {nest}")
+                head_label = f"#{chain_head_id}" if chain_head_id else f"(链首缺失,用#{reply_to})"
+                head_workdir = (chain_head_msg.get("workdir") or "").strip()
+                head_nest = (chain_head_msg.get("nest") or "").strip()
+                new_workdir = head_workdir or (original.get("workdir") or "").strip()
+                new_nest = head_nest or (original.get("nest") or "").strip()
+                if new_workdir and workdir != new_workdir:
+                    if workdir:
+                        logger.info(
+                            f"[create_message] 回复消息workdir={workdir!r}已被链首"
+                            f"{head_label}的值覆盖: {new_workdir!r}（链上下文一致）"
+                        )
+                    else:
+                        logger.debug(f"[create_message] 从链首消息{head_label}继承工作目录: {new_workdir}")
+                    workdir = new_workdir
+                if new_nest and nest != new_nest:
+                    if nest:
+                        logger.info(
+                            f"[create_message] 回复消息nest={nest!r}已被链首"
+                            f"{head_label}的值覆盖: {new_nest!r}（链上下文一致）"
+                        )
+                    else:
+                        logger.debug(f"[create_message] 从链首消息{head_label}继承nest: {new_nest}")
+                    nest = new_nest
             else:
                 return 0, {
                     "success": False,

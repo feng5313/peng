@@ -17,11 +17,13 @@
 - 发送者：由工具自动标识为「鹏🐣·事务#N」（N=调用方事务ID），LLM传入的
   --from 一律剥离（禁止冒充风主），消息可追踪来源事务。
 - 接收者：
-  - reply <消息#ID> → 固定回复给风主🍃（进入风主发件箱，挂在目标消息链内）
-  - send → 发布新任务消息给鹏（接收者=agent），支持 --to 显式指定：
-    agent名（默认）/ 事务#N（路由到该事务根消息链，注入运行中事务）/ #N|消息#N（回复进该消息链）
-    禁止 --to 风主（全局消息请用 reply 挂到已有消息链，杜绝无意义全局消息）
-- 回复/链内路由消息的 nest/workdir 由数据库层从链首消息继承（保证消息链上下文一致）。
+  - reply <消息#ID> → 固定回复给风主🍃（进入风主发件箱，挂在目标消息链内）；
+    无ID时回退本事务链首消息，两者都拿不到则拒绝（不允许退化成根消息）
+  - send（根消息/新任务的唯一入口）→ 事务#2502 彻底禁止：工具只能 reply 挂到已有
+    消息链，新任务必须由风主发布（杜绝工具自造无父消息的根消息）
+- 回复/链内路由消息的 nest/workdir 自动设置为与根消息（链首）一致（事务#2502）：
+  工具剥离 LLM 传入的 --nest/--workdir，CLI 层不再为 reply 注入默认执行环境，
+  数据库层无条件跟随链首，保证整条消息链上下文一致。
 """
 
 import logging
@@ -47,10 +49,7 @@ AGENT_NAME = get_agent_name()
 MASTER_NAME = get_master_name()
 PROJECT_ROOT = get_project_root()
 
-# --to 接收者的合法别名（事务#2089）
-_AGENT_ALIASES = {"peng", "鹏", "鹏🐣", "agent", "ai"}
-_MASTER_ALIASES = {"master", "风主", "风主🍃"}
-_TASK_ID_RE = re.compile(r"^(?:事务#?|task[:#]?)(\d+)$", re.IGNORECASE)
+# reply目标消息ID解析（事务#2502：send禁用后，--to别名与事务ID正则已成死代码并删除）
 _MSG_ID_RE = re.compile(r"^(?:消息#?|#)(\d+)$", re.IGNORECASE)
 
 
@@ -139,31 +138,30 @@ class MessageTool(Tool):
     def description(self) -> str:
         return """消息管理工具统一的消息管理接口，支持消息回复、读取、控制等所有功能。
 常用功能：
-1. 回复消息（回复给风主🍃，挂在目标消息链内）：reply <id> <回复内容> [--timeout TIMEOUT]
+1. 回复消息（本工具唯一的发送途径，回复给风主🍃，挂在目标消息链内）：reply <id> <回复内容> [--timeout TIMEOUT]
       示例：reply 12 已完成。
       示例：reply 已完成（无ID时自动回复本事务的链首消息）
-2. 发布新任务消息给鹏：send <消息内容> [--nest NEST] [--workdir WORKDIR] [--to <接收者>]
-      示例：send 截屏存到本目录 --nest win11 --workdir D:\\work\\temp
-      --to 可选（默认=发布新任务给鹏）：agent名 | 事务#ID（发给指定事务，注入其消息链） | #消息ID（发到指定消息链）
-3. 显示所有未归档消息：trees
-4. 显示完整上下文：context <id>
+2. 显示所有未归档消息：trees
+3. 显示完整上下文：context <id>
       示例：context 12（显示消息#12的完整上下文信息，包括关联的事务、消息链等）
-5. 搜索消息：search <关键词>
-      示例：search "错误" （搜索包含"错误"的消息
-6. 显示消息分支树（从该消息开始）：tree <ID>
-7. 显示消息完整树（从根消息开始）：full-tree <ID>
+4. 搜索消息：search "错误" （搜索包含"错误"的消息
+5. 显示消息分支树（从该消息开始）：tree <ID>
+6. 显示消息完整树（从根消息开始）：full-tree <ID>
 
 注意：
 1. 参数中禁止管道操作
 2. 支持换行转义符\\n，允许在参数中使用换行符
 3. 避免使用英文单引号或双引号，建议使用中文引号或不使用引号
-4. 选项（--nest/--workdir/--timeout 等）必须写在参数**末尾**（内容之后），
-   否则会被当作内容的一部分而失效！例如：send 消息内容 --nest win11 --workdir D:\\work\\temp
-5. 发送者由系统自动标识为「鹏🐣·事务#当前事务ID」，--from 参数会被忽略；
-   send子命令只用于创建新事务，禁止用于事务交互，交互/汇报请用 reply 回复已有消息链，注意消息ID和事务ID的区别，reply不要用事务ID当作参数！
-6. 复杂任务应该用report工具汇报总结工作，不要使用message工具除非被明确要求回复。
-7. 回复消息后，禁止用message或report工具连续汇报类似内容！
-8. 使用--help参数获取详细帮助
+4. 彻底禁止用本工具发送根消息（send已禁用）：所有消息必须通过 reply 挂在已有消息链内，
+   新任务只能由风主🍃发布；reply 必须指明目标消息ID（缺省则回复本事务的链首消息）
+5. 回复消息的 nest/workdir 自动设置为与根消息一样，无需（也无法）指定 --nest/--workdir，
+   显式传入会被剥离
+6. 选项（--timeout 等）必须写在参数**末尾**（内容之后），否则会被当作内容的一部分而失效！
+7. 发送者由系统自动标识为「鹏🐣·事务#当前事务ID」，--from 参数会被忽略；
+   注意消息ID和事务ID的区别，reply的参数是消息ID不是事务ID！
+8. 复杂任务应该用report工具汇报总结工作，不要使用message工具除非被明确要求回复。
+9. 回复消息后，禁止用message或report工具连续汇报类似内容！
+10. 使用--help参数获取详细帮助
     """
 
     @property
@@ -184,83 +182,6 @@ class MessageTool(Tool):
     def _sender_tag(self) -> str:
         """发送者标识：鹏🐣·事务#N（N=调用方事务ID），无事务上下文时为纯agent名"""
         return build_task_sender_tag(self.get_context("task_id"), AGENT_NAME)
-
-    def _resolve_to_agent_target(self, to_value: str | None) -> tuple[str, int | None, str]:
-        """解析 send 的 --to 接收者。
-
-        Returns:
-            (kind, target_id, note)：
-            - kind="new_task"：发布新任务给鹏（默认），target_id=None
-            - kind="chain"：路由到指定消息链（target_id=链内消息ID，回复注入该链）
-            - kind="invalid"：非法目标，note=错误说明
-        """
-        if to_value is None or not to_value.strip():
-            return "new_task", None, ""
-        to = to_value.strip()
-
-        # agent 名 → 新任务
-        if to.lower() in _AGENT_ALIASES or to == AGENT_NAME:
-            return "new_task", None, ""
-
-        # 风主名 → 禁止（杜绝无意义全局消息，#9460 教训）
-        if to in _MASTER_ALIASES or to == MASTER_NAME:
-            return (
-                "invalid",
-                None,
-                f"禁止用 send 向{MASTER_NAME}发送全局新消息（会产生无意义全局消息）。"
-                f"向{MASTER_NAME}汇报请用 reply <消息#ID> 回复已有消息链。",
-            )
-
-        # 事务#N → 路由到该事务的根消息链
-        m = _TASK_ID_RE.match(to)
-        if m:
-            task_id = int(m.group(1))
-            task_manager = self.get_context("task_manager")
-            task = task_manager.get_task(task_id) if task_manager else None
-            if not task:
-                return "invalid", None, f"事务#{task_id}不存在，无法路由消息。"
-            msg_id = task.get("message_id")
-            if not msg_id:
-                return (
-                    "invalid",
-                    None,
-                    f"事务#{task_id}没有关联消息链，无法路由消息；"
-                    f"定向发送提示请改用 info_tool 注入。",
-                )
-            note = ""
-            if task.get("root_id"):
-                note = f"事务#{task_id}是子事务，消息已路由到其根消息链（由根事务处理）。"
-            return "chain", int(msg_id), note
-
-        # #N / 消息#N → 回复进该消息链
-        m = _MSG_ID_RE.match(to)
-        if m:
-            msg_id = int(m.group(1))
-            return "chain", msg_id, ""
-
-        # 纯数字 → 消息ID
-        if to.isdigit():
-            return "chain", int(to), ""
-
-        return (
-            "invalid",
-            None,
-            f"非法接收者 {to!r}。合法格式：agent名（发布新任务）| 事务#ID（发给指定事务）"
-            f" | #消息ID（发到指定消息链）。向{MASTER_NAME}汇报请用 reply。",
-        )
-
-    def _validate_chain_message(self, msg_id: int) -> str | None:
-        """校验链内目标消息存在，返回错误信息（None=通过）"""
-        try:
-            from peng.message.database import MessageDatabase
-
-            msg = MessageDatabase().get_message(msg_id)
-            if not msg:
-                return f"消息#{msg_id}不存在，无法路由消息。"
-            return None
-        except Exception as e:
-            logger.warning(f"[message工具] 校验消息#{msg_id}失败: {e}")
-            return None  # 数据库查询失败时交给 bin/msg 兜底校验
 
     # ==================== 主执行 ====================
 
@@ -383,6 +304,14 @@ class MessageTool(Tool):
                             hint += (
                                 f"\nℹ️ 未指定回复目标消息ID，已自动回复本事务链首消息#{msg_id_str}。"
                             )
+                        else:
+                            # 事务#2502：无目标ID又无上下文链首 → reply会退化成根消息，拒绝
+                            output = (
+                                "❌  message工具调用失败： 无法确定回复目标消息ID"
+                                "（参数未指定消息ID，且本事务没有关联的链首消息），"
+                                "message工具禁止发送根消息，请显式指定 reply <消息#ID>。"
+                            )
+                            return DualOutput(summary=output, display=output)
                     cmd = _build_msg_cmd(
                         "reply",
                         *([msg_id_str] if msg_id_str else []),
@@ -393,7 +322,13 @@ class MessageTool(Tool):
                         MASTER_NAME,
                     )
                 elif subcmd == "send":
-                    output = f"❌  message工具调用失败： 禁用send！"
+                    # 事务#2502：彻底禁止message工具发送根消息（send是根消息/新任务唯一入口），
+                    # 新任务只能由风主发布，工具只能用 reply 挂在已有消息链内
+                    output = (
+                        f"❌  message工具调用失败： 禁用send！"
+                        f"禁止用message工具发送根消息（新任务只能由{MASTER_NAME}发布）。"
+                        f"请用 reply <消息#ID> 回复已有消息链。"
+                    )
                     return DualOutput(summary=output, display=output)
                 else:
                     # content/title/search 等只读或字段操作子命令：原样传递

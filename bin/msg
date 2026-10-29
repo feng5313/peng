@@ -104,6 +104,9 @@ _msg_all_subcommands = {
     "move",
     "archive",
     "unarchive",
+    # 事务#2502：reply 必须在此集合内——漏收会被当作"默认子命令send"注入
+    # 本机 cwd/self-nest，覆盖数据库层的链首继承，污染整条消息链上下文
+    "reply",
 }
 _first_arg = _clean_args[0] if _clean_args else None
 

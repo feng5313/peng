@@ -4,8 +4,9 @@
 覆盖：
 1. names 辅助：is_agent_side / build_task_sender_tag
 2. message 工具选项辅助：_pop_option_pairs / _extract_leading_msg_id
-3. MessageTool reply/send 流程：发送者自动标识（鹏🐣·事务#N）、--from剥离、
-   接收者路由（agent/事务#N/#N/风主拒绝）、reply缺ID回退本事务链首
+3. MessageTool reply 流程：发送者自动标识（鹏🐣·事务#N）、--from剥离、--nest/--workdir剥离、
+   reply缺ID回退本事务链首；事务#2502禁止根消息：send一律拒绝、
+   缺ID且本事务无链首时拒绝
 4. InfoTool：--sender 事务#N 自动注入
 5. info 解析：sender 字段 round-trip
 """
@@ -161,125 +162,55 @@ class TestMessageToolReply:
         assert "12" in cmd
 
 
-class TestMessageToolSend:
-    async def test_send_default_receiver_is_agent(self, monkeypatch):
-        """send 默认：接收者=agent（发布新任务），不再发全局消息给风主（#9460根因）"""
-        tool, captured = _make_tool(monkeypatch)
-        await _run_tool(tool, "send 帮我截屏")
-        cmd = captured.cmds[0]
-        i_from = cmd.index("--from")
-        i_to = cmd.index("--to")
-        assert cmd[i_from + 1] == f"{AGENT_NAME}·事务#2089"
-        assert cmd[i_to + 1] == AGENT_NAME
-        # 新任务注入上下文环境
-        assert "--nest" in cmd and "--workdir" in cmd
+class TestMessageToolNoRootMessage:
+    """事务#2502：彻底禁止message工具发送根消息（send一律拒绝，reply必须挂已有链）"""
 
-    async def test_send_to_agent_alias(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "args",
+        [
+            "send 帮我截屏",
+            "send 帮我截屏 --to peng",
+            "send 通知你一下 --to 风主🍃",
+            "send hi --to 事务#2064",
+            "send hi --to #9302",
+            "send hi --to 张三",
+            "send hi --from 风主🍃",
+            "send hi --to=事务#2064",
+        ],
+    )
+    async def test_send_always_rejected(self, monkeypatch, args):
+        """send（根消息/新任务唯一入口）一律拒绝，且不得调用bin/msg"""
         tool, captured = _make_tool(monkeypatch)
-        await _run_tool(tool, "send 帮我截屏 --to peng")
-        cmd = captured.cmds[0]
-        assert cmd[cmd.index("--to") + 1] == AGENT_NAME
-
-    async def test_send_to_master_rejected(self, monkeypatch):
-        """send --to 风主：拒绝，提示用 reply（杜绝无意义全局消息）"""
-        tool, captured = _make_tool(monkeypatch)
-        result = await _run_tool(tool, "send 通知你一下 --to 风主🍃")
-        assert captured.cmds == []  # 未执行命令
+        result = await _run_tool(tool, args)
+        assert captured.cmds == []
         assert "❌" in result.summary
+        assert "禁用send" in result.summary
         assert "reply" in result.summary
 
-    async def test_send_to_task_routes_to_chain(self, monkeypatch):
-        """send --to 事务#N：路由到该事务根消息链（receiver=agent，--reply）"""
-        fake_tm = _FakeTaskManager({2064: {"id": 2064, "message_id": 9302, "root_id": None}})
-        monkeypatch.setattr(
-            "peng.message.database.MessageDatabase",
-            type(
-                "FakeDB",
-                (),
-                {"get_message": staticmethod(lambda mid: {"id": mid} if mid == 9302 else None)},
-            ),
-        )
-        tool, captured = _make_tool(monkeypatch, task_manager=fake_tm)
-        await _run_tool(tool, "send 进度同步：xxx完成 --to 事务#2064")
+    async def test_reply_without_id_falls_back_to_own_chain_message(self, monkeypatch):
+        """reply 无ID：自动回复本事务链首消息（链内消息，非根消息）"""
+        tool, captured = _make_tool(monkeypatch, message_id=9479)
+        await _run_tool(tool, "reply 已完成")
         cmd = captured.cmds[0]
-        i_reply = cmd.index("--reply")
-        assert cmd[i_reply + 1] == "9302"
-        i_to = cmd.index("--to")
-        assert cmd[i_to + 1] == AGENT_NAME
-        i_from = cmd.index("--from")
-        assert cmd[i_from + 1] == f"{AGENT_NAME}·事务#2089"
-        # 链内路由不注入环境（由链首继承）
+        assert "9479" in cmd
+        # 链内回复不注入执行环境（由数据库层从链首继承）
         assert "--nest" not in cmd and "--workdir" not in cmd
 
-    async def test_send_to_subtask_notes_root_chain(self, monkeypatch):
-        """send --to 子事务：路由根消息链并给出提示"""
-        fake_tm = _FakeTaskManager({2065: {"id": 2065, "message_id": 9302, "root_id": 2064}})
-        monkeypatch.setattr(
-            "peng.message.database.MessageDatabase",
-            type(
-                "FakeDB",
-                (),
-                {"get_message": staticmethod(lambda mid: {"id": mid})},
-            ),
-        )
-        tool, captured = _make_tool(monkeypatch, task_manager=fake_tm)
-        result = await _run_tool(tool, "send hi --to 事务#2065")
-        cmd = captured.cmds[0]
-        assert cmd[cmd.index("--reply") + 1] == "9302"
-        assert "子事务" in result.summary
-
-    async def test_send_to_task_not_exists(self, monkeypatch):
-        fake_tm = _FakeTaskManager({})
-        tool, captured = _make_tool(monkeypatch, task_manager=fake_tm)
-        result = await _run_tool(tool, "send hi --to 事务#9999")
+    async def test_reply_without_id_and_context_rejected(self, monkeypatch):
+        """reply 无ID且本事务无链首消息：拒绝，避免退化成根消息"""
+        tool, captured = _make_tool(monkeypatch, message_id=None)
+        result = await _run_tool(tool, "reply 已完成")
         assert captured.cmds == []
-        assert "❌" in result.summary and "不存在" in result.summary
+        assert "❌" in result.summary and "根消息" in result.summary
 
-    async def test_send_to_msg_id_routes_to_chain(self, monkeypatch):
-        """send --to #9302：回复进该消息链"""
-        monkeypatch.setattr(
-            "peng.message.database.MessageDatabase",
-            type(
-                "FakeDB",
-                (),
-                {"get_message": staticmethod(lambda mid: {"id": mid})},
-            ),
-        )
+    async def test_reply_strips_env_options(self, monkeypatch):
+        """reply 显式传入的 --nest/--workdir 被剥离（nest/workdir自动与根消息一致）"""
         tool, captured = _make_tool(monkeypatch)
-        await _run_tool(tool, "send hi --to #9302")
+        result = await _run_tool(tool, "reply 12 已完成 --nest epyc --workdir D:/x")
         cmd = captured.cmds[0]
-        assert cmd[cmd.index("--reply") + 1] == "9302"
-        assert cmd[cmd.index("--to") + 1] == AGENT_NAME
-
-    async def test_send_to_invalid_rejected(self, monkeypatch):
-        tool, captured = _make_tool(monkeypatch)
-        result = await _run_tool(tool, "send hi --to 张三")
-        assert captured.cmds == []
-        assert "❌" in result.summary and "非法接收者" in result.summary
-
-    async def test_send_strips_from(self, monkeypatch):
-        """send：--from 一律剥离（禁止冒充）"""
-        tool, captured = _make_tool(monkeypatch)
-        result = await _run_tool(tool, "send hi --from 风主🍃")
-        cmd = captured.cmds[0]
-        assert cmd[cmd.index("--from") + 1] == f"{AGENT_NAME}·事务#2089"
-        assert "发送者已自动标识" in result.summary
-
-    async def test_send_attached_to_form(self, monkeypatch):
-        """send --to=事务#N 粘连形式"""
-        fake_tm = _FakeTaskManager({2064: {"id": 2064, "message_id": 9302, "root_id": None}})
-        monkeypatch.setattr(
-            "peng.message.database.MessageDatabase",
-            type(
-                "FakeDB",
-                (),
-                {"get_message": staticmethod(lambda mid: {"id": mid})},
-            ),
-        )
-        tool, captured = _make_tool(monkeypatch, task_manager=fake_tm)
-        await _run_tool(tool, "send hi --to=事务#2064")
-        cmd = captured.cmds[0]
-        assert cmd[cmd.index("--reply") + 1] == "9302"
+        assert "12" in cmd
+        assert "--nest" not in cmd and "--workdir" not in cmd
+        assert "✅" in result.summary
 
 
 # ==================== InfoTool ====================

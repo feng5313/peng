@@ -962,6 +962,10 @@ def _inject_nest_workdir_defaults(args: list[str]) -> list[str]:
         "delete", "status", "pause", "cancel", "restart", "resume",
         "up", "down", "search", "tree", "full-tree", "context", "move",
         "archive", "unarchive",
+        # 事务#2502：reply 必须在此集合内——漏收会被当作"默认子命令send"注入
+        # 本机 cwd/self-nest，覆盖数据库层的链首继承，污染整条消息链上下文
+        # （历史数据 223 条 nest、197 条 workdir 与链首不一致即此根因）
+        "reply",
     }
 
     _first_arg = args[0] if args else None
@@ -2243,8 +2247,18 @@ def create_parser():
     reply_parser.add_argument("--to", type=str, help="指定接收者")
     reply_parser.add_argument("--timeout", type=int, help="设置超时时间（秒）")
     reply_parser.add_argument("--file", type=str, help="从文件读取回复内容")
-    reply_parser.add_argument("-n", "--nest", type=str, help="指定关联的nest名称")
-    reply_parser.add_argument("-w", "--workdir", type=str, help="指定工作目录")
+    reply_parser.add_argument(
+        "-n",
+        "--nest",
+        type=str,
+        help="（回复消息将被链首消息的nest覆盖，事务#2502）",
+    )
+    reply_parser.add_argument(
+        "-w",
+        "--workdir",
+        type=str,
+        help="（回复消息将被链首消息的workdir覆盖，事务#2502）",
+    )
 
     # ========== delete 子命令 ==========
     delete_parser = subparsers.add_parser("delete", help="删除消息")
