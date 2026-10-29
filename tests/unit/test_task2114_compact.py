@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""事务#2114+事务#2270：上下文长度优化（思考提醒 + 超长工具结果/思考内容compact精简）
+"""事务#2114：上下文长度优化（思考提醒 + 超长工具结果compact精简）
 
 需求：
 1. 大模型输出思考内容后没有输出正式内容（无content无tool_calls）时，
@@ -9,19 +9,13 @@
    参考 max_concurrent，默认1024）时末尾追加带唯一4位数字id的compact清理提示；
    compact工具按id把上一轮迭代对应的工具调用返回结果替换为指定精简文字，
    不得跨迭代compact，只替换返回结果，不改工具调用和参数。
-3. 事务#2270：保留思考内容的provider（thinking_type="thinking" 或
-   preserve_thinking=true，如 qwen3.8/deepseek 系列）中超过阈值
-   （thinking_compact_threshold，默认2048）的思考内容末尾追加compact精简提示；
-   compact工具按id把上一轮迭代的 reasoning_content 整体替换为精简文字。
-   事务#2270同时把 drop 工具改名 compact（DropTool→CompactTool）。
 
 覆盖：
 - 配置层：ProviderConfig/LLMConfig/LLMPromptsConfig 新字段 + get_provider 4路透传
 - 引擎层：_append_compact_hint（阈值/provider覆盖/禁用/多模态/ID唯一）、
-  _append_thinking_compact_hint（保留模式才追加/阈值/禁用/非保留模式跳过）、
-  _thinking_kept_in_context、_remind_thinking_only（仅思考无正式内容时注入）
+  _remind_thinking_only（仅思考无正式内容时注入）
 - MessageHistory：_iteration_marks 边界、get_compact_window、compact_by_id
-  （成功/跨迭代拦截/未找到/非法id/无窗口/多模态精简/思考内容精简/空replace回退）
+  （成功/跨迭代拦截/未找到/非法id/无窗口/多模态精简/空replace回退）
 - CompactTool：经工具上下文执行精简
 """
 
@@ -42,19 +36,15 @@ from peng.tools.compact import COMPACT_TOOL, CompactTool  # noqa: E402
 
 
 def test_config_defaults():
-    """全局默认1024/2048；provider级默认None（用全局）；提示词模板含占位符"""
+    """全局默认1024；provider级默认None（用全局）；提示词模板含占位符"""
     assert LLMConfig().compact_hint_threshold == 1024
-    assert LLMConfig().thinking_compact_threshold == 2048
     assert ProviderConfig().compact_hint_threshold is None
-    assert ProviderConfig().thinking_compact_threshold is None
     prompts = LLMPromptsConfig()
     assert prompts.thinking_only_reminder == (
         "思考内容不会保留在上下文中，因此思考后必须输出正式内容总结，以免丢失思考成果！"
     )
     assert "{compact_id}" in prompts.compact_hint
     assert "compact工具" in prompts.compact_hint
-    assert "{compact_id}" in prompts.thinking_compact_hint
-    assert "compact工具精简" in prompts.thinking_compact_hint
 
 
 def _make_llm_config(prov_kwargs=None) -> LLMConfig:
@@ -65,7 +55,6 @@ def _make_llm_config(prov_kwargs=None) -> LLMConfig:
             base_url="u",
             model="m",
             compact_hint_threshold=4096,
-            thinking_compact_threshold=8192,
             priority=99,
         ),
         "p-default": ProviderConfig(api_key="k2", base_url="u2", model="m2", priority=90),
@@ -82,22 +71,18 @@ def test_get_provider_compact_threshold_passthrough():
     data = cfg.get_provider()
     assert data["provider"] == "p-override"
     assert data["compact_hint_threshold"] == 4096
-    assert data["thinking_compact_threshold"] == 8192
     # 切换到无provider级配置的provider（forbidden排除高优先级的p-override）
     data2 = cfg.get_provider(current="p-override", forbidden=["p-override"])
     assert data2["provider"] == "p-default"
     assert data2["compact_hint_threshold"] == 1024  # 全局默认
-    assert data2["thinking_compact_threshold"] == 2048
     # 锁定分支透传
     data3 = cfg.get_provider(current="p-default", locked=True)
     assert data3["compact_hint_threshold"] == 1024
-    assert data3["thinking_compact_threshold"] == 2048
     # enable_fallback=False 分支透传
     cfg.enable_fallback = False
     cfg.current_provider = "p-override"
     data4 = cfg.get_provider()
     assert data4["compact_hint_threshold"] == 4096
-    assert data4["thinking_compact_threshold"] == 8192
 
 
 # ==================== 引擎辅助方法 ====================
@@ -106,19 +91,14 @@ def test_get_provider_compact_threshold_passthrough():
 def make_engine(
     provider_config=None,
     global_threshold=None,
-    thinking_type=None,
-    global_thinking_threshold=None,
 ) -> ToolExecutionEngine:
     """构造跳过__init__的引擎实例（遵循现有单测惯例）"""
     engine = ToolExecutionEngine.__new__(ToolExecutionEngine)
     engine.llm = SimpleNamespace(
         provider="test",
         provider_config=provider_config if provider_config is not None else {},
-        config=SimpleNamespace(
-            compact_hint_threshold=global_threshold,
-            thinking_compact_threshold=global_thinking_threshold,
-        ),
-        thinking_type=thinking_type,
+        config=SimpleNamespace(compact_hint_threshold=global_threshold),
+        thinking_type=None,
     )
     engine._compact_id_seq = 9999
     engine._used_compact_ids = set()
@@ -192,86 +172,7 @@ def test_append_compact_hint_multimodal_list():
     assert parts_small[0]["text"] == "small"
 
 
-# ==================== 思考内容精简提示（事务#2270） ====================
-
-
-def test_thinking_kept_in_context():
-    """thinking_type='thinking'或preserve_thinking=true时保留思考"""
-    # 剥离模式（默认）
-    assert make_engine()._thinking_kept_in_context() is False
-    # qwen系列 preserve_thinking=true
-    assert make_engine(provider_config={"preserve_thinking": True})._thinking_kept_in_context() is True
-    # deepseek系列 thinking_type="thinking"
-    assert make_engine(thinking_type="thinking")._thinking_kept_in_context() is True
-    # chat_template_kwargs + 不保留 → 剥离
-    assert (
-        make_engine(thinking_type="chat_template_kwargs")._thinking_kept_in_context() is False
-    )
-
-
-def test_append_thinking_compact_hint_preserve_mode():
-    """保留模式：超阈值(默认2048)追加精简提示，含唯一4位id"""
-    engine = make_engine(provider_config={"preserve_thinking": True})
-    small = "思" * 100
-    assert engine._append_thinking_compact_hint(small) == small
-
-    big = "思" * 2000  # 6000字节 > 2048
-    result = engine._append_thinking_compact_hint(big)
-    assert result.startswith(big)
-    tail = result[len(big) :]
-    assert "请用compact工具精简，id " in tail
-    assert "尽量节省上下文空间！" in tail
-    m = re.search(r"id (\d{4})", tail)
-    assert m, f"提示中未找到4位数字id: {tail!r}"
-
-    # thinking_type="thinking"（deepseek系列）同样生效
-    engine_ds = make_engine(thinking_type="thinking")
-    result2 = engine_ds._append_thinking_compact_hint(big)
-    assert result2 != big and "请用compact工具精简" in result2[len(big) :]
-
-
-def test_append_thinking_compact_hint_strip_mode_skipped():
-    """非保留模式（思考不驻留上下文）：不追加提示（纯浪费token）"""
-    engine = make_engine()  # 默认剥离模式
-    big = "思" * 2000
-    assert engine._append_thinking_compact_hint(big) == big
-
-
-def test_append_thinking_compact_hint_threshold_and_disable():
-    """阈值可覆盖（provider级/全局回退）；<=0禁用；空thinking原样返回"""
-    # provider级8192：6000字节不触发
-    engine = make_engine(
-        provider_config={"preserve_thinking": True, "thinking_compact_threshold": 8192}
-    )
-    big = "思" * 2000  # 6000字节
-    assert engine._append_thinking_compact_hint(big) == big
-
-    # provider级0=禁用
-    engine0 = make_engine(
-        provider_config={"preserve_thinking": True, "thinking_compact_threshold": 0}
-    )
-    assert engine0._append_thinking_compact_hint(big) == big
-
-    # 全局回退
-    engine_g = make_engine(
-        provider_config={"preserve_thinking": True}, global_thinking_threshold=100
-    )
-    assert "请用compact工具精简" in engine_g._append_thinking_compact_hint("思" * 100)
-
-    # 空内容
-    assert make_engine(provider_config={"preserve_thinking": True})._append_thinking_compact_hint("") == ""
-
-
-def test_append_thinking_compact_hint_ids_unique_across_kinds():
-    """思考提示与工具结果提示共用ID分配器，连续分配互不重复"""
-    engine = make_engine(provider_config={"preserve_thinking": True})
-    ids = []
-    for _ in range(10):
-        ids.append(
-            re.search(r"id (\d{4})", engine._append_thinking_compact_hint("思" * 2000)).group(1)
-        )
-        ids.append(re.search(r"id (\d{4})", engine._append_compact_hint("x" * 2000)).group(1))
-    assert len(set(ids)) == 20
+# ==================== 思考后无正式内容提醒（事务#2114） ====================
 
 
 def test_remind_thinking_only():
@@ -442,94 +343,6 @@ def test_compact_by_id_multimodal():
     assert h._messages[-1]["content"] == "无用信息"
 
 
-def test_compact_by_id_thinking_content():
-    """思考内容精简：窗口内assistant消息reasoning_content命中标记，整体替换"""
-    h = MessageHistory()
-    h.add_user("任务")
-    # === 迭代1：thinking(带提示) + tool_calls 合并 + 工具结果 ===
-    h.mark_iteration_start()
-    h.add_assistant(
-        "",
-        tool_calls=[
-            {
-                "id": "c1",
-                "type": "function",
-                "function": {"name": "bash", "arguments": '{"command": "ls"}'},
-            }
-        ],
-        _reasoning="深度思考" * 1000
-        + "\n 思考内容较长，如对后续工作已无用或可用总结大幅精简，请用compact工具精简，id 1300，尽量节省上下文空间！",
-    )
-    h.add_tool_result("c1", "bash", "ok", add_timestamp=False)
-    # === 迭代2：发起compact ===
-    h.mark_iteration_start()
-    h.add_assistant(
-        "",
-        tool_calls=[
-            {
-                "id": "c2",
-                "type": "function",
-                "function": {"name": "compact", "arguments": '{"id": "1300"}'},
-            }
-        ],
-    )
-    ok, msg = h.compact_by_id("1300", "思考精简：方案A可行，详见工具输出。")
-    assert ok is True, msg
-    assert h._messages[1]["reasoning_content"] == "思考精简：方案A可行，详见工具输出。"
-    # content与tool_calls不动
-    assert h._messages[1]["tool_calls"][0]["function"]["name"] == "bash"
-    assert h._messages[1].get("content", "") == ""
-    # 工具结果不受影响
-    assert h._messages[2]["content"] == "ok"
-
-
-def test_compact_by_id_thinking_only_message():
-    """纯thinking消息（thinking-only）中的标记同样可精简"""
-    h = MessageHistory()
-    h.add_user("任务")
-    h.mark_iteration_start()
-    h.add_assistant("", tool_calls=[{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}])
-    h.add_tool_result("c1", "bash", "out", add_timestamp=False)
-    # 空转迭代：thinking-only消息（保留模式下驻留上下文）
-    h.mark_iteration_start()
-    h.add_thinking(
-        "反复推演" * 800
-        + "\n 思考内容较长，如对后续工作已无用或可用总结大幅精简，请用compact工具精简，id 1400，尽量节省上下文空间！"
-    )
-    # === 当前迭代：发起compact ===
-    h.mark_iteration_start()
-    ok, msg = h.compact_by_id("1400", "思考精简：维持原方案。")
-    assert ok is True, msg
-    thinking_msgs = [m for m in h._messages if m.get(MessageHistory._THINKING_ONLY)]
-    assert thinking_msgs[-1]["reasoning_content"] == "思考精简：维持原方案。"
-
-
-def test_compact_by_id_thinking_cross_iteration_blocked():
-    """思考内容跨迭代拦截：更早迭代的thinking标记不可精简"""
-    h = MessageHistory()
-    h.add_user("任务")
-    # 迭代1：带标记的thinking
-    h.mark_iteration_start()
-    h.add_assistant(
-        "",
-        tool_calls=[{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}],
-        _reasoning="旧思考\n请用compact工具精简，id 1500",
-    )
-    h.add_tool_result("c1", "bash", "out1", add_timestamp=False)
-    # 迭代2：真实工具迭代（隔绝迭代1）
-    h.mark_iteration_start()
-    h.add_assistant(
-        "",
-        tool_calls=[{"id": "c2", "type": "function", "function": {"name": "bash", "arguments": "{}"}}],
-    )
-    h.add_tool_result("c2", "bash", "out2", add_timestamp=False)
-    # 迭代3：发起compact
-    h.mark_iteration_start()
-    ok, msg = h.compact_by_id("1500", "无用信息")
-    assert ok is False
-    assert "不属于上一轮迭代" in msg
-
-
 def test_iteration_marks_reset_on_clear():
     """clear/reset后边界失效；marks只保留最近8条"""
     h = MessageHistory()
@@ -594,7 +407,7 @@ def test_compact_window_excludes_current_iteration():
 
 
 def test_compact_tool_execute():
-    """CompactTool经工具上下文执行精简（工具结果与思考内容两类）"""
+    """CompactTool经工具上下文执行精简（工具结果）"""
     tool = CompactTool()
     h = _make_history_with_compact_hint()
     tool.set_context(history=h, task_id=2114)
@@ -608,26 +421,6 @@ def test_compact_tool_execute():
     # 未找到
     result3 = asyncio.run(tool.execute(id="9999", replace="无用信息"))
     assert "未找到" in result3
-
-
-def test_compact_tool_execute_thinking():
-    """CompactTool精简思考内容"""
-    tool = CompactTool()
-    h = MessageHistory()
-    h.add_user("任务")
-    h.mark_iteration_start()
-    h.add_assistant(
-        "",
-        tool_calls=[{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}],
-        _reasoning="长思考\n请用compact工具精简，id 1600",
-    )
-    h.add_tool_result("c1", "bash", "ok", add_timestamp=False)
-    h.mark_iteration_start()
-    tool.set_context(history=h, task_id=2270)
-    result = asyncio.run(tool.execute(id="1600", replace="思考精简摘要"))
-    assert result.startswith("已精简")
-    assert "思考内容" in result
-    assert h._messages[1]["reasoning_content"] == "思考精简摘要"
 
 
 def test_compact_tool_without_history_context():
@@ -666,48 +459,6 @@ def test_hint_then_compact_roundtrip():
     assert ok is True
     tool_msgs = [m for m in h._messages if m.get("role") == "tool"]
     assert tool_msgs[0]["content"] == "内容精简：ls输出无异常"
-
-
-def test_thinking_hint_then_compact_roundtrip():
-    """思考提示端到端闭环：保留模式追加提示 → 入history(合并模式) → 下一轮精简"""
-    engine = make_engine(provider_config={"preserve_thinking": True})
-    h = MessageHistory()
-    h.add_user("任务")
-    h.mark_iteration_start()  # 迭代1
-    big_thinking = "深度思考" * 1000  # 12000字节 > 2048
-    hinted = engine._append_thinking_compact_hint(big_thinking)
-    assert hinted.startswith(big_thinking)
-    compact_id = re.search(r"id (\d{4})", hinted[len(big_thinking) :]).group(1)
-    h.add_assistant(
-        "",
-        tool_calls=[{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}],
-        _reasoning=hinted,
-    )
-    h.add_tool_result("c1", "bash", "done", add_timestamp=False)
-    h.mark_iteration_start()  # 迭代2
-    ok, msg = h.compact_by_id(compact_id, "思考精简：已定位问题，方案见上。")
-    assert ok is True, msg
-    assert h._messages[1]["reasoning_content"] == "思考精简：已定位问题，方案见上。"
-
-
-def test_thinking_hint_roundtrip_strip_mode():
-    """非保留模式闭环：不追加提示 → 无标记 → 精简未找到"""
-    engine = make_engine()  # 剥离模式
-    h = MessageHistory()
-    h.add_user("任务")
-    h.mark_iteration_start()
-    big_thinking = "深度思考" * 1000
-    hinted = engine._append_thinking_compact_hint(big_thinking)
-    assert hinted == big_thinking
-    h.add_assistant(
-        "",
-        tool_calls=[{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}],
-        _reasoning=hinted,
-    )
-    h.add_tool_result("c1", "bash", "done", add_timestamp=False)
-    h.mark_iteration_start()
-    ok, msg = h.compact_by_id("1000", "无用信息")
-    assert ok is False and "未找到" in msg
 
 
 # ==================== 上下文估算对齐 preserve_thinking（事务#2114） ====================

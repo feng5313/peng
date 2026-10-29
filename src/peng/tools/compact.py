@@ -1,17 +1,13 @@
 """
-compact 工具：清理/精简上一轮迭代中无用的超长内容（事务#2114，事务#2270扩展思考内容）
+compact 工具：清理/精简上一轮迭代中无用的超长工具返回结果（事务#2114）
 
-大模型上一轮迭代中，超过阈值字节数的内容末尾带有提示：
-- 工具返回结果（provider级 compact_hint_threshold，默认1024字节）：
-  " 返回结果较长，如果无用或可以用总结大幅精简，请用compact工具清理或精简，id xxxx，尽量节省上下文空间！"
-- 保留思考内容的 provider（thinking_type="thinking" 或 preserve_thinking=true，
-  如 qwen3.8/deepseek 系列，thinking_compact_threshold 默认2048字节）的思考内容：
-  " 思考内容较长，如对后续工作已无用或可用总结大幅精简，请用compact工具精简，id xxxx，尽量节省上下文空间！"
-其中 xxxx 为该内容的唯一4位数字ID。
+大模型上一轮迭代中，超过阈值字节数（provider级 compact_hint_threshold，
+默认1024字节）的工具返回结果末尾带有提示：
+" 返回结果较长，如果无用或可以用总结大幅精简，请用compact工具清理或精简，id xxxx，尽量节省上下文空间！"
+其中 xxxx 为该结果的唯一4位数字ID。
 
-模型确认某段带此提示的内容对后续工作无用（或可大幅精简）时，调用本工具按id精简：
-- tool 消息的 content（或 assistant 消息的 reasoning_content）整体替换为指定精简文字，
-  工具调用记录和参数保持不变
+模型确认某段带此提示的结果对后续工作无用（或可大幅精简）时，调用本工具按id精简：
+- tool 消息的 content 整体替换为指定精简文字，工具调用记录和参数保持不变
 - 只能精简上一轮迭代的内容，禁止跨迭代精简（保护上下文前缀缓存）
 """
 
@@ -25,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class CompactTool(Tool):
-    """清理/精简上一轮迭代中无用的超长工具结果或思考内容，节省上下文空间。"""
+    """清理/精简上一轮迭代中无用的超长工具结果，节省上下文空间。"""
 
     @property
     def name(self) -> str:
@@ -33,8 +29,8 @@ class CompactTool(Tool):
 
     @property
     def description(self) -> str:
-        return """如果上一轮工具调用的返回结果或保留的思考内容中有较长无用或可被大幅精简的信息，用此工具清理或精简之，节省上下文空间。
-- 只能清理或精简上一轮迭代的内容（工具结果/思考内容），不能跨迭代清理
+        return """如果上一轮工具调用的返回结果中有较长无用或可被大幅精简的信息，用此工具清理或精简之，节省上下文空间。
+- 只能清理或精简上一轮迭代的工具结果，不能跨迭代清理
 - 对后续工作有用的结果（如稍后需要引用的代码/命令输出内容）不要清理
 """
 
@@ -45,7 +41,7 @@ class CompactTool(Tool):
             "properties": {
                 "id": {
                     "type": "string",
-                    "description": "要精简内容的4位数字ID（来自工具结果/思考内容末尾提示中的 id xxxx）",
+                    "description": "要精简工具结果的4位数字ID（来自工具结果末尾提示中的 id xxxx）",
                 },
                 "replace": {
                     "type": "string",
@@ -57,10 +53,10 @@ class CompactTool(Tool):
 
     async def execute(self, id: str, replace: str) -> str:  # noqa: A002 - 工具参数名与API约定一致
         """
-        按id精简上一轮迭代的工具返回结果或思考内容
+        按id精简上一轮迭代的工具返回结果
 
         Args:
-            id: 4位数字ID（来自内容末尾compact提示中的 "id xxxx"）
+            id: 4位数字ID（来自工具结果末尾compact提示中的 "id xxxx"）
 
         Returns:
             精简结果说明（成功或错误信息）
