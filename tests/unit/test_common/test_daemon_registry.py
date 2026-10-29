@@ -929,3 +929,99 @@ class TestKillTreeProtection:
                 kill_process(parent.pid, force=True, kill_tree=False, caller="test", reason="cleanup")
             if _alive(child_pid):
                 os.kill(child_pid, signal.SIGKILL)
+
+
+# ============================================================
+# get_alive_task_daemons（report汇报门禁，事务#2507）
+# ============================================================
+
+class TestGetAliveTaskDaemons:
+    def test_no_daemons(self):
+        """无注册daemon → 空列表"""
+        assert asyncio.run(dr.get_alive_task_daemons(999999)) == []
+
+    def test_local_alive_and_dead_filtering(self):
+        """本地daemon：存活的返回(alive_status=alive)，已退出的被过滤"""
+        # 存活进程：当前测试进程自身
+        alive_entry = dr.register_daemon(
+            task_id=51, command="watch alive", pid=os.getpid(), nest=None, platform="linux"
+        )
+        # 已退出进程：spawn后立即杀死并reap
+        dead = subprocess.Popen(["sleep", "300"])
+        dead_pid = dead.pid
+        dead.kill()
+        dead.wait(timeout=5)
+        dead_entry = dr.register_daemon(
+            task_id=51, command="watch dead", pid=dead_pid, nest=None, platform="linux"
+        )
+        result = asyncio.run(dr.get_alive_task_daemons(51))
+        ids = [e["id"] for e in result]
+        assert alive_entry["id"] in ids
+        assert dead_entry["id"] not in ids
+        for e in result:
+            assert e["alive_status"] == "alive"
+
+    def test_remote_batch_alive(self, monkeypatch):
+        """远程daemon：按nest批量RPC，返回存活的；同nest多个条目共用一次RPC"""
+        dr.register_daemon(task_id=52, command="http.server", pid=1234, nest="epyc", platform="linux")
+        dr.register_daemon(task_id=52, command="old build", pid=5678, nest="epyc", platform="linux")
+
+        calls = []
+
+        class FakeResp:
+            error = None
+            data = {"exit_code": 0, "stdout": "1234\n", "stderr": ""}
+
+        async def fake_bash(command, timeout, nest_name):
+            calls.append((nest_name, command))
+            return FakeResp()
+
+        import peng.nest.client as nest_client
+
+        monkeypatch.setattr(nest_client, "bash", fake_bash)
+        result = asyncio.run(dr.get_alive_task_daemons(52))
+
+        assert len(calls) == 1, "同nest两个PID应合并为一次批量RPC"
+        assert "1234" in calls[0][1] and "5678" in calls[0][1]
+        assert [e["pid"] for e in result] == [1234]
+        assert result[0]["alive_status"] == "alive"
+
+    def test_remote_query_fail_considered_unknown(self, monkeypatch):
+        """远程nest查询失败 → 保守视为存活（alive_status=unknown），防误放行遗留daemon"""
+        dr.register_daemon(task_id=53, command="svc", pid=9999, nest="epyc", platform="linux")
+
+        class FakeResp:
+            error = "WebSocket已关闭"
+            data = None
+
+        async def fake_bash(command, timeout, nest_name):
+            return FakeResp()
+
+        import peng.nest.client as nest_client
+
+        monkeypatch.setattr(nest_client, "bash", fake_bash)
+        result = asyncio.run(dr.get_alive_task_daemons(53))
+        assert len(result) == 1
+        assert result[0]["alive_status"] == "unknown"
+
+    def test_mixed_local_and_remote(self, monkeypatch):
+        """本地+远程混合：本地直查、远程批量RPC，各自正确归类"""
+        dr.register_daemon(task_id=54, command="local svc", pid=os.getpid(), nest="local")
+        dr.register_daemon(task_id=54, command="remote svc", pid=4321, nest="epyc", platform="windows")
+
+        class FakeResp:
+            error = None
+            data = {"exit_code": 0, "stdout": "4321", "stderr": ""}
+
+        async def fake_bash(command, timeout, nest_name):
+            assert "Get-Process" in command  # windows平台走PowerShell命令
+            return FakeResp()
+
+        import peng.nest.client as nest_client
+
+        monkeypatch.setattr(nest_client, "bash", fake_bash)
+        result = asyncio.run(dr.get_alive_task_daemons(54))
+        assert len(result) == 2
+        assert all(e["alive_status"] == "alive" for e in result)
+        nests = {e.get("nest") for e in result}
+        assert nests == {None, "epyc"}

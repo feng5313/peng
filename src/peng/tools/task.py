@@ -436,6 +436,20 @@ class ReportTool(Tool):
     def __init__(self):
         super().__init__()
 
+    async def _get_alive_daemons_safe(self, task_id: int) -> list[dict[str, Any]]:
+        """获取本事务存活daemon条目（失败降级为空列表，绝不阻断report）
+
+        daemon_registry异常（文件损坏/nest模块不可用等）时只记日志返回[]，
+        保持report工具原有可用性优先。
+        """
+        try:
+            from peng.common.daemon_registry import get_alive_task_daemons
+
+            return await get_alive_task_daemons(task_id)
+        except Exception as e:
+            logger.warning(f"[report] 事务#{task_id} 存活daemon检查失败(降级跳过): {e}")
+            return []
+
     @property
     def name(self) -> str:
         return "report"
@@ -443,6 +457,7 @@ class ReportTool(Tool):
     @property
     def description(self) -> str:
         return """工作汇报工具：复杂事务需求要全部达成且验证后，用本工具作汇报总结，以此结束事务处理。禁止在工作完成前的事务处理中途使用本工具！ 汇报内容要包含需求概述，解决方案，所做变更(包括文件路径)，测试验收结果，注意事项等信息。
+⚠️ 汇报门禁：本事务若有存活daemon（daemon工具启动的后台进程），汇报会被暂缓——需先用 stop <id> 清理不需要的daemon；有意保留的长期服务（如部署的http服务）需在summary末尾添加标记 [保留daemon] 并简述原因。
 支持通过id参数查看其他事务的report字段（只读）。
 常用功能：
 1. 汇报：summary=<汇报内容>（写入当前事务的report字段）
@@ -548,6 +563,39 @@ class ReportTool(Tool):
                 output = f"❌ 事务#{target_id}进度为 {progress}，尚未完成！report工具仅允许在事务全部完成（progress=100）后使用。请继续完成未完成的工作，更新 checklist 以推进进度。"
                 return DualOutput(summary=output, display=output)
 
+            # 🔧 事务#2507：存活daemon汇报门禁——汇报前确认本事务daemon已清理或注明保留。
+            # 背景：统计2860个daemon中4.8%在事务结束后仍无清理记录（rollback/异常中断/
+            # 遗忘），且存在模型声称"已清理"实际遗留的案例。report是事务完成最后关卡，
+            # 在此强制闭环：要么stop清理，要么[保留daemon]标记显式放行（可审计）。
+            alive_daemons = await self._get_alive_daemons_safe(target_id)
+            if alive_daemons and not re.search(r"\[\s*保留\s*daemon", report_content, re.I):
+                lines = []
+                for e in alive_daemons[:10]:
+                    status = "存活" if e.get("alive_status") == "alive" else "状态未知"
+                    nest_hint = f", nest={e['nest']}" if e.get("nest") else ""
+                    cmd_preview = (e.get("command") or "")[:60]
+                    lines.append(
+                        f"  - {e['id']} (PID {e.get('pid')}{nest_hint}) [{status}]: {cmd_preview}"
+                    )
+                more_hint = (
+                    f"\n  ...（共{len(alive_daemons)}个，仅列前10，其余同理）"
+                    if len(alive_daemons) > 10
+                    else ""
+                )
+                stop_ids = " ".join(e["id"] for e in alive_daemons[:10])
+                output = (
+                    f"⚠️ 事务#{target_id} 汇报暂缓：检测到 {len(alive_daemons)} 个存活daemon未处理。\n"
+                    + "\n".join(lines)
+                    + more_hint
+                    + "\n处理方式（二选一后重新report）：\n"
+                    f"1. 清理临时daemon：用bash/daemon工具执行 stop {stop_ids}"
+                    "（支持一次多个id；数量多时也可用bash执行 task kill "
+                    f"{target_id} 一次性停止本事务全部daemon）；\n"
+                    "2. 有意保留的长期服务（如部署的http服务/debug-server）："
+                    "在summary末尾添加标记 [保留daemon] 并简述保留原因。"
+                )
+                return DualOutput(summary=output, display=output)
+
             # 将汇报写入事务的report字段
             success = task_manager.db.update_task(target_id, report=report_content, progress=100)
             if not success:
@@ -555,6 +603,10 @@ class ReportTool(Tool):
                 return DualOutput(summary=output, display=output)
 
             summary = REPORT_SUCCESS_SUMMARY
+            if alive_daemons:
+                # [保留daemon]标记放行：在结果中注明保留清单（审计可见）
+                retained = ", ".join(e["id"] for e in alive_daemons)
+                summary += f"\n📌 已注明保留daemon: [{retained}]（共{len(alive_daemons)}个）"
             display = _format_markdown_for_display(
                 report_content, title=f"📝 事务#{target_id} 工作汇报已提交"
             )

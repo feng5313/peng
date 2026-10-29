@@ -1693,7 +1693,8 @@ class DaemonTool(BashTool):
             f"\n✅ daemon {daemon_id} 已启动 (PID {entry['pid']}{nest_hint})\n"
             f"命令: {command}\n"
             f"日志: {entry['log_file']}（用read工具读取查看输出）\n"
-            f"停止: stop {daemon_id}（bash/daemon工具内置命令），或 task kill -d {daemon_id}"
+            f"停止: stop {daemon_id}（bash/daemon工具内置命令），或 task kill -d {daemon_id}\n"
+            f"⚠️ report汇报时若本事务仍有存活daemon会被暂缓，需先stop清理或在汇报末尾注明 [保留daemon]"
         )
         display = f"\ndaemon {daemon_id} 已启动 (PID {entry['pid']})，停止方式: stop {daemon_id}"
         return DualOutput(summary=output, display=display)

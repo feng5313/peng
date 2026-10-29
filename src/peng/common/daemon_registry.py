@@ -403,6 +403,77 @@ def _check_remote_group_alive(
     return alive_pids
 
 
+async def _check_remote_group_alive_async(
+    nest_name: str, platform: str | None, entries: list[dict[str, Any]]
+) -> set[int] | None:
+    """异步批量检查同nest远程daemon存活（get_alive_task_daemons使用）
+
+    与同步版_check_remote_group_alive同策略：分批防命令行超长，
+    任一批查询失败返回None（调用方保守视为存活）。
+    """
+    alive_pids: set[int] = set()
+    for i in range(0, len(entries), _REMOTE_CHECK_BATCH_SIZE):
+        batch = entries[i : i + _REMOTE_CHECK_BATCH_SIZE]
+        pids = [int(e.get("pid") or 0) for e in batch if int(e.get("pid") or 0) > 0]
+        if not pids:
+            continue
+        cmd = _build_remote_check_command(pids, platform)
+        try:
+            from peng.nest.client import bash as nest_bash
+
+            resp = await nest_bash(command=cmd, timeout=15000, nest_name=nest_name)
+            if resp.error:
+                logger.debug(f"远程daemon批量存活检查失败({nest_name}): {resp.error}")
+                return None
+            alive_pids |= _parse_alive_pids((resp.data or {}).get("stdout", ""))
+        except Exception as e:
+            logger.debug(f"远程daemon批量存活检查异常({nest_name}): {e}")
+            return None
+    return alive_pids
+
+
+async def get_alive_task_daemons(task_id: int) -> list[dict[str, Any]]:
+    """获取指定事务的存活daemon条目（report汇报门禁使用，事务#2507）
+
+    - 本地(nest=None): process_exists逐个直查（无RPC开销）
+    - 远程: 按(nest,platform)分组批量RPC检查（复用_build_remote_check_command，
+      每nest每批≤50个PID）；nest查询失败保守视为存活（防误放行遗留daemon）
+
+    Returns:
+        存活（或状态未知）的daemon条目列表，每条目附:
+        - alive_status: "alive"（确认存活）或 "unknown"（远程查询失败，保守保留）
+    """
+    from peng.common.platform import process_exists
+
+    result: list[dict[str, Any]] = []
+    remote_groups: dict[tuple[str, str | None], list[dict[str, Any]]] = {}
+
+    for entry in get_task_daemons(task_id):
+        if normalize_nest(entry.get("nest")) is None:
+            pid = int(entry.get("pid") or 0)
+            if pid > 0 and process_exists(pid):
+                item = dict(entry)
+                item["alive_status"] = "alive"
+                result.append(item)
+        else:
+            key = (str(entry.get("nest")), entry.get("platform"))
+            remote_groups.setdefault(key, []).append(entry)
+
+    for (nest_name, platform), group in remote_groups.items():
+        alive_pids = await _check_remote_group_alive_async(nest_name, platform, group)
+        for entry in group:
+            pid = int(entry.get("pid") or 0)
+            item = dict(entry)
+            if alive_pids is None:
+                item["alive_status"] = "unknown"
+                result.append(item)
+            elif pid in alive_pids:
+                item["alive_status"] = "alive"
+                result.append(item)
+
+    return result
+
+
 # ============================================================
 # 进程存活与杀进程
 # ============================================================
