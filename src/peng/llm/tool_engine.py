@@ -39,7 +39,7 @@ import json
 from peng.common.colors import ANSI_COLORS, colorize, get_colors
 from peng.config import get_agent_name, get_master_name, load_config
 from peng.hooks.manager import HookManager
-from peng.llm.client import GLMClient, LLMError, StreamStallError
+from peng.llm.client import GLMClient, LLMError, StreamStallError, TaskCancelledError
 from peng.task.info import is_urgent_content
 from peng.task.output_manager import get_output_manager
 from peng.tools.base import DualOutput, Tool, ToolError
@@ -4533,6 +4533,18 @@ class ToolExecutionEngine:
                     text = f"⚠️  事务#{task_id} [ToolEngine]检测到中断，立刻结束大模型处理{e}。\n"
                     logger.info(text)
                     # 🔧 事务#2178：取消可能发生在yield处（生成器不会自动关闭），显式清理
+                    await self._aclose_llm_stream(stream)
+                    return
+                except TaskCancelledError as e:
+                    # 🔧 事务#2081（风主#11675）：事务在首token前（长prefill）被取消/
+                    # 暂停，client侧消费循环检测到终态抛出——此时连接已在client侧
+                    # finally关闭，服务端watcher检测EOF后STOP，prefill在chunk边界
+                    # 中止（实测从102秒僵尸prefill降至<4秒）。不重试不切换provider
+                    # （事务结果已无人消费），对齐CancelledError语义直接结束本轮。
+                    logger.info(
+                        f"⚡ 事务#{task_id} [ToolEngine]LLM流等待中检测到事务已取消/暂停，"
+                        f"连接已关闭: {e}"
+                    )
                     await self._aclose_llm_stream(stream)
                     return
                 except StreamStallError as e:

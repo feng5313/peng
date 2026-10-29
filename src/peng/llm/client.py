@@ -57,6 +57,16 @@ class LLMError(Exception):
         super().__init__(message)
 
 
+class TaskCancelledError(Exception):
+    """🔧 事务#2081：事务在等待LLM流期间（如长prefill首token前）被取消/暂停。
+
+    此时无任何chunk到达，tool_engine的chunk循环内中断检测点永不执行，
+    连接保持打开，服务端为已取消的事务prefill整个上下文（实测102秒僵尸
+    prefill）。client侧消费循环检测到事务终态后抛出本异常：不重试、不切换
+    provider，穿透finally链关闭连接（服务端watcher检测EOF后立即停止prefill）。
+    """
+
+
 # thinking标签预编译正则（用于_parse_thinking_tags）
 _THINKING_TAG_PATTERN = re.compile(r"<think\>(.*?)\</think\>", re.DOTALL)
 
@@ -1366,6 +1376,8 @@ class GLMClient:
                 # 排空socket，server侧连接健康）。50ms轮询间隔：SSE行吞吐~130行/s，
                 # 批量取行摊薄开销，延迟可忽略。
                 _stall_deadline = time.monotonic() + _effective_stall_timeout()
+                # 🔧 事务#2081：取消/暂停检测节流基准（每500ms查一次DB，见下方empty分支）
+                _cancel_check_at = time.monotonic()
                 while True:
                     if _line_q.empty():
                         if time.monotonic() >= _stall_deadline:
@@ -1384,6 +1396,32 @@ class GLMClient:
                                 timeout=_fired_timeout,
                                 provider=self.provider,
                             )
+                        # 🔧 事务#2081：首token前（长prefill）0 chunk，tool_engine的
+                        # chunk循环内中断检测点永不执行，取消/暂停的事务连接保持打开，
+                        # 服务端为已取消请求prefill整个上下文（实测102秒僵尸prefill，
+                        # 风主#11675）。每500ms节流查事务状态，终态/暂停→抛
+                        # TaskCancelledError（不重试语义），finally链关闭连接，服务端
+                        # watcher检测EOF后STOP→prefill在chunk边界(~2s)中止，端到端<4秒。
+                        # 查询失败静默跳过（不阻断正常流）。
+                        if task_id is not None and time.monotonic() >= _cancel_check_at:
+                            _cancel_check_at = time.monotonic() + 0.5
+                            try:
+                                _t = self.task_manager.db.get_task(task_id)
+                                if _t and _t.get("status") in (
+                                    "cancelled",
+                                    "paused",
+                                    "interrupted",
+                                    "failed",
+                                    "completed",
+                                ):
+                                    raise TaskCancelledError(
+                                        f"事务#{task_id}已{_t.get('status')}，"
+                                        f"中止等待中的LLM流（连接关闭，服务端prefill随之停止）"
+                                    )
+                            except TaskCancelledError:
+                                raise
+                            except Exception:
+                                pass
                         await asyncio.sleep(0.05)
                         continue
                     item = _line_q.get_nowait()
