@@ -1179,6 +1179,10 @@ class LLMConfig(BaseModel):
     # 超过此字节数的工具返回结果末尾追加compact清理提示（见llm.prompts.compact_hint）；
     # 0=禁用
     compact_hint_threshold: int = 1024
+    # 🔧 事务#2521：compact可精简窗口=最近N批工具结果所在的迭代（默认3，peng.json可配）。
+    # 1=仅上一轮迭代（原始行为）；窗口覆盖模型视角最近N批工具结果所在迭代，
+    # 中间无工具的空转迭代不顶掉批次；更早批次禁止精简（保护上下文前缀缓存）
+    compact_window_iterations: int = 3
     # 向后兼容：顶层 model 字段（将从 current_provider 获取）
     model: str = ""
     # 向后兼容：顶层 model 字段（将从 current_provider 获取）

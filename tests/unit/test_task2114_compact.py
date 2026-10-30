@@ -45,6 +45,8 @@ def test_config_defaults():
     )
     assert "{compact_id}" in prompts.compact_hint
     assert "compact工具" in prompts.compact_hint
+    # 🔧 事务#2521：compact精简窗口默认3批迭代
+    assert LLMConfig().compact_window_iterations == 3
 
 
 def _make_llm_config(prov_kwargs=None) -> LLMConfig:
@@ -270,8 +272,9 @@ def test_compact_by_id_empty_replace_fallback():
     assert h._messages[2]["content"] == PLACEHOLDER
 
 
-def test_compact_by_id_cross_iteration_blocked():
-    """跨迭代拦截：id在更早迭代中存在但不在上一轮窗口内"""
+def test_compact_by_id_cross_iteration_blocked(monkeypatch):
+    """N=1窗口（原始语义回归）：id在更早迭代中存在但不在上一轮窗口内"""
+    monkeypatch.setattr(MessageHistory, "_compact_window_iterations", lambda self: 1)
     h = _make_history_with_compact_hint()
     # 第3轮迭代开始后，id 1234所在的迭代1已不在"上一轮"窗口（上一轮=迭代2）
     h.add_tool_result("c2", "compact", "已精简", add_timestamp=False)  # idx 4
@@ -288,7 +291,7 @@ def test_compact_by_id_cross_iteration_blocked():
     )
     ok, msg = h.compact_by_id("1234", "无用信息")
     assert ok is False
-    assert "不属于上一轮迭代" in msg
+    assert "不在最近1次迭代精简窗口内" in msg
     assert h._messages[2]["content"] != "无用信息"
 
 
@@ -549,14 +552,16 @@ def test_get_token_count_fallback_passes_flags():
 # ==================== 事务#2521：防假目标 + 提示携带字符数 ====================
 
 
-def test_compact_no_false_target_on_legacy_error_message():
+def test_compact_no_false_target_on_legacy_error_message(monkeypatch):
     """事务#2520回归：窗口内含marker的compact错误消息不再被同id精简命中
 
     旧代码：错误消息"错误：未找到 id 1234..."文本含marker"id 1234"子串，下一轮
     重试compact(1234)时被窗口内子串匹配命中——报告"已精简：从65字符精简到113
     字符"的虚假成功（目标大结果纹丝不动，token不减反增）。此处用旧格式文本模拟
     修复上线时存量会话中的历史遗留消息（跳过compact自身消息的深度防御兜底）。
+    钉N=1保持"仅上一轮"窗口语义以复现事务#2520场景（窗口放宽后见N=3专项组）。
     """
+    monkeypatch.setattr(MessageHistory, "_compact_window_iterations", lambda self: 1)
     h = MessageHistory()
     h.add_user("任务")
     # 迭代1：真实目标（带id 1234提示）在更早迭代
@@ -606,7 +611,7 @@ def test_compact_no_false_target_on_legacy_error_message():
     ok, msg = h.compact_by_id("1234", "精简摘要")
     # 不再虚假成功：compact自身消息被跳过；命中更早迭代的真实目标→跨迭代拦截
     assert ok is False, f"不应虚假命中compact错误消息: {msg}"
-    assert "不属于上一轮迭代" in msg
+    assert "不在最近1次迭代精简窗口内" in msg
     # 错误消息与真实目标的内容均未被改动
     compact_msgs = [m for m in h._messages if m.get("name") == "compact"]
     assert "未找到" in compact_msgs[0]["content"]
@@ -652,8 +657,12 @@ def test_compact_skips_own_result_message_in_full_scan():
     assert "已精简：id 1234" in h._messages[2]["content"]  # 内容未被动过
 
 
-def test_compact_error_messages_use_hash_format():
-    """新错误消息中id写作"id#XXXX"（不带空格），不构成marker"id XXXX"子串"""
+def test_compact_error_messages_use_hash_format(monkeypatch):
+    """新错误消息中id写作"id#XXXX"（不带空格），不构成marker"id XXXX"子串
+
+    钉N=1：跨迭代分支需要id存在于更早迭代（N=3宽窗口下该场景直接命中成功）。
+    """
+    monkeypatch.setattr(MessageHistory, "_compact_window_iterations", lambda self: 1)
     h = _make_history_with_compact_hint()
     # 未找到分支
     _, msg_not_found = h.compact_by_id("5678", "无用信息")
@@ -714,3 +723,143 @@ def test_compact_hint_custom_template_without_size_compat(monkeypatch):
     assert m, f"旧模板应正常分配id: {result[-60:]!r}"
     # 新模板占位符（回归确认默认模板已含{size}）
     assert "{size}" in LLMPromptsConfig().compact_hint
+
+
+# ==================== 事务#2521：精简窗口放宽为最近N批迭代（默认3） ====================
+
+
+def _add_tool_batch(h: MessageHistory, call_id: str, compact_id: str):
+    """追加一个完整工具迭代批次：mark + assistant(tool_call) + tool结果(带id提示)"""
+    h.mark_iteration_start()
+    h.add_assistant(
+        "",
+        tool_calls=[
+            {"id": call_id, "type": "function", "function": {"name": "read", "arguments": "{}"}}
+        ],
+    )
+    h.add_tool_result(
+        call_id,
+        "read",
+        f"大量输出{compact_id}\n 请用compact工具清理或精简，id {compact_id}，尽量节省上下文空间！",
+        add_timestamp=False,
+    )
+
+
+def test_compact_window_last_3_iterations():
+    """N=3（默认/真实配置）：最近3批工具结果所在迭代可精简，第4批之外拦截
+
+    复刻事务#2521风主令前实测痛点：隔1轮/隔2轮的结果曾被"禁止跨迭代清理"拦截。
+    """
+    h = MessageHistory()
+    h.add_user("任务")
+    _add_tool_batch(h, "b0", "1000")  # 迭代0（4批前，应拦截）
+    _add_tool_batch(h, "b1", "1001")  # 迭代1（3批前，窗口内）
+    _add_tool_batch(h, "b2", "1002")  # 迭代2
+    _add_tool_batch(h, "b3", "1003")  # 迭代3（最近批次）
+    h.mark_iteration_start()  # 当前迭代：模型发起compact
+    h.add_assistant(
+        "",
+        tool_calls=[
+            {"id": "c9", "type": "function", "function": {"name": "compact", "arguments": "{}"}}
+        ],
+    )
+    # 最近3批=迭代1/2/3，均可精简
+    for cid in ("1001", "1002", "1003"):
+        ok, msg = h.compact_by_id(cid, "已精简摘要")
+        assert ok is True, f"id {cid} 应在最近3次迭代窗口内: {msg}"
+    # 第4批之外（迭代0）拦截
+    ok0, msg0 = h.compact_by_id("1000", "无用信息")
+    assert ok0 is False
+    assert "不在最近3次迭代精简窗口内" in msg0
+
+
+def test_compact_window_n1_only_last_batch(monkeypatch):
+    """N=1（原始语义对照）：仅最近1批可精简，隔1批即拦截"""
+    monkeypatch.setattr(MessageHistory, "_compact_window_iterations", lambda self: 1)
+    h = MessageHistory()
+    h.add_user("任务")
+    _add_tool_batch(h, "b1", "1001")
+    _add_tool_batch(h, "b2", "1002")
+    h.mark_iteration_start()
+    h.add_assistant(
+        "",
+        tool_calls=[
+            {"id": "c9", "type": "function", "function": {"name": "compact", "arguments": "{}"}}
+        ],
+    )
+    ok, _ = h.compact_by_id("1002", "摘要")
+    assert ok is True
+    ok1, msg1 = h.compact_by_id("1001", "摘要")
+    assert ok1 is False
+    assert "不在最近1次迭代精简窗口内" in msg1
+
+
+def test_compact_window_idle_iterations_not_shifting():
+    """N=3：中间无工具的空转迭代（空响应重试/纯文本轮）不顶掉批次
+
+    推广事务#2114哲学：窗口按"最近N批工具结果"计，而非机械倒数N个mark。
+    """
+    h = MessageHistory()
+    h.add_user("任务")
+    _add_tool_batch(h, "b0", "1000")  # 迭代0（3批之外）
+    _add_tool_batch(h, "b1", "1001")  # 批次1
+    h.mark_iteration_start()  # 空转迭代A（无工具消息）
+    h.add_user("空响应提醒（无工具调用）")
+    _add_tool_batch(h, "b2", "1002")  # 批次2
+    h.mark_iteration_start()  # 空转迭代B
+    h.add_user("纯文本轮（无工具调用）")
+    _add_tool_batch(h, "b3", "1003")  # 批次3
+    h.mark_iteration_start()  # 当前迭代
+    h.add_assistant(
+        "",
+        tool_calls=[
+            {"id": "c9", "type": "function", "function": {"name": "compact", "arguments": "{}"}}
+        ],
+    )
+    # 窗口起点应越过空转迭代直达批次1（而非机械marks[-3]=空转B之前的批次2）
+    start, end = h.get_compact_window()
+    assert h._messages[start].get("tool_calls"), "窗口起点应落在批次1的assistant消息上"
+    ok, msg = h.compact_by_id("1001", "摘要")
+    assert ok is True, f"空转迭代不应顶掉批次1: {msg}"
+    ok0, msg0 = h.compact_by_id("1000", "摘要")
+    assert ok0 is False
+    assert "不在最近3次迭代精简窗口内" in msg0
+
+
+def test_compact_window_config_read_and_clamp(monkeypatch):
+    """_compact_window_iterations：真实配置读取（peng.json=3/默认3）；非法回退3；≤0钳制1"""
+    h = MessageHistory()
+    n = h._compact_window_iterations()
+    assert n == 3, f"默认/配置应读取3（peng.json显式或字段默认）: {n}"
+    # ≤0钳制为1
+    monkeypatch.setattr(
+        "peng.llm.tool_engine.load_config",
+        lambda: SimpleNamespace(llm=SimpleNamespace(compact_window_iterations=0)),
+    )
+    assert MessageHistory()._compact_window_iterations() == 1
+    # 非法值回退3
+    monkeypatch.setattr(
+        "peng.llm.tool_engine.load_config",
+        lambda: SimpleNamespace(llm=SimpleNamespace(compact_window_iterations="abc")),
+    )
+    assert MessageHistory()._compact_window_iterations() == 3
+
+
+def test_compact_window_marks_truncation_clamp():
+    """第N批工具迭代早于保留的最早mark（marks仅留8条被空转挤掉）时，
+    窗口起点钳制到marks[0]，不失控覆盖远古历史"""
+    h = MessageHistory()
+    h.add_user("任务")
+    _add_tool_batch(h, "b1", "1001")  # 批次1（其mark将被挤出）
+    for i in range(8):  # 8次空转迭代：批次1的mark被截断
+        h.mark_iteration_start()
+        h.add_user(f"空转{i}")
+    _add_tool_batch(h, "b2", "1002")  # 批次2
+    _add_tool_batch(h, "b3", "1003")  # 批次3
+    h.mark_iteration_start()  # 当前迭代
+    start, end = h.get_compact_window()
+    assert start == h._iteration_marks[0], "窗口起点应钳制到最旧保留mark"
+    # 批次1的1001消息在marks[0]之前→不在窗口→拦截（保守取舍：宁拒勿滥）
+    ok, msg = h.compact_by_id("1001", "摘要")
+    assert ok is False
+    assert "不在最近3次迭代精简窗口内" in msg

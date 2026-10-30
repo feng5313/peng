@@ -470,16 +470,30 @@ class MessageHistory:
             )
         return str(content) if content else ""
 
+    def _compact_window_iterations(self) -> int:
+        """compact可精简窗口的迭代批次数N（事务#2521，热更新读取配置）
+
+        读取 llm.compact_window_iterations（默认3，peng.json可配）；
+        非法值回退3，钳制下限1（1=仅上一轮迭代的原始行为）。
+        """
+        try:
+            n = int(getattr(load_config().llm, "compact_window_iterations", 3))
+        except Exception:
+            n = 3
+        return max(1, n)
+
     def get_compact_window(self) -> tuple[int, int] | None:
-        """获取"上一轮迭代"（最近一批工具结果所在迭代）的消息索引窗口 [start, end)（事务#2114）
+        """获取compact可精简窗口的消息索引范围 [start, end)（事务#2114；事务#2521放宽为最近N批迭代）
 
         end = 最后一次mark（当前迭代的消息——含正在执行的工具批次——全部在其后，
-        天然被排除）；start = 最近一条 tool 消息所在迭代的起始边界。
+        天然被排除）；start = 最近第N条 tool 消息所在迭代的起始边界
+        （N = llm.compact_window_iterations，默认3，peng.json可配；N=1 即原始
+        "仅上一轮迭代"行为）。
 
-        从模型视角，"上一轮迭代"= 它看到的最近一批工具结果：中间隔着的无工具
+        从模型视角，窗口覆盖"最近N批工具结果所在的迭代"：中间隔着的无工具
         空转迭代（空响应重试/纯文本轮/中断跳过等）不产生工具结果，不应把窗口
-        顶到错过最近一批结果；而更早批次的内容（隔着真实工具迭代）不允许
-        精简（"不得跨多个迭代compact"，同时保护上下文前缀缓存）。
+        顶到错过最近批次；而更早批次的内容（隔着超过N次真实工具迭代）不允许
+        精简（"不得跨迭代compact"，同时保护上下文前缀缓存）。
 
         Returns:
             (start, end)：可精简的消息索引范围（已按当前消息数钳制）；
@@ -490,30 +504,41 @@ class MessageHistory:
         end = min(self._iteration_marks[-1], len(self._messages))
         if end <= 0:
             return None
-        # 定位最近一条 tool 消息（最近一批工具结果的尾部）
+        n = self._compact_window_iterations()
+        # 定位最近第N条 tool 消息（=第N批工具结果中最早一行的下标；不足N条时
+        # 循环自然结束，last_tool 停在历史中最早一条 tool 消息上）
         last_tool = -1
+        tool_seen = 0
         for i in range(end - 1, -1, -1):
             if self._messages[i].get("role") == "tool":
+                tool_seen += 1
                 last_tool = i
-                break
-        if last_tool < 0:
+                if tool_seen >= n:
+                    break
+        if tool_seen == 0:
             return None  # 历史中尚无工具结果
-        # 窗口起点 = 该消息所在迭代的起始边界（≤last_tool 的最大mark，无则0）
-        start = 0
+        # 窗口起点 = 该消息所在迭代的起始边界（≤last_tool 的最大mark，无则钳制到最旧mark）
+        start = None
         for m in self._iteration_marks:
             if m <= last_tool:
                 start = m
             else:
                 break
+        if start is None:
+            # 🔧 事务#2521兜底：第N批工具迭代早于保留的最早mark（marks仅留最近8条，
+            # 如中间大量空转迭代致截断）时，钳制到最旧保留mark，避免窗口失控
+            # 覆盖到远古历史（破坏前缀缓存保护）
+            start = self._iteration_marks[0]
         return (start, end)
 
     def compact_by_id(self, compact_id: str, replace: str) -> tuple[bool, str]:
-        """按id精简上一轮迭代的工具返回结果（事务#2114）
+        """按id精简最近N批迭代内的工具返回结果（事务#2114；事务#2521窗口放宽为N批）
 
-        只允许精简上一轮迭代（最近一批工具结果所在迭代，见get_compact_window）：
+        只允许精简最近N批工具结果所在迭代（N=llm.compact_window_iterations，
+        默认3，见get_compact_window）：
         命中的 tool 消息 content 整体替换为精简文字（同时清除多模态附件part，
         节省视觉token），不改动 assistant 消息中的 tool_calls 与参数。
-        中间隔着真实工具迭代的更早批次结果禁止精简（不得跨多个迭代compact）。
+        更早批次的结果禁止精简（不得跨迭代compact，保护上下文前缀缓存）。
         replace 为空/纯空白时回退为占位文案。
 
         Args:
@@ -550,7 +575,7 @@ class MessageHistory:
                 original_len = len(self._content_text(msg.get("content")))
                 msg["content"] = replace
                 logger.info(
-                    f"[MessageHistory] compact工具已精简上一轮迭代工具结果 "
+                    f"[MessageHistory] compact工具已精简迭代窗口内工具结果 "
                     f"id={compact_id} (消息#{i}, 原{original_len}字符)"
                 )
                 return (
@@ -558,15 +583,16 @@ class MessageHistory:
                     f"已精简：id {compact_id} 对应的工具返回结果，"
                     f"从{original_len}字符精简到{len(replace)}字符。",
                 )
-        # 窗口内未命中：区分"id不存在"与"存在但不在上一轮迭代"两种情况，给出精确报错
+        # 窗口内未命中：区分"id不存在"与"存在但不在精简窗口内"两种情况，给出精确报错
         for i, msg in enumerate(self._messages):
             if _is_compactable_target(msg) and marker in self._content_text(msg.get("content")):
+                # 🔧 事务#2521：错误消息中id写作"id#XXXX"（不带空格），避免构成
+                # marker"id XXXX"子串——错误消息入历史后污染下一轮的同id精简匹配
                 return (
                     False,
-                    # 🔧 事务#2521：错误消息中id写作"id#XXXX"（不带空格），避免构成
-                    # marker"id XXXX"子串——错误消息入历史后污染下一轮的同id精简匹配
-                    f"错误：id#{compact_id} 对应的工具结果不属于上一轮迭代（消息#{i}），"
-                    f"禁止跨迭代清理。只能精简上一轮迭代中带compact提示的工具结果。",
+                    f"错误：id#{compact_id} 对应的工具结果不在最近{self._compact_window_iterations()}"
+                    f"次迭代精简窗口内（消息#{i}），禁止跨迭代清理。"
+                    f"只能精简最近{self._compact_window_iterations()}次迭代中带compact提示的工具结果。",
                 )
         return (
             False,

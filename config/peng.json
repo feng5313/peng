@@ -88,6 +88,7 @@
     "symbol_output_threshold": 500,
     "repeated_phrase_maxlen": 256,
     "compact_threshold": 360000,
+    "compact_window_iterations": 3,
     "timeout": 60.0,
     "timeout_connect": 30.0,
     "timeout_read": 30.0,
