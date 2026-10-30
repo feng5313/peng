@@ -411,7 +411,11 @@ def _recover_persist_index(
 # 回滚diff预览短时缓存（用户反复点击同一回滚链接时跳过 add -A 全量扫描）
 # 格式：{cache_key: {"ts": float, "result": dict}}
 _preview_diff_cache: dict[str, dict[str, Any]] = {}
-_PREVIEW_DIFF_CACHE_TTL = 10.0  # 秒（覆盖"关闭弹窗再点开"的典型间隔，同时保持diff新鲜度）
+_PREVIEW_DIFF_CACHE_TTL = 60.0  # 秒（大仓库检测可达10s+；覆盖反复开关窗口，
+# 确认回滚时后端仍会重新检测实际变更，预览允许略陈旧）
+# 🔧 事务#2513：预览等待 workdir 锁上限（同 workdir 快照/检测排队时，
+# 预览最多等这么久即返回"系统繁忙"提示——预览仅参考，确认时重新检测）
+_PREVIEW_LOCK_WAIT_TIMEOUT = 60.0
 
 # 回滚diff预览截断上限（字节）：末尾按完整行对齐，超出部分不传输不渲染
 _DIFF_PREVIEW_MAX_BYTES = 3 * 1024 * 1024  # 3MB
@@ -4646,8 +4650,24 @@ class ToolBackupManager:
         )
 
         # 🔧 事务#2484：与快照共用 peng_backup_idx 索引——同 workdir 串行锁
-        with _get_remote_workdir_lock(nest_name, str(workdir)):
+        # 🔧 事务#2513：锁等待上限 60s——同 workdir 事务快照/检测排队时预览
+        # 可能等分钟级（前端"永远计算中"实锤）；超时返回繁忙提示（预览仅
+        # 参考信息，用户可直接确认回滚——确认时后端会重新检测实际变更）
+        wd_lock = _get_remote_workdir_lock(nest_name, str(workdir))
+        _t0 = time.time()
+        if not wd_lock.acquire(timeout=_PREVIEW_LOCK_WAIT_TIMEOUT):
+            logger.warning(
+                f"远程diff预览等待workdir锁超时60s({nest_name}:{workdir})"
+            )
+            return {"success": False, "diff": "", "changed_files": [], "truncated": False,
+                    "message": ("系统繁忙：同目录正有事务快照/检测排队（已等60s），"
+                                "diff预览暂不可用。可直接确认回滚（确认时将重新检测"
+                                "实际变更），或稍后重试")}
+        try:
+            logger.debug(f"远程diff预览获锁耗时 {time.time()-_t0:.1f}s({nest_name}:{workdir})")
             result = _run_python_remote(py_code, timeout=180, nest_name=nest_name)
+        finally:
+            wd_lock.release()
         if result.returncode != 0:
             logger.warning(f"远程批量diff预览失败({nest_name}): {result.stderr[:200]}")
             return {"success": False, "diff": "", "changed_files": [], "truncated": False,

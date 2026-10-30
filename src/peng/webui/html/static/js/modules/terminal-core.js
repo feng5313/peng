@@ -2002,14 +2002,26 @@ async function loadRollbackDiffPreview(rollbackMeta, container) {
     }
     var ph = container.querySelector('[data-elapsed]');
     if (ph) {
-      ph.textContent = '⏳ 正在计算回滚diff...（已用时 ' + Math.round((Date.now() - startTs) / 1000) + 's，大仓库或并发构建时较慢）';
+      var secs = Math.round((Date.now() - startTs) / 1000);
+      var txt = '⏳ 正在计算回滚diff...（已用时 ' + secs + 's，大仓库或并发构建时较慢）';
+      // 🔧 事务#2513：>30s 追加繁忙指引（预览仅参考，可直接确认——
+      // 确认时后端会重新检测实际变更）
+      if (secs > 30) {
+        txt += '\n⏳ 系统繁忙（同目录事务快照/检测可能排队中）。\n提示：diff仅供预览参考，可直接点击"确认回滚"（确认时将重新检测实际变更），无需等待。';
+      }
+      ph.textContent = txt;
     }
   }, 1000);
+  // 🔧 事务#2513：fetch 超时上限 150s（服务端锁等待60s+计算180s兜底，
+  // 防无限等待——超时显示重试入口）
+  var abortCtrl = new AbortController();
+  var abortTimer = setTimeout(function() { abortCtrl.abort(); }, 150000);
   try {
     var response = await fetch('/api/tool-rollback-preview', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rollback_meta: rollbackMeta })
+      body: JSON.stringify({ rollback_meta: rollbackMeta }),
+      signal: abortCtrl.signal
     });
     if (!response.ok) {
       container.innerHTML = '<span style="color:#8b949e">（diff预览不可用：HTTP ' + response.status + '）</span>';
@@ -2178,9 +2190,25 @@ async function loadRollbackDiffPreview(rollbackMeta, container) {
   } catch (e) {
     console.error('[Rollback] diff预览加载失败:', e);
     if (document.body.contains(container)) {
-      container.innerHTML = '<span style="color:#8b949e">（diff预览加载失败：' + e.message + '）</span>';
+      // 🔧 事务#2513：150s 超时——繁忙提示+重试（可直接确认回滚）
+      if (e && (e.name === 'AbortError' || /aborted/i.test(String(e.message)))) {
+        container.innerHTML = ''
+          + '<div style="color:#d29922">⏳ diff预览计算超时（系统繁忙：同目录事务快照/检测可能排队中）。</div>'
+          + '<div style="color:#8b949e;margin:4px 0">提示：diff仅供预览参考，可直接点击"确认回滚"（确认时将重新检测实际变更），无需等待。</div>'
+          + '<button id="rollback-diff-retry" style="padding:4px 14px;border:1px solid #30363d;background:transparent;color:#e6edf3;border-radius:4px;cursor:pointer;font-size:var(--font-size-ui, 12px)">重试预览</button>';
+        var retryBtn = container.querySelector('#rollback-diff-retry');
+        if (retryBtn) {
+          retryBtn.addEventListener('click', function() {
+            container.innerHTML = '<span data-elapsed style="color:#8b949e">⏳ 正在计算回滚diff...</span>';
+            loadRollbackDiffPreview(rollbackMeta, container);
+          });
+        }
+      } else {
+        container.innerHTML = '<span style="color:#8b949e">（diff预览加载失败：' + e.message + '）</span>';
+      }
     }
   } finally {
+    clearTimeout(abortTimer);
     clearInterval(elapsedTimer);
   }
 }

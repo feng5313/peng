@@ -90,3 +90,67 @@ class TestPreviewDiffCache:
                 m = _meta(commit=f"c{i:03d}"); m["nest_name"] = "epyc"
                 ToolBackupManager.preview_rollback_diff(m)
         assert len(tool_backup._preview_diff_cache) <= 32
+
+
+class TestPreviewLockWaitTimeout:
+    """🔧 事务#2513：workdir 锁等待上限——同目录快照/检测排队时预览不再无限等待"""
+
+    def test_lock_held_returns_busy_hint(self, monkeypatch):
+        """锁被占（模拟快照进行中）+ 等待超时 → 返回"系统繁忙"提示（不发HTTP）"""
+        import threading
+
+        monkeypatch.setattr(tool_backup, "_PREVIEW_LOCK_WAIT_TIMEOUT", 0.2)
+        lock = threading.RLock()
+        # RLock 可重入：持锁者必须是**别的线程**（模拟快照并发持锁），
+        # 同线程重入 acquire 会直接成功导致测试无效；释放也须由持锁线程
+        acquired = threading.Event()
+        release_flag = threading.Event()
+
+        def _hold():
+            lock.acquire()
+            acquired.set()
+            release_flag.wait(10)
+            lock.release()
+
+        holder = threading.Thread(target=_hold, daemon=True)
+        holder.start()
+        assert acquired.wait(5), "持锁线程未就绪"
+        monkeypatch.setattr(
+            tool_backup, "_get_remote_workdir_lock", lambda *a, **kw: lock
+        )
+        meta = _meta(workdir="D:/busy", commit="c1")
+        meta["nest_name"] = "epyc"  # 远程分支 → _preview_rollback_diff_remote_batch
+        try:
+            r = ToolBackupManager.preview_rollback_diff(meta)
+        finally:
+            release_flag.set()
+            holder.join(5)
+        assert r["success"] is False
+        assert r["diff"] == "" and r["changed_files"] == []
+        assert "系统繁忙" in r["message"]
+        assert "确认" in r["message"], "必须提示用户可直接确认回滚（确认时重新检测）"
+
+    def test_lock_released_after_compute(self, monkeypatch):
+        """锁获取成功后正常计算并释放（finally 释放，不残留死锁）"""
+        import threading
+
+        lock = threading.RLock()
+        monkeypatch.setattr(tool_backup, "_PREVIEW_LOCK_WAIT_TIMEOUT", 5.0)
+        monkeypatch.setattr(
+            tool_backup, "_get_remote_workdir_lock", lambda *a, **kw: lock
+        )
+
+        class _R:
+            returncode = 0
+            stdout = '{"no_change": true}'
+            stderr = ""
+
+        monkeypatch.setattr(
+            tool_backup, "_run_python_remote", lambda *a, **kw: _R()
+        )
+        meta = _meta(workdir="D:/ok", commit="c2")
+        meta["nest_name"] = "epyc"
+        r = ToolBackupManager.preview_rollback_diff(meta)
+        assert r["success"] is True and r["message"] == "无文件变更"
+        assert lock.acquire(blocking=False), "计算完成后锁必须已释放"
+        lock.release()
