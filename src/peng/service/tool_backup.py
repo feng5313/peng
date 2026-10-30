@@ -965,6 +965,61 @@ def _get_remote_workdir_lock(nest_name: str, workdir: str) -> threading.RLock:
         return _REMOTE_WD_LOCKS.setdefault(key, threading.RLock())
 
 
+def _cross_proc_wd_lock_py(wait_secs: float, indent: str = "    ") -> str:
+    """生成远程脚本内的跨进程 workdir 互斥锁代码段（事务#2513）
+
+    根因：diff预览在 webui 进程、各事务 runner 是独立进程——调用方的
+    进程内 threading 锁跨进程互不可见，多进程并发操作同一远程 workdir
+    的 git 索引导致 "index.lock File exists" 冲突（实测实锤）。
+    方案：脚本在远程端获取 workdir 级文件锁（Windows msvcrt / Linux
+    fcntl），进程退出 OS 自动释放无残留；并顺带清理历史冲突遗留的
+    索引 .lock 残留（File exists 永久失败源头）。
+
+    插入位置要求：脚本内 workdir/temp_index/result_data 变量已定义、
+    首个索引写操作（read-tree/add）之前。进程内 _get_remote_workdir_lock
+    保留（同进程排队快速路径，二者互补）。indent 为脚本内代码块缩进。
+    """
+    i = indent
+    return (
+        f"{i}# 🔧 事务#2513 跨进程 workdir 互斥锁：webui（diff预览）与各事务\n"
+        f"{i}# runner 是不同进程，调用方进程内锁跨进程无效（index.lock File\n"
+        f"{i}# exists 冲突实锤）——远程端文件锁统一互斥；进程退出 OS 自动释放\n"
+        f"{i}import time as _t\n"
+        f"{i}_wait = {wait_secs!r}\n"
+        f"{i}_lf = open(os.path.join(workdir, '.peng_wd.lock'), 'a+')\n"
+        f"{i}_lock_ok = False\n"
+        f"{i}_dl = _t.time() + _wait\n"
+        f"{i}while True:\n"
+        f"{i}    try:\n"
+        f"{i}        import msvcrt as _ms\n"
+        f"{i}        _ms.locking(_lf.fileno(), _ms.LK_NBLCK, 1)\n"
+        f"{i}        _lock_ok = True\n"
+        f"{i}        break\n"
+        f"{i}    except ImportError:\n"
+        f"{i}        import fcntl as _fc\n"
+        f"{i}        try:\n"
+        f"{i}            _fc.flock(_lf.fileno(), _fc.LOCK_EX | _fc.LOCK_NB)\n"
+        f"{i}            _lock_ok = True\n"
+        f"{i}            break\n"
+        f"{i}        except OSError:\n"
+        f"{i}            pass\n"
+        f"{i}    except OSError:\n"
+        f"{i}        pass\n"
+        f"{i}    if _t.time() > _dl:\n"
+        f"{i}        break\n"
+        f"{i}    _t.sleep(1)\n"
+        f"{i}if not _lock_ok:\n"
+        f"{i}    result_data['error'] = ('workdir busy: 跨进程锁等待超时' + str(_wait)\n"
+        f"{i}                            + 's（同目录事务快照/检测并发中，请稍后重试）')\n"
+        f"{i}    print(json.dumps(result_data)); sys.exit(0)\n"
+        f"{i}# 历史并发冲突的索引 lock 残留清理（File exists 永久失败源头）\n"
+        f"{i}_idx_lk = temp_index + '.lock'\n"
+        f"{i}if os.path.exists(_idx_lk):\n"
+        f"{i}    try: os.remove(_idx_lk)\n"
+        f"{i}    except OSError: pass\n"
+    )
+
+
 # Windows cmd 命令行长度硬限制 8191 字符，预留脚本前缀等余量
 # 🔧 事务#2497 语义更新：本值现为"长脚本是否走文件通道"的阈值——
 # ≤阈值走原 `python -c` 直发快路径（单次 HTTP）；>阈值把脚本经协议
@@ -2091,7 +2146,8 @@ class ToolBackupManager:
             "            git_dir = os.path.join(toplevel.stdout.strip().replace(chr(92), '/'), git_dir)\n"
             # 🔧 事务#2088 持久化增量索引（与快照共用，跨调用增量 O(变更数)）
             "    temp_index = os.path.join(git_dir, 'peng_backup_idx_task' + str(task_id))\n"
-            "    env_idx = {'GIT_INDEX_FILE': temp_index}\n"
+            + _cross_proc_wd_lock_py(120)
+            + "    env_idx = {'GIT_INDEX_FILE': temp_index}\n"
             "    if not os.path.exists(temp_index):\n"
             "        real_idx = os.path.join(git_dir, 'index')\n"
             "        if os.path.isfile(real_idx):\n"
@@ -2583,7 +2639,8 @@ class ToolBackupManager:
             # 根因。固定名索引跨快照复用（增量 O(变更数)）；缺失时优先复制
             # 真实 .git/index 热启动（含用户 git 维护的 stat 缓存）
             "    temp_index = os.path.join(git_dir, 'peng_backup_idx_task' + str(task_id))\n"
-            "    env_idx = {'GIT_INDEX_FILE': temp_index}\n"
+            + _cross_proc_wd_lock_py(120)
+            + "    env_idx = {'GIT_INDEX_FILE': temp_index}\n"
             "    if not os.path.exists(temp_index):\n"
             "        real_idx = os.path.join(git_dir, 'index')\n"
             "        if os.path.isfile(real_idx):\n"
@@ -4606,8 +4663,9 @@ class ToolBackupManager:
             "            t = git('rev-parse', '--show-toplevel')\n"
             "            if t.returncode == 0:\n"
             "                git_dir = os.path.join(t.stdout.decode('utf-8','replace').strip().replace(chr(92), '/'), git_dir)\n"
-            "        temp_index = os.path.join(git_dir, 'peng_backup_idx_task' + str(task_id))\n"
-            "        env_idx = {'GIT_INDEX_FILE': temp_index}\n"
+        "        temp_index = os.path.join(git_dir, 'peng_backup_idx_task' + str(task_id))\n"
+        + _cross_proc_wd_lock_py(60, indent="        ")
+        + "        env_idx = {'GIT_INDEX_FILE': temp_index}\n"
             # 🔧 事务#2088 持久化增量索引（与快照共用；缺失时热/冷启动）
             "        if not os.path.exists(temp_index):\n"
             "            real_idx = os.path.join(git_dir, 'index')\n"
