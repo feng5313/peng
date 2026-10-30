@@ -662,6 +662,12 @@ class UploadError(Exception):
 
 _upload_callbacks: list[Callable] = []
 
+# 🔧 事务#2513 SWR 缓存（stale-while-revalidate）：回滚diff预览秒级响应——
+# key=rollback_meta哈希 → {ts, result, refreshing}；新鲜(<60s)秒回、陈旧返回
+# 旧值+后台刷新、无缓存返回pending+后台计算（前端1.5s轮询拉取）
+_PREVIEW_SWR_CACHE: dict[str, dict] = {}
+_PREVIEW_SWR_GUARD = threading.Lock()
+
 
 def register_upload_callback(callback):
     _upload_callbacks.append(callback)
