@@ -17,6 +17,7 @@ import json
 import logging
 import shlex
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -1727,9 +1728,33 @@ async def tool_rollback_preview(request: Request):
             return {"success": False, "diff": "", "changed_files": [], "truncated": False,
                     "message": "缺少回滚元数据"}
 
-        file_task = asyncio.to_thread(
-            ToolBackupManager.preview_rollback_diff_with_external, rollback_meta
-        )
+        # 🔧 事务#2513 SWR（stale-while-revalidate）：回滚diff计算可达10s+
+        # （大仓库add -A+跨进程锁排队）——窗口打开必须秒级响应：
+        # 1) 缓存新鲜（<60s）→ 直接返回
+        # 2) 缓存陈旧 → 立即返回旧值（标stale）+ 后台线程刷新
+        # 3) 无缓存 → 后台线程计算，本次返回 pending（前端1.5s轮询，
+        #    后台在事务间隙抢跨进程锁，典型2-8s后轮询命中缓存）
+        import hashlib
+        import threading
+        import time as _time
+
+        swr_key = hashlib.sha256(
+            json.dumps(rollback_meta, sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest()[:16]
+
+        def _bg_compute() -> None:
+            try:
+                r = ToolBackupManager.preview_rollback_diff_with_external(dict(rollback_meta))
+                with _PREVIEW_SWR_GUARD:
+                    _PREVIEW_SWR_CACHE[swr_key] = {
+                        "ts": _time.time(), "result": r, "refreshing": False,
+                    }
+            except Exception as exc:
+                logger.warning(f"diff预览后台刷新失败: {exc}")
+                with _PREVIEW_SWR_GUARD:
+                    cur = _PREVIEW_SWR_CACHE.get(swr_key)
+                    if cur:
+                        cur["refreshing"] = False
 
         # checklist diff：仅快照包含 history_commit 时可计算（迭代/undo快照），
         # 工具级快照无 checklist 备份，返回 available=False 前端不显示区块
@@ -1749,8 +1774,36 @@ async def tool_rollback_preview(request: Request):
             task_id, history_commit, label,
         )
 
-        result, checklist_result = await asyncio.gather(file_task, cl_task)
-        result["checklist_diff"] = checklist_result
+        with _PREVIEW_SWR_GUARD:
+            entry = _PREVIEW_SWR_CACHE.get(swr_key)
+            now = _time.time()
+            # 无缓存 或 后台计算尚未完成（result=None）→ pending 轮询语义
+            if entry is None or entry.get("result") is None:
+                if entry is None:
+                    _PREVIEW_SWR_CACHE[swr_key] = {
+                        "ts": 0.0, "result": None, "refreshing": True,
+                    }
+                    threading.Thread(target=_bg_compute, daemon=True).start()
+                pending = True
+            else:
+                pending = False
+                fresh = now - entry["ts"] < 60
+                if not fresh and not entry.get("refreshing"):
+                    entry["refreshing"] = True
+                    threading.Thread(target=_bg_compute, daemon=True).start()
+
+        if pending:
+            checklist_result = await cl_task
+            return {"pending": True, "success": True, "diff": "",
+                    "changed_files": [], "truncated": False,
+                    "message": "diff后台计算中（约2-8秒，窗口自动刷新）",
+                    "checklist_diff": checklist_result}
+
+        result = dict(entry["result"] or {"success": False, "diff": "",
+                                          "changed_files": [], "truncated": False,
+                                          "message": "计算中"})
+        result["stale"] = (now - entry["ts"]) >= 60
+        result["checklist_diff"] = await cl_task
         return result
     except Exception as e:
         tb = traceback.format_exc()

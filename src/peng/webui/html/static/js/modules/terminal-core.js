@@ -1990,7 +1990,8 @@ function parseDiffAddedFiles(diffText) {
  * @param {object} rollbackMeta - 回滚元数据
  * @param {HTMLElement} container - diff渲染容器
  */
-async function loadRollbackDiffPreview(rollbackMeta, container) {
+async function loadRollbackDiffPreview(rollbackMeta, container, attempt) {
+  attempt = attempt || 0;
   var titleEl = document.getElementById('rollback-diff-title');
   // 加载耗时计时器：大仓库/远程nest并发时diff计算可达数秒~分钟级，
   // 实时显示已耗时秒数让用户知道在计算而非卡死
@@ -2031,6 +2032,27 @@ async function loadRollbackDiffPreview(rollbackMeta, container) {
 
     // 对话框可能已被用户关闭
     if (!document.body.contains(container)) return;
+
+    // 🔧 SWR pending（事务#2513）：服务端后台计算中——1.5s 后自动重试
+    // 拉取（后台算完写入缓存，下次请求秒回；窗口打开永远 <1s 有响应）
+    if (data.pending) {
+      if (attempt < 40) {
+        var ph = container.querySelector('[data-elapsed]');
+        if (ph) {
+          ph.textContent = '⏳ 正在后台计算回滚diff...（已用时 '
+            + Math.round((Date.now() - startTs) / 1000)
+            + 's，计算完成自动刷新；可直接点击"确认回滚"无需等待）';
+        }
+        setTimeout(function() {
+          if (document.body.contains(container)) {
+            loadRollbackDiffPreview(rollbackMeta, container, attempt + 1);
+          }
+        }, 1500);
+      } else {
+        container.innerHTML = '<span style="color:#8b949e">（diff后台计算超时，可直接确认回滚——确认时将重新检测实际变更）</span>';
+      }
+      return;
+    }
 
     var YELLOW = '#d29922', DIM = '#8b949e';
     var parts = [];

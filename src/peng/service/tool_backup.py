@@ -4517,9 +4517,12 @@ class ToolBackupManager:
                         "message": f"快照commit不存在: {result.stderr[:100]}"}
             backup_tree = result.stdout.strip()
 
-            # 当前工作区tree（🔧 持久化增量索引：与快照共用，增量 O(变更数)）
+            # 当前工作区tree（🔧 持久化增量索引）
+            # 🔧 事务#2513：preview 用独立 _preview 索引——与该事务 runner 的
+            # 检测/快照索引隔离，无需等跨进程锁（要回滚的事务往往还在运行、
+            # 持锁频繁，共享索引=preview 排队饿死、窗口"永远计算中"实锤）
             task_id_prev = int(rollback_meta.get("task_id", 0) or 0)
-            persist_idx = _persist_index_path(git_dir, task_id_prev)
+            persist_idx = _persist_index_path(git_dir, task_id_prev) + "_preview"
             env = {"GIT_INDEX_FILE": persist_idx}
             try:
                 _ensure_persist_index(persist_idx, git_dir, cwd, env, nest_name)
@@ -4663,9 +4666,8 @@ class ToolBackupManager:
             "            t = git('rev-parse', '--show-toplevel')\n"
             "            if t.returncode == 0:\n"
             "                git_dir = os.path.join(t.stdout.decode('utf-8','replace').strip().replace(chr(92), '/'), git_dir)\n"
-        "        temp_index = os.path.join(git_dir, 'peng_backup_idx_task' + str(task_id))\n"
-        + _cross_proc_wd_lock_py(60, indent="        ")
-        + "        env_idx = {'GIT_INDEX_FILE': temp_index}\n"
+        "        temp_index = os.path.join(git_dir, 'peng_backup_idx_task' + str(task_id) + '_preview')\n"
+        "        env_idx = {'GIT_INDEX_FILE': temp_index}\n"
             # 🔧 事务#2088 持久化增量索引（与快照共用；缺失时热/冷启动）
             "        if not os.path.exists(temp_index):\n"
             "            real_idx = os.path.join(git_dir, 'index')\n"
