@@ -544,3 +544,173 @@ def test_get_token_count_fallback_passes_flags():
     # 有真实值时优先真实值（与开关无关）
     h._prompt_tokens = 12345
     assert h.get_token_count(estimate=True, thinking_type="thinking") == 12345
+
+
+# ==================== 事务#2521：防假目标 + 提示携带字符数 ====================
+
+
+def test_compact_no_false_target_on_legacy_error_message():
+    """事务#2520回归：窗口内含marker的compact错误消息不再被同id精简命中
+
+    旧代码：错误消息"错误：未找到 id 1234..."文本含marker"id 1234"子串，下一轮
+    重试compact(1234)时被窗口内子串匹配命中——报告"已精简：从65字符精简到113
+    字符"的虚假成功（目标大结果纹丝不动，token不减反增）。此处用旧格式文本模拟
+    修复上线时存量会话中的历史遗留消息（跳过compact自身消息的深度防御兜底）。
+    """
+    h = MessageHistory()
+    h.add_user("任务")
+    # 迭代1：真实目标（带id 1234提示）在更早迭代
+    h.mark_iteration_start()
+    h.add_assistant(
+        "",
+        tool_calls=[
+            {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+        ],
+    )
+    h.add_tool_result(
+        "c1",
+        "bash",
+        "大量输出\n 如果这些返回结果是毫无用处的垃圾信息，请用compact工具清理或精简，id 1234，尽量节省上下文空间！",
+        add_timestamp=False,
+    )
+    # 迭代2：compact(1234)失败，旧格式错误消息（含marker）入历史
+    h.mark_iteration_start()
+    h.add_assistant(
+        "",
+        tool_calls=[
+            {
+                "id": "c2",
+                "type": "function",
+                "function": {"name": "compact", "arguments": '{"id": "1234"}'},
+            }
+        ],
+    )
+    h.add_tool_result(
+        "c2",
+        "compact",
+        "[ts] 错误：未找到 id 1234 对应的工具结果。请核对工具结果末尾提示中的4位数字ID。",
+        add_timestamp=False,
+    )
+    # 迭代3：模型重试compact(1234)
+    h.mark_iteration_start()
+    h.add_assistant(
+        "",
+        tool_calls=[
+            {
+                "id": "c3",
+                "type": "function",
+                "function": {"name": "compact", "arguments": '{"id": "1234"}'},
+            }
+        ],
+    )
+    ok, msg = h.compact_by_id("1234", "精简摘要")
+    # 不再虚假成功：compact自身消息被跳过；命中更早迭代的真实目标→跨迭代拦截
+    assert ok is False, f"不应虚假命中compact错误消息: {msg}"
+    assert "不属于上一轮迭代" in msg
+    # 错误消息与真实目标的内容均未被改动
+    compact_msgs = [m for m in h._messages if m.get("name") == "compact"]
+    assert "未找到" in compact_msgs[0]["content"]
+    assert "大量输出" in h._messages[2]["content"]
+
+
+def test_compact_skips_own_result_message_in_full_scan():
+    """全历史唯一含marker的是compact自身结果（如成功消息"已精简：id 1234..."）时，
+    第一循环和全历史第二循环都应跳过它→报"未找到"而非命中/误报跨迭代"""
+    h = MessageHistory()
+    h.add_user("任务")
+    h.mark_iteration_start()
+    h.add_assistant(
+        "",
+        tool_calls=[
+            {
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "compact", "arguments": '{"id": "1234"}'},
+            }
+        ],
+    )
+    h.add_tool_result(
+        "c1",
+        "compact",
+        "已精简：id 1234 对应的工具返回结果，从5000字符精简到100字符。",
+        add_timestamp=False,
+    )
+    h.mark_iteration_start()
+    h.add_assistant(
+        "",
+        tool_calls=[
+            {
+                "id": "c2",
+                "type": "function",
+                "function": {"name": "compact", "arguments": '{"id": "1234"}'},
+            }
+        ],
+    )
+    ok, msg = h.compact_by_id("1234", "无用信息")
+    assert ok is False
+    assert "未找到" in msg
+    assert "已精简：id 1234" in h._messages[2]["content"]  # 内容未被动过
+
+
+def test_compact_error_messages_use_hash_format():
+    """新错误消息中id写作"id#XXXX"（不带空格），不构成marker"id XXXX"子串"""
+    h = _make_history_with_compact_hint()
+    # 未找到分支
+    _, msg_not_found = h.compact_by_id("5678", "无用信息")
+    assert "id#5678" in msg_not_found
+    assert not re.search(r"id 5678", msg_not_found), f"错误消息不应含marker子串: {msg_not_found!r}"
+    # 跨迭代分支
+    h.add_tool_result("c2", "compact", "已精简", add_timestamp=False)
+    h.mark_iteration_start()
+    h.add_assistant(
+        "",
+        tool_calls=[
+            {
+                "id": "c3",
+                "type": "function",
+                "function": {"name": "compact", "arguments": '{"id": "1234"}'},
+            }
+        ],
+    )
+    _, msg_cross = h.compact_by_id("1234", "无用信息")
+    assert "id#1234" in msg_cross
+    assert not re.search(r"id 1234", msg_cross), f"错误消息不应含marker子串: {msg_cross!r}"
+
+
+def test_compact_hint_includes_char_count():
+    """提示携带当前实际字符数（str/多模态text parts按len()字符计）"""
+    engine = make_engine()
+    # 纯ASCII
+    big = "x" * 2000
+    result = engine._append_compact_hint(big)
+    assert result.startswith(big)
+    assert "（2000字符）" in result
+    # 中文按字符数（非字节数）
+    big_cn = "中" * 600  # 600字符 / 1800字节
+    result2 = engine._append_compact_hint(big_cn)
+    assert result2.startswith(big_cn)
+    assert "（600字符）" in result2
+    # 多模态：text parts字符数（附件不计入）
+    parts = [
+        {"type": "text", "text": "t" * 1500},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "b" * 5000}},
+    ]
+    result3 = engine._append_compact_hint(parts)
+    assert result3 is parts
+    assert "（1500字符）" in result3[0]["text"]
+
+
+def test_compact_hint_custom_template_without_size_compat(monkeypatch):
+    """旧自定义模板（无{size}占位符）兼容：format多余kwarg被忽略，不KeyError"""
+    engine = make_engine()
+    monkeypatch.setattr(
+        ToolExecutionEngine,
+        "_prompts",
+        property(lambda self: SimpleNamespace(compact_hint="旧模板，id {compact_id}，请精简！")),
+    )
+    result = engine._append_compact_hint("y" * 2000)
+    assert result.startswith("y" * 2000)
+    m = re.search(r"id (\d{4})", result)
+    assert m, f"旧模板应正常分配id: {result[-60:]!r}"
+    # 新模板占位符（回归确认默认模板已含{size}）
+    assert "{size}" in LLMPromptsConfig().compact_hint

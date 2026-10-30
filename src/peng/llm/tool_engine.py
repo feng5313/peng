@@ -535,9 +535,16 @@ class MessageHistory:
             return False, "错误：当前不存在可精简的上一轮迭代内容。"
         start, end = window
 
+        # 🔧 事务#2521防假目标：只匹配非compact工具的结果消息。compact自身的结果
+        # （尤其是"未找到 id XXXX"错误消息文本）天然含有marker子串，若不排除会
+        # 被下一轮重试的同id精简命中——"虚假成功"（如65字符错误消息被替换成更长
+        # 的replace文本），真正想精简的大结果纹丝不动（事务#2520实测1066/1047）。
+        def _is_compactable_target(msg: dict) -> bool:
+            return msg.get("role") == "tool" and msg.get("name") != "compact"
+
         for i in range(start, end):
             msg = self._messages[i]
-            if msg.get("role") != "tool":
+            if not _is_compactable_target(msg):
                 continue
             if marker in self._content_text(msg.get("content")):
                 original_len = len(self._content_text(msg.get("content")))
@@ -553,15 +560,18 @@ class MessageHistory:
                 )
         # 窗口内未命中：区分"id不存在"与"存在但不在上一轮迭代"两种情况，给出精确报错
         for i, msg in enumerate(self._messages):
-            if msg.get("role") == "tool" and marker in self._content_text(msg.get("content")):
+            if _is_compactable_target(msg) and marker in self._content_text(msg.get("content")):
                 return (
                     False,
-                    f"错误：id {compact_id} 对应的工具结果不属于上一轮迭代（消息#{i}），"
+                    # 🔧 事务#2521：错误消息中id写作"id#XXXX"（不带空格），避免构成
+                    # marker"id XXXX"子串——错误消息入历史后污染下一轮的同id精简匹配
+                    f"错误：id#{compact_id} 对应的工具结果不属于上一轮迭代（消息#{i}），"
                     f"禁止跨迭代清理。只能精简上一轮迭代中带compact提示的工具结果。",
                 )
         return (
             False,
-            f"错误：未找到 id {compact_id} 对应的工具结果。请核对工具结果末尾提示中的4位数字ID。",
+            # 🔧 事务#2521：同上，id#XXXX格式不构成marker
+            f"错误：未找到 id#{compact_id} 对应的工具结果。请核对工具结果末尾提示中的4位数字ID。",
         )
 
     def from_api_format(self, messages):
@@ -3278,16 +3288,21 @@ class ToolExecutionEngine:
             if isinstance(history_content, str):
                 if len(history_content.encode("utf-8")) <= threshold:
                     return history_content
-                hint = self._prompts.compact_hint.format(compact_id=self._allocate_compact_id())
+                hint = self._prompts.compact_hint.format(
+                    compact_id=self._allocate_compact_id(), size=len(history_content)
+                )
                 return history_content + hint
             if isinstance(history_content, list):
                 text_parts = [
                     p for p in history_content if isinstance(p, dict) and p.get("type") == "text"
                 ]
-                size = sum(len(str(p.get("text", "")).encode("utf-8")) for p in text_parts)
-                if size <= threshold or not text_parts:
+                size_bytes = sum(len(str(p.get("text", "")).encode("utf-8")) for p in text_parts)
+                if size_bytes <= threshold or not text_parts:
                     return history_content
-                hint = self._prompts.compact_hint.format(compact_id=self._allocate_compact_id())
+                size_chars = sum(len(str(p.get("text", ""))) for p in text_parts)
+                hint = self._prompts.compact_hint.format(
+                    compact_id=self._allocate_compact_id(), size=size_chars
+                )
                 text_parts[0]["text"] = str(text_parts[0].get("text", "")) + hint
                 return history_content
         except Exception as e:

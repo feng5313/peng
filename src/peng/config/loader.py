@@ -1132,8 +1132,9 @@ class LLMPromptsConfig(BaseModel):
 
     # 🔧 事务#2114：超长工具结果的compact清理提示（{compact_id} 为唯一4位数字ID）。
     # 工具返回结果字节数超过 compact_hint_threshold（provider级可配，默认1024）时
-    # 追加此提示，模型确认结果毫无用处时调用compact工具清理以节省上下文空间
-    compact_hint: str = "\n 返回结果较长，如果无用或可以用总结大幅精简，请用compact工具清理或精简，id {compact_id}，尽量节省上下文空间！"
+    # 追加此提示，模型确认结果毫无用处时调用compact工具清理以节省上下文空间。
+    # 🔧 事务#2521：{size} 为该结果的字符数，提示模型权衡精简收益
+    compact_hint: str = "\n 返回结果较长（{size}字符），如果无用或可以用总结大幅精简，请用compact工具清理或精简，id {compact_id}，尽量节省上下文空间！"
 
 
 class LLMConfig(BaseModel):
