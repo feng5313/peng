@@ -411,7 +411,7 @@ def _recover_persist_index(
 # 回滚diff预览短时缓存（用户反复点击同一回滚链接时跳过 add -A 全量扫描）
 # 格式：{cache_key: {"ts": float, "result": dict}}
 _preview_diff_cache: dict[str, dict[str, Any]] = {}
-_PREVIEW_DIFF_CACHE_TTL = 60.0  # 秒（大仓库检测可达10s+；覆盖反复开关窗口，
+_PREVIEW_DIFF_CACHE_TTL = 180.0  # 秒（大仓库检测可达10s+；覆盖反复开关窗口，
 # 确认回滚时后端仍会重新检测实际变更，预览允许略陈旧）
 # 🔧 事务#2513：预览等待 workdir 锁上限（同 workdir 快照/检测排队时，
 # 预览最多等这么久即返回"系统繁忙"提示——预览仅参考，确认时重新检测）

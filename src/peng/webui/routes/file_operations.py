@@ -667,6 +667,12 @@ _upload_callbacks: list[Callable] = []
 # 旧值+后台刷新、无缓存返回pending+后台计算（前端1.5s轮询拉取）
 _PREVIEW_SWR_CACHE: dict[str, dict] = {}
 _PREVIEW_SWR_GUARD = threading.Lock()
+# 🔧 事务#2590：外部检测超时负缓存（key=swr_key→超时时刻ts，30分钟内
+# 重算直接跳过外部检测——远程大仓库 ls-tree 稳定超时的环境下，每次重算
+# 都白等限时窗口是回滚diff"几十秒"的主要来源；超时属环境性慢，短期不会
+# 好转，30分钟后自动重试恢复）
+_EXT_DETECT_NEG_TTL = 1800.0
+_EXT_DETECT_NEG_CACHE: dict[str, float] = {}
 
 
 def register_upload_callback(callback):
@@ -1758,6 +1764,11 @@ async def tool_rollback_preview(request: Request):
                 # 注记），主 diff（典型 <5s）稳定秒级可看。
                 base_box = {}
                 ext_box = {}
+                # 🔧 事务#2590：外部检测超时负缓存——30分钟内同回滚项直接
+                # 跳过外部检测（超时=环境性慢，重试纯属浪费限时窗口）
+                with _PREVIEW_SWR_GUARD:
+                    neg_ts = _EXT_DETECT_NEG_CACHE.get(swr_key)
+                ext_skip = neg_ts is not None and _time.time() - neg_ts < _EXT_DETECT_NEG_TTL
 
                 def _run_base():
                     try:
@@ -1776,22 +1787,29 @@ async def tool_rollback_preview(request: Request):
                         ext_box["err"] = str(e)
 
                 t_base = threading.Thread(target=_run_base, daemon=True)
-                t_ext = threading.Thread(target=_run_ext, daemon=True)
                 t_base.start()
-                t_ext.start()
-                t_ext.join(15)   # 外部检测限时（daemon 线程超时后自行结束）
+                if ext_skip:
+                    ext_changed, ext_err = [], "外部文件检测近期超时已跳过（30分钟内不重试）"
+                else:
+                    t_ext = threading.Thread(target=_run_ext, daemon=True)
+                    t_ext.start()
+                    t_ext.join(10)   # 外部检测限时（daemon 线程超时后自行结束）
+                    if "r" in ext_box:
+                        ext_changed, ext_err = ext_box["r"]
+                    else:
+                        ext_changed, ext_err = [], (
+                            ext_box.get("err") or "外部文件检测超时（10s），已跳过"
+                        )
+                        if not ext_box.get("err"):
+                            # 超时（非快速失败）→ 记负缓存
+                            with _PREVIEW_SWR_GUARD:
+                                _EXT_DETECT_NEG_CACHE[swr_key] = _time.time()
                 t_base.join(190)  # 主 diff 兜底（内部各 git 步有 60~180s 超时）
                 if "r" not in base_box:
                     raise RuntimeError(
                         f"主diff计算失败: {base_box.get('err') or '超时（190s）'}"
                     )
                 r = base_box["r"]
-                if "r" in ext_box:
-                    ext_changed, ext_err = ext_box["r"]
-                else:
-                    ext_changed, ext_err = [], (
-                        ext_box.get("err") or "外部文件检测超时（15s），已跳过"
-                    )
                 if ext_changed:
                     r["changed_files"] = (
                         list(r.get("changed_files") or []) + list(ext_changed)
