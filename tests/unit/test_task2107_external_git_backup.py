@@ -442,7 +442,9 @@ class TestIterationRollbackManifest:
         lstree.assert_not_called()
 
     def test_detect_legacy_meta_lstree_fallback(self, monkeypatch):
-        """旧 meta（无 manifest）：保持 ls-tree 全量 + 全量 git 剔除兜底"""
+        """🔧 事务#2590 新语义：旧 meta 无 manifest + 累积 manifest 为空 =
+        本事务从未备份过外部文件 → 空恢复集，绝不 ls-tree 共享盘符仓库
+        （共享仓库体量不可控且混入其他 task 的文件，ls-tree 语义本就错误）"""
         # 工作区检测 mock 为无变化（避免真实 git 命令）
         monkeypatch.setattr(
             ToolBackupManager, "check_post_tool_changes",
@@ -456,10 +458,41 @@ class TestIterationRollbackManifest:
             ExternalFileBackup, "check_changes",
             staticmethod(lambda *a, **k: []),
         )
+        # 累积 manifest 无记录（文件不存在）
+        monkeypatch.setattr(
+            tb, "manifest_get", lambda tid: [],
+        )
         meta = self._meta()  # 无 external_manifest
         out = ToolBackupManager._detect_rollback_changes(meta, "/wd", None, True)
         assert out is False
-        lstree.assert_called_once()
+        lstree.assert_not_called()
+
+    def test_detect_legacy_meta_uses_cumulative_manifest(self, monkeypatch):
+        """🔧 事务#2590：旧 meta 无 manifest 但累积 manifest 非空 →
+        以备份时记录的累积清单为恢复集（本地秒级，不 ls-tree）"""
+        monkeypatch.setattr(
+            ToolBackupManager, "check_post_tool_changes",
+            staticmethod(lambda meta, wd, nest: None),
+        )
+        lstree = mock.Mock(return_value=[])
+        monkeypatch.setattr(
+            ExternalFileBackup, "list_baseline_files", staticmethod(lstree)
+        )
+        checks = {}
+
+        def fake_check(task_id, files, commit, nest_name=None, strict_baseline=False):
+            checks["files"] = list(files)
+            return ["/my/cum/f.txt"]
+
+        monkeypatch.setattr(ExternalFileBackup, "check_changes", fake_check)
+        monkeypatch.setattr(
+            tb, "manifest_get", lambda tid: ["/my/cum/f.txt"],
+        )
+        meta = self._meta()  # 无 external_manifest
+        out = ToolBackupManager._detect_rollback_changes(meta, "/wd", None, True)
+        assert out is True
+        assert checks["files"] == ["/my/cum/f.txt"]
+        lstree.assert_not_called()
 
     def test_restore_all_with_manifest(self, monkeypatch):
         """restore_all manifest 精确集：不 ls-tree、轻过滤恢复"""
@@ -483,7 +516,8 @@ class TestIterationRollbackManifest:
         lstree.assert_not_called()
 
     def test_restore_all_legacy_without_manifest(self, monkeypatch):
-        """旧路径（无 manifest）：ls-tree + baseline 过滤，行为不变"""
+        """🔧 事务#2590 新语义：无 manifest + 累积 manifest 为空 =
+        本事务从未备份过外部文件 → 无可恢复直接返回，不 ls-tree"""
         lstree = mock.Mock(return_value=[])
         monkeypatch.setattr(
             ExternalFileBackup, "list_baseline_files", staticmethod(lstree)
@@ -492,8 +526,31 @@ class TestIterationRollbackManifest:
             ExternalFileBackup, "restore",
             staticmethod(lambda *a, **k: 0),
         )
-        ExternalFileBackup.restore_all(884, "head888", nest_name=None, workdir="/wd")
-        lstree.assert_called_once()
+        monkeypatch.setattr(tb, "manifest_get", lambda tid: [])
+        n = ExternalFileBackup.restore_all(884, "head888", nest_name=None, workdir="/wd")
+        assert n == 0
+        lstree.assert_not_called()
+
+    def test_restore_all_legacy_cumulative_manifest(self, monkeypatch):
+        """🔧 事务#2590：无 manifest 参数但累积 manifest 非空 → 恢复累积集"""
+        lstree = mock.Mock(return_value=[])
+        monkeypatch.setattr(
+            ExternalFileBackup, "list_baseline_files", staticmethod(lstree)
+        )
+        restores = {}
+
+        def fake_restore(task_id, files, commit, nest_name=None):
+            restores["files"] = list(files)
+            return len(files)
+
+        monkeypatch.setattr(ExternalFileBackup, "restore", staticmethod(fake_restore))
+        monkeypatch.setattr(
+            tb, "manifest_get", lambda tid: ["/my/a.txt", "/my/b.txt"],
+        )
+        n = ExternalFileBackup.restore_all(885, "head777", nest_name=None, workdir="/wd")
+        assert n == 2
+        assert restores["files"] == ["/my/a.txt", "/my/b.txt"]
+        lstree.assert_not_called()
 
     def test_rollback_iter_passes_manifest(self, monkeypatch):
         """rollback() 迭代分支将 meta.external_manifest 传给 restore_all"""

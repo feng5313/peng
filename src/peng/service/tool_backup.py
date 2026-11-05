@@ -3511,12 +3511,15 @@ class ToolBackupManager:
                                 list(ext_manifest), workdir,
                             )
                         else:
-                            abs_paths = ExternalFileBackup.list_baseline_files(
-                                task_id, ext_head, nest_name=nest_name
-                            )
-                            abs_paths = ToolBackupManager._filter_baseline_files(
-                                abs_paths, workdir, nest_name
-                            )
+                            # 🔧 事务#2590 根治：优先本事务累积 manifest；为空=
+                            # 从未备份过外部文件→无可检测，不 ls-tree 共享仓库
+                            abs_paths = manifest_get(task_id)[:_MANIFEST_MAX_FILES]
+                            if not abs_paths:
+                                abs_paths = []
+                            else:
+                                abs_paths = ToolBackupManager._filter_baseline_files(
+                                    abs_paths, workdir, nest_name
+                                )
                         if abs_paths and ExternalFileBackup.check_changes(
                             task_id, abs_paths, ext_head, nest_name=nest_name,
                             strict_baseline=True,
@@ -4307,11 +4310,18 @@ class ToolBackupManager:
                 list(ext_manifest), rollback_meta.get("workdir"),
             )
         else:
-            files = ExternalFileBackup.list_baseline_files(
-                task_id, ext_commit, nest_name=nest_name
-            )
+            # 🔧 事务#2590 根治：无快照清单时优先用本事务累积 manifest
+            # （备份时 manifest_add 记录的精确清单——"备份时做记录，检测时查
+            # 记录"，零远程遍历）。manifest 为空/不存在 = 本事务从未备份过
+            # 外部文件 → 外部无文件可检测，直接空清单——**绝不 ls-tree 共享
+            # 盘符仓库**（全用户共享、体量不可控，#2580 曾因此 60s 超时拖垮
+            # 回滚diff预览；共享仓库 HEAD 还含其他 task 备份的文件，ls-tree
+            # 结果本来就语义错误）。
+            cumulative = manifest_get(task_id)
+            if not cumulative:
+                return [], None
             files = ToolBackupManager._filter_baseline_files(
-                files, rollback_meta.get("workdir", ""), nest_name,
+                cumulative, rollback_meta.get("workdir", ""), nest_name,
                 scope=ToolBackupManager._meta_scope(rollback_meta),
             )
         if not files:
@@ -6670,13 +6680,17 @@ class ExternalFileBackup:
                     list(manifest), workdir,
                 )
             else:
-                abs_paths = ExternalFileBackup.list_baseline_files(
-                    task_id, commit_spec, nest_name
-                )
-                if workdir:
+                # 🔧 事务#2590 根治：无快照清单时优先用本事务累积 manifest
+                # （备份时记录的精确清单），为空=本事务从未备份过外部文件 →
+                # 无可恢复，直接返回——**绝不 ls-tree 共享盘符仓库**（全用户
+                # 共享体量不可控且混入其他 task 的文件，语义本就错误）。
+                abs_paths = manifest_get(task_id)[:_MANIFEST_MAX_FILES]
+                if abs_paths:
                     abs_paths = ToolBackupManager._filter_baseline_files(
                         abs_paths, workdir, nest_name
                     )
+                else:
+                    return 0
             if not abs_paths:
                 return 0
             restored = ExternalFileBackup.restore(

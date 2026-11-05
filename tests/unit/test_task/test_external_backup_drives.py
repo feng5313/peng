@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from peng.service.tool_backup import ExternalFileBackup, _strip_drive_rel
+from peng.service import tool_backup as _tb
 
 
 def _git(repo: Path, *args: str, **kw) -> subprocess.CompletedProcess:
@@ -175,6 +176,12 @@ def drive_env(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         ExternalFileBackup, "_existing_drive_keys", staticmethod(fake_existing_keys)
+    )
+    # 🔧 事务#2590：隔离累积 manifest 目录（防测试读写生产
+    # data/external_manifests）
+    monkeypatch.setattr(
+        _tb, "_manifest_file",
+        lambda tid: tmp_path / "ext_manifests" / f"task-{tid}.json",
     )
     return SimpleNamespace(default_repo=default_repo, tmp_path=tmp_path)
 
@@ -389,13 +396,22 @@ class TestGetAllHeadsAndRestoreAll:
 
         # 回滚预检测：盘符文件在反推路径不存在（判删除）、默认文件被删（判删除）
         assert ExternalFileBackup.check_changes(TASK_ID, baseline_files, heads) == baseline_files
-        # 全量恢复：盘符文件恢复到反推路径，默认文件恢复到原路径
-        assert ExternalFileBackup.restore_all(TASK_ID, heads) == 2
+        # 全量恢复：🔧 事务#2590 后 restore_all 无 manifest 参数时用累积
+        # manifest（备份时记录）——本测试直接调 ExternalFileBackup.backup
+        # 不写 manifest 记录（记录在 ToolBackupManager 快照流程），故显式传
+        # ls-tree 基线清单保持"全量恢复（含删除场景）"测试意图
+        assert ExternalFileBackup.restore_all(
+            TASK_ID, heads, manifest=baseline_files
+        ) == 2
         assert Path(fd_mapped).read_text(encoding="utf-8") == "v1"
         assert fn.read_text(encoding="utf-8") == "v1"
 
     def test_restore_all_legacy_str(self, drive_env, tmp_path):
-        """旧格式 str 基线 → restore_all 从默认仓库全量恢复"""
+        """旧格式 str 基线 → restore_all 从默认仓库全量恢复
+
+        🔧 事务#2590：无 manifest 记录（backup 未走快照流程）时不再 ls-tree
+        共享仓库兜底——restore_all 显式传恢复集保持全量恢复语义。
+        """
         fn = tmp_path / "normal_proj" / "fn.txt"
         fn.parent.mkdir(parents=True, exist_ok=True)
         fn.write_text("v1", encoding="utf-8")
@@ -405,5 +421,9 @@ class TestGetAllHeadsAndRestoreAll:
         )
 
         fn.write_text("v2", encoding="utf-8")
-        assert ExternalFileBackup.restore_all(TASK_ID, legacy_commit) == 1
+        baseline = ExternalFileBackup.list_baseline_files(TASK_ID, legacy_commit)
+        assert baseline == [str(fn)]
+        assert ExternalFileBackup.restore_all(
+            TASK_ID, legacy_commit, manifest=baseline
+        ) == 1
         assert fn.read_text(encoding="utf-8") == "v1"
