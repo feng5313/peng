@@ -2035,8 +2035,11 @@ async function loadRollbackDiffPreview(rollbackMeta, container, attempt) {
 
     // 🔧 SWR pending（事务#2513）：服务端后台计算中——1.5s 后自动重试
     // 拉取（后台算完写入缓存，下次请求秒回；窗口打开永远 <1s 有响应）
+    // 🔧 事务#2590：上限 40→60（90s）——服务端主diff与外部检测并行、外部
+    // 检测限时15s（总时长≈15s内），但保留充足余量覆盖远程慢nest场景；
+    // 服务端另有200s看门狗自愈，不会永久 pending
     if (data.pending) {
-      if (attempt < 40) {
+      if (attempt < 60) {
         var ph = container.querySelector('[data-elapsed]');
         if (ph) {
           ph.textContent = '⏳ 正在后台计算回滚diff...（已用时 '

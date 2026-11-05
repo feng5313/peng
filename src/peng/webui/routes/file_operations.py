@@ -1750,17 +1750,88 @@ async def tool_rollback_preview(request: Request):
 
         def _bg_compute() -> None:
             try:
-                r = ToolBackupManager.preview_rollback_diff_with_external(dict(rollback_meta))
+                # 🔧 事务#2590：主 git diff 与外部文件检测并行计算——外部检测
+                # （远程 nest 逐盘符 git ls-tree -r 全仓库遍历，Windows 大仓库
+                # 60s+ 超时）串行执行曾把整体计算拖到 63s+，前端 60s 轮询预算
+                # 内永远拿不到结果（回滚窗口"永远正在后台计算"的直接根因）。
+                # 外部检测限时 15s：超时/失败仅损失 external 区块信息（message
+                # 注记），主 diff（典型 <5s）稳定秒级可看。
+                base_box = {}
+                ext_box = {}
+
+                def _run_base():
+                    try:
+                        base_box["r"] = ToolBackupManager.preview_rollback_diff(
+                            dict(rollback_meta)
+                        )
+                    except Exception as e:
+                        base_box["err"] = str(e)
+
+                def _run_ext():
+                    try:
+                        ext_box["r"] = ToolBackupManager.preview_external_changes_only(
+                            dict(rollback_meta)
+                        )
+                    except Exception as e:
+                        ext_box["err"] = str(e)
+
+                t_base = threading.Thread(target=_run_base, daemon=True)
+                t_ext = threading.Thread(target=_run_ext, daemon=True)
+                t_base.start()
+                t_ext.start()
+                t_ext.join(15)   # 外部检测限时（daemon 线程超时后自行结束）
+                t_base.join(190)  # 主 diff 兜底（内部各 git 步有 60~180s 超时）
+                if "r" not in base_box:
+                    raise RuntimeError(
+                        f"主diff计算失败: {base_box.get('err') or '超时（190s）'}"
+                    )
+                r = base_box["r"]
+                if "r" in ext_box:
+                    ext_changed, ext_err = ext_box["r"]
+                else:
+                    ext_changed, ext_err = [], (
+                        ext_box.get("err") or "外部文件检测超时（15s），已跳过"
+                    )
+                if ext_changed:
+                    r["changed_files"] = (
+                        list(r.get("changed_files") or []) + list(ext_changed)
+                    )
+                    # 🔧 事务#2476：外部文件变更独立字段（前端回滚确认窗口
+                    # 勾选框联动——"外部文件"勾选框控制该区块显隐）
+                    r["external_changed_files"] = list(ext_changed)
+                    r["message"] = (
+                        (r.get("message") or "")
+                        + f"；外部/非git管理文件变更 {len(ext_changed)} 个"
+                    )
+                    if rollback_meta.get("type") == "history_only":
+                        # 有可展示的文件变更：置 success 让前端渲染变更区块
+                        # 🔧 事务#2402：保留"此快照无文件备份"警示
+                        r["success"] = True
+                        r["message"] = (
+                            f"⚠️ 本快照未含项目代码备份（快照创建时备份暂不可用，"
+                            f"仅上下文恢复）；外部/非git管理文件变更 "
+                            f"{len(ext_changed)} 个（见列表）"
+                        )
+                elif ext_err:
+                    r["message"] = (r.get("message") or "") + f"；{ext_err}"
                 with _PREVIEW_SWR_GUARD:
                     _PREVIEW_SWR_CACHE[swr_key] = {
                         "ts": _time.time(), "result": r, "refreshing": False,
                     }
             except Exception as exc:
-                logger.warning(f"diff预览后台刷新失败: {exc}")
+                logger.warning(f"diff预览后台计算失败: {exc}")
+                # 🔧 事务#2590：写入失败结果供前端展示（错误信息+重试按钮）。
+                # 旧实现只置 refreshing=False 且残留 result=None 的 entry——该
+                # entry 永久命中 pending 分支且 entry is None 为 False 永不重算，
+                # 回滚窗口从此"永远正在后台计算"（无任何自愈路径）。
                 with _PREVIEW_SWR_GUARD:
-                    cur = _PREVIEW_SWR_CACHE.get(swr_key)
-                    if cur:
-                        cur["refreshing"] = False
+                    _PREVIEW_SWR_CACHE[swr_key] = {
+                        "ts": _time.time(),
+                        "result": {"success": False, "diff": "", "changed_files": [],
+                                   "truncated": False,
+                                   "message": f"diff计算失败: {exc}（可点击重试预览重算）"},
+                        "refreshing": False,
+                    }
 
         # checklist diff：仅快照包含 history_commit 时可计算（迭代/undo快照），
         # 工具级快照无 checklist 备份，返回 available=False 前端不显示区块
@@ -1775,20 +1846,26 @@ async def tool_rollback_preview(request: Request):
         else:
             label = f"快照[{timestamp}]"
 
-        cl_task = asyncio.to_thread(
-            HistoryBackupManager.preview_checklist_diff,
-            task_id, history_commit, label,
-        )
-
         with _PREVIEW_SWR_GUARD:
             entry = _PREVIEW_SWR_CACHE.get(swr_key)
             now = _time.time()
-            # 无缓存 或 后台计算尚未完成（result=None）→ pending 轮询语义
-            if entry is None or entry.get("result") is None:
-                if entry is None:
-                    _PREVIEW_SWR_CACHE[swr_key] = {
-                        "ts": 0.0, "result": None, "refreshing": True,
-                    }
+            # 🔧 事务#2590：自愈 + 看门狗（杜绝任何形态的"永远 pending"）：
+            # - result 未算出且 refreshing=False 超过 10s（异常残留僵尸 entry）
+            #   → 重启计算
+            # - refreshing=True 超过 200s（计算线程卡死；并行计算理论上限
+            #   主 diff 190s 兜底 + 外部检测 15s）→ 重启计算
+            if entry is None:
+                # 无缓存 → 后台计算，本次 pending
+                _PREVIEW_SWR_CACHE[swr_key] = {
+                    "ts": 0.0, "result": None, "refreshing": True, "started": now,
+                }
+                threading.Thread(target=_bg_compute, daemon=True).start()
+                pending = True
+            elif entry.get("result") is None:
+                wd = now - entry.get("started", 0)
+                if (not entry.get("refreshing") and wd > 10) or wd > 200:
+                    entry["refreshing"] = True
+                    entry["started"] = now
                     threading.Thread(target=_bg_compute, daemon=True).start()
                 pending = True
             else:
@@ -1796,14 +1873,21 @@ async def tool_rollback_preview(request: Request):
                 fresh = now - entry["ts"] < 60
                 if not fresh and not entry.get("refreshing"):
                     entry["refreshing"] = True
+                    entry["started"] = now
                     threading.Thread(target=_bg_compute, daemon=True).start()
 
         if pending:
-            checklist_result = await cl_task
+            # 🔧 事务#2590：pending 响应不再同步计算 checklist_diff——前端
+            # pending 分支只显示等待文案不渲染 checklist（旧实现每 1.5s 轮询
+            # 都全量重算一次 checklist diff，大上下文事务纯浪费且拖慢节奏）。
             return {"pending": True, "success": True, "diff": "",
                     "changed_files": [], "truncated": False,
-                    "message": "diff后台计算中（约2-8秒，窗口自动刷新）",
-                    "checklist_diff": checklist_result}
+                    "message": "diff后台计算中（典型5-15s，窗口自动刷新）"}
+
+        cl_task = asyncio.to_thread(
+            HistoryBackupManager.preview_checklist_diff,
+            task_id, history_commit, label,
+        )
 
         result = dict(entry["result"] or {"success": False, "diff": "",
                                           "changed_files": [], "truncated": False,

@@ -4282,6 +4282,47 @@ class ToolBackupManager:
             return file_paths
 
     @staticmethod
+    def preview_external_changes_only(
+        rollback_meta: dict[str, Any],
+    ) -> tuple[list[str], str | None]:
+        """仅计算外部/非git管理文件的变更清单（可独立限时执行）。
+
+        🔧 事务#2590：从 preview_rollback_diff_with_external 提取外部检测段
+        ——回滚窗口 SWR 后台计算把主 git diff 与外部检测并行执行、外部检测
+        限时（远程 nest 逐盘符 git ls-tree -r 全仓库遍历可达 60s+，串行曾把
+        整体计算拖到 63s+，前端 60s 轮询预算内永远拿不到结果）。
+        返回 (changed_files, error)：error 非 None 表示检测失败（changed 空）。
+        """
+        task_id = int(rollback_meta.get("task_id", 0) or 0)
+        nest_name = rollback_meta.get("nest_name", "local")
+        ext_commit = (
+            rollback_meta.get("external_backup_commit")
+            or rollback_meta.get("external_head_commit")
+        )
+        if not task_id or not ext_commit:
+            return [], None
+        ext_manifest = rollback_meta.get("external_manifest")
+        if ext_manifest:
+            files = ToolBackupManager._filter_manifest_paths(
+                list(ext_manifest), rollback_meta.get("workdir"),
+            )
+        else:
+            files = ExternalFileBackup.list_baseline_files(
+                task_id, ext_commit, nest_name=nest_name
+            )
+            files = ToolBackupManager._filter_baseline_files(
+                files, rollback_meta.get("workdir", ""), nest_name,
+                scope=ToolBackupManager._meta_scope(rollback_meta),
+            )
+        if not files:
+            return [], None
+        changed = ExternalFileBackup.check_changes(
+            task_id, files, ext_commit, nest_name=nest_name,
+            strict_baseline=True,
+        )
+        return list(changed or []), None
+
+    @staticmethod
     def preview_rollback_diff_with_external(rollback_meta: dict[str, Any]) -> dict[str, Any]:
         """回滚预览（含外部/非git管理文件的变更信息，🔧 第九轮）
 
@@ -4310,24 +4351,8 @@ class ToolBackupManager:
         if not result.get("success") and rollback_meta.get("type") != "history_only":
             return result
         try:
-            ext_manifest = rollback_meta.get("external_manifest")
-            if ext_manifest:
-                files = ToolBackupManager._filter_manifest_paths(
-                    list(ext_manifest), rollback_meta.get("workdir"),
-                )
-            else:
-                files = ExternalFileBackup.list_baseline_files(
-                    task_id, ext_commit, nest_name=nest_name
-                )
-                files = ToolBackupManager._filter_baseline_files(
-                    files, rollback_meta.get("workdir", ""), nest_name,
-                    scope=ToolBackupManager._meta_scope(rollback_meta),
-                )
-            if not files:
-                return result
-            changed = ExternalFileBackup.check_changes(
-                task_id, files, ext_commit, nest_name=nest_name,
-                strict_baseline=True,
+            changed, _ext_err = ToolBackupManager.preview_external_changes_only(
+                rollback_meta
             )
             if changed:
                 result["changed_files"] = list(result.get("changed_files") or []) + changed
@@ -5426,6 +5451,11 @@ class ExternalFileBackup:
     - str（旧格式/仅默认仓库）：该 commit 位于默认 data 仓库，所有文件均查默认仓库
     - dict {repo_key: commit}：各仓库记录各自基线，文件按自己盘符 key 查询
     """
+
+    # 🔧 事务#2590：远程基线清单永久缓存（commit 不可变 → 清单不可变；
+    # 远程逐盘符 git ls-tree -r 全仓库遍历可达 60s+，曾拖垮回滚窗口预览）
+    _baseline_files_cache: dict[tuple, list[str]] = {}
+    _baseline_cache_lock = threading.Lock()
 
     @staticmethod
     def _win_drive_of(file_path: str) -> str:
@@ -6573,9 +6603,25 @@ class ExternalFileBackup:
         task_id: int, commit_spec: str | dict[str, str] | None,
         nest_name: str | None = None,
     ) -> list[str]:
-        """列出基线 commit 中备份的全部外部文件绝对路径（本地+远程nest合并）"""
+        """列出基线 commit 中备份的全部外部文件绝对路径（本地+远程nest合并）
+
+        🔧 事务#2590：结果永久缓存（key=nest+task+commit_spec；commit 不可变
+        → 清单不可变）。远程基线要逐盘符 git ls-tree -r 全仓库遍历（Windows
+        大仓库 60s+ 超时），曾拖垮回滚窗口 diff 预览。空结果不缓存（保留
+        失败重试机会），容量上限 256 条 FIFO 淘汰。
+        """
         if not commit_spec:
             return []
+        cache_key = None
+        if ExternalFileBackup._is_remote_nest(nest_name):
+            cache_key = (
+                str(nest_name), task_id,
+                json.dumps(commit_spec, sort_keys=True, ensure_ascii=False),
+            )
+            with ExternalFileBackup._baseline_cache_lock:
+                cached = ExternalFileBackup._baseline_files_cache.get(cache_key)
+            if cached is not None:
+                return list(cached)
         abs_paths: list[str] = []
         # 远程盘符 key 部分远程执行；其余（"" 与本地盘符）本地执行
         if ExternalFileBackup._is_remote_nest(nest_name) and isinstance(commit_spec, dict):
@@ -6584,12 +6630,20 @@ class ExternalFileBackup:
             )
             local_spec = {k: v for k, v in commit_spec.items() if not k}
             if not local_spec:
-                return abs_paths
-            abs_paths.extend(
-                ExternalFileBackup._list_baseline_local(task_id, local_spec)
-            )
-            return abs_paths
-        return ExternalFileBackup._list_baseline_local(task_id, commit_spec)
+                result_paths = abs_paths
+            else:
+                result_paths = abs_paths + ExternalFileBackup._list_baseline_local(
+                    task_id, local_spec
+                )
+        else:
+            result_paths = ExternalFileBackup._list_baseline_local(task_id, commit_spec)
+        if cache_key is not None and result_paths:
+            with ExternalFileBackup._baseline_cache_lock:
+                cache = ExternalFileBackup._baseline_files_cache
+                cache[cache_key] = list(result_paths)
+                while len(cache) > 256:
+                    cache.pop(next(iter(cache)))
+        return result_paths
 
     @staticmethod
     def restore_all(
