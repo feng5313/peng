@@ -83,6 +83,36 @@ def _check_transfer_paths(nest_name: str, local_path: str, remote_path: str) -> 
                 )
 
 
+def _safe_remote_basename(remote_path: str) -> str:
+    """从 remote_path 推导 pull 默认落地文件名（🔧事务#2609 斩断复发）
+
+    POSIX 的 os.path.basename 不切分反斜杠：Windows remote_path 整串会被当成
+    单个文件名（事故形态：'C:\\Users\\Xin\\AppData\\Local\\fcc\\fcc.json' 被实体化
+    为项目根下的一个文件）。规范实现在 peng.nest.transfer.safe_remote_basename
+    （tools 与 bin/nest CLI 共用），此处转 ToolError 供工具层报错。
+    """
+    from peng.nest.transfer import TransferError, safe_remote_basename
+
+    try:
+        return safe_remote_basename(remote_path)
+    except TransferError as e:
+        raise ToolError(
+            f"{e}（本机 {_local_side_platform()} 平台有效绝对路径）"
+        ) from e
+
+
+def _final_local_path_check(local_path: str) -> None:
+    """传输落地前终检：最终本地路径无条件过平台交叉校验（🔧事务#2609）
+
+    #2402 的 _check_transfer_paths 对"未传 local_path（默认推导）"跳过校验，
+    推导出的垃圾路径因此漏网；本终检覆盖显式/相对/推导所有来源的最终值，
+    任何形态的平台交叉在写盘前一律拒绝。
+    """
+    reason = _path_platform_mismatch(local_path, _local_side_platform())
+    if reason:
+        raise ToolError(f"local_path 平台交叉: {reason}")
+
+
 class WindowTool(Tool):
     """窗口查询工具 - 通过 nest 远程查询程序窗口"""
 
@@ -468,7 +498,7 @@ class NestTool(Tool):
 - nest: 目标nest名称（exec/pull/push/sync时必填）
 - command: bash命令（exec时必填）
 - remote_path: 远程nest上的文件/目录路径（pull/push/sync时必填，须为目标平台有效的绝对路径）
-- local_path: 本地文件/目录路径，在本实例主机解析（pull时可选默认当前工作目录；push/sync时必填；须为本机平台有效的绝对路径）
+- local_path: 本地文件/目录路径，在本实例主机解析（pull时可省略：默认落到当前事务workdir、以remote_path末段命名（平台感知安全推导）；push/sync时必填；相对路径一律锚定当前事务workdir解析，禁止服务进程cwd直落）
 - direction: 同步方向 push（默认，本地→远端）或 pull（远端→本地），仅sync
 - delete: 镜像删除目标端多余文件，仅sync（可选，默认false）
 - dry_run: 只预演不实际传输，仅sync（可选，默认false）"""
@@ -655,6 +685,39 @@ class NestTool(Tool):
 
         return _Transport()
 
+    def _base_local_dir(self) -> str:
+        """本地路径锚定目录：当前事务 workdir 上下文，缺省回退进程 cwd
+
+        🔧 事务#2609：此前 pull 默认落地直接用 os.getcwd()=peng 服务进程 cwd
+        （=项目根），导致 workdir 不在本项目的事务也能把文件拉进项目根
+        （跨项目垃圾污染）。与 bash 工具的 cwd 口径对齐：get_context("workdir")。
+        """
+        wd = str(self.get_context("workdir") or "").strip()
+        return wd or os.getcwd()
+
+    def _resolve_local_path(
+        self, local_path: str, remote_path: str = "", *, allow_default: bool = True
+    ) -> str:
+        """解析传输操作的本地路径（🔧事务#2609 根治默认/相对路径两大垃圾形态）
+
+        1) 显式相对路径 → 锚定当前事务 workdir 解析（此前锚定服务进程 cwd=
+           项目根，'fcc_xin.json' 即此形态落进项目根）
+        2) 缺省（pull 默认）→ 以 remote_path 平台感知安全推导末段文件名
+           （此前 os.path.basename 不切反斜杠，'C:\\Users\\...\\fcc.json' 整串
+           成为文件名实体化在项目根——本次事故形态）
+        3) 最终路径无条件过平台交叉终检（#2402 护栏只校验显式传参、空值默认
+           跳过校验漏过推导路径——本次堵死）
+        """
+        if local_path:
+            if not os.path.isabs(local_path):
+                local_path = os.path.join(self._base_local_dir(), local_path)
+        elif allow_default:
+            local_path = os.path.join(self._base_local_dir(), _safe_remote_basename(remote_path))
+        else:
+            raise ToolError("缺少local_path参数（本地路径，须为本机平台有效路径）")
+        _final_local_path_check(local_path)
+        return local_path
+
     async def _pull_file(self, kwargs: dict) -> DualOutput:
         """从远程nest拉取文件/目录（协议分块传输，二进制安全，目录递归）"""
         from peng.nest.transfer import TransferError, pull_file, sync_tree
@@ -680,8 +743,7 @@ class NestTool(Tool):
         try:
             lines = []
             if is_dir:
-                if not local_path:
-                    local_path = os.path.join(os.getcwd(), os.path.basename(remote_path.rstrip("/\\")) or "pull_dir")
+                local_path = self._resolve_local_path(local_path, remote_path)
                 stats = await sync_tree(transport, local_path, remote_path, direction="pull")
                 lines.append(f"✅ 目录已从 {nest_name}:{remote_path} 同步到 {local_path}")
                 lines.append(
@@ -691,8 +753,7 @@ class NestTool(Tool):
                 if stats["failed"]:
                     raise ToolError(f"目录同步有 {stats['failed']} 个文件失败")
             else:
-                if not local_path:
-                    local_path = os.path.join(os.getcwd(), os.path.basename(remote_path))
+                local_path = self._resolve_local_path(local_path, remote_path)
                 result = await pull_file(transport, remote_path, local_path)
                 lines.append(f"✅ 文件已拉取: {local_path} ({result['size']} 字节)")
 
@@ -716,6 +777,7 @@ class NestTool(Tool):
         if not remote_path:
             raise ToolError("push操作需要提供remote_path参数（远端目标路径）")
         _check_transfer_paths(nest_name, local_path, remote_path)
+        local_path = self._resolve_local_path(local_path, remote_path, allow_default=False)
 
         src = Path(local_path).expanduser()
         if not src.exists():
@@ -763,6 +825,7 @@ class NestTool(Tool):
         if direction not in ("push", "pull"):
             raise ToolError(f"无效的direction: {direction}（支持 push/pull）")
         _check_transfer_paths(nest_name, local_path, remote_path)
+        local_path = self._resolve_local_path(local_path, remote_path, allow_default=False)
 
         transport = self._make_transport(nest_name)
 

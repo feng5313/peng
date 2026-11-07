@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -36,6 +37,30 @@ OnEvent = Callable[[dict], None]
 
 class TransferError(Exception):
     """传输错误"""
+
+
+_WIN_DRIVE_SEG = re.compile(r"^[A-Za-z]:$")
+
+
+def safe_remote_basename(remote_path: str) -> str:
+    """从 remote_path 推导 pull 默认落地文件名（平台感知分隔符切分，🔧事务#2609）
+
+    POSIX 的 os.path.basename/Path.name 不切分反斜杠，Windows remote_path 整串
+    会被当成单个文件名实体化（事故形态：'C:\\Users\\Xin\\AppData\\Local\\fcc\\
+    fcc.json' 在项目根成为一个文件）。同时按 / 与 \\ 两种分隔符切分取最后非空
+    段并剥首段盘符；推导不出安全文件名（根路径/盘符裸路径/../.）时抛
+    TransferError，要求显式指定本地落地路径，绝不静默落垃圾名。
+    """
+    segs = [s for s in re.split(r"[/\\]+", str(remote_path or "").strip()) if s]
+    if segs and _WIN_DRIVE_SEG.match(segs[0]):
+        segs = segs[1:]
+    name = segs[-1] if segs else ""
+    if not name or name in {".", ".."} or _WIN_DRIVE_SEG.match(name):
+        raise TransferError(
+            f"无法从 remote_path={remote_path!r} 安全推导本地落地文件名"
+            f"（推导得 {name!r}），请显式指定本地落地路径"
+        )
+    return name
 
 
 def _check(response: NestResponse, action: str) -> dict:

@@ -65,6 +65,9 @@ parts2/
 
 # 跨平台路径曾在工作目录根静默实体化的垃圾目录形态（护栏：tools/nest.py 平台交叉拒绝）
 [A-Za-z]:/
+# 🔧 事务#2609：反斜杠整串文件名形态（'C:\Users\...' 是单个文件名、无/）[A-Za-z]:/ 匹配不到，
+# 曾被 iteration backup / AutoCodeUpdate 的 git add -A 卷入提交；[A-Za-z]:* 同时兜住两形态
+[A-Za-z]:*
 nest.json
 test_large_file.py
 

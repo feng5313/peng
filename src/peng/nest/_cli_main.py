@@ -327,9 +327,8 @@ def _cli_push(nest_name: str, local_path: str, remote_path: str | None) -> int:
 def _cli_pull(nest_name: str, remote_path: str, local_path: str | None) -> int:
     """从远端 nest 拉取文件/目录"""
     import asyncio
-    from pathlib import Path
 
-    from peng.nest.transfer import TransferError, pull_file, sync_tree
+    from peng.nest.transfer import TransferError, pull_file, safe_remote_basename, sync_tree
 
     async def _run():
         transport = _make_ws_transport(nest_name)
@@ -339,7 +338,9 @@ def _cli_pull(nest_name: str, remote_path: str, local_path: str | None) -> int:
             raise TransferError(f"远端路径不可访问: {resp.error}")
         is_dir = bool((resp.data or {}).get("is_dir"))
         if is_dir:
-            lpath = local_path or Path(remote_path.rstrip("/\\")).name or "pull_dir"
+            # 🔧 事务#2609：Path.name 在 POSIX 不切反斜杠，Windows 路径整串成为
+            # 文件名落垃圾（改用平台感知安全推导，推导不出安全名直接报错）
+            lpath = local_path or safe_remote_basename(remote_path)
             stats = await sync_tree(transport, lpath, remote_path, direction="pull")
             return [
                 f"✅ 目录已从 {nest_name}:{remote_path} 同步到 {lpath}",
@@ -347,7 +348,7 @@ def _cli_pull(nest_name: str, remote_path: str, local_path: str | None) -> int:
                 f"删除 {stats['deleted']}, 失败 {stats['failed']}",
                 f"   传输量: {_fmt_size(stats['total_bytes'])}",
             ] + ([f"⚠️ 有 {stats['failed']} 个文件失败"] if stats["failed"] else [])
-        lpath = local_path or Path(remote_path).name
+        lpath = local_path or safe_remote_basename(remote_path)
         result = await pull_file(transport, remote_path, lpath)
         speed = result.get("speed", 0)
         return [
