@@ -36,6 +36,46 @@ import uuid
 from pathlib import Path
 
 
+def _ensure_safe_stdio() -> None:
+    """让 stdout/stderr 永不因编码问题中断（Windows GBK 控制台/重定向场景）。
+
+    远程命令输出可能包含本机编码无法表示的字符（如 U+FFFD 替换字符，
+    常见于扫描混合编码文件产生），在 GBK (cp936) 控制台或重定向日志文件上
+    print 会抛 UnicodeEncodeError。reconfigure(errors="backslashreplace")
+    使不可编码字符以 \\uXXXX 转义形式保留：信息不丢失、不再崩溃；
+    UTF-8 终端上无任何行为变化。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None and hasattr(stream, "reconfigure"):
+                stream.reconfigure(errors="backslashreplace")
+        except Exception:
+            pass
+
+
+def _safe_write(stream, text: str) -> None:
+    """向流写入文本，编码失败时降级为转义写入，绝不抛 UnicodeEncodeError。
+
+    作为 _ensure_safe_stdio 的兜底：当流是被替换过的包装对象（无 reconfigure，
+    如测试或嵌入环境）时依然安全。
+    """
+    try:
+        stream.write(text)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        try:
+            # backslashreplace 只替换该编码下不可编码的字符（产物纯 ASCII），
+            # 其余部分是流编码的合法字节，按流编码解回后必然可完整写入
+            safe = text.encode(encoding, errors="backslashreplace").decode(encoding)
+        except (UnicodeEncodeError, UnicodeDecodeError, LookupError):
+            # 极端兜底：全 ASCII 转义，任何编码都能写
+            safe = text.encode("ascii", errors="backslashreplace").decode("ascii")
+        try:
+            stream.write(safe)
+        except Exception:
+            pass
+
+
 def _get_webui_port() -> int:
     """获取webui端口"""
     try:
@@ -95,6 +135,7 @@ def _do_exec(nest_name: str, command: str, timeout: int = 60, stream: bool = Fal
         return _do_exec_stream(nest_name, command, timeout, port, api_hosts)
 
     for api_host in api_hosts:
+        # 阶段1：连接 + 请求 + 解析响应（失败则尝试下一个 host）
         try:
             params = urllib.parse.urlencode({"nest": nest_name, "command": command, "timeout": timeout})
             url = f"http://{api_host}:{port}/api/nest/exec?{params}"
@@ -102,29 +143,32 @@ def _do_exec(nest_name: str, command: str, timeout: int = 60, stream: bool = Fal
             req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=timeout + 10) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
-
-            if not result.get("success"):
-                print(f"远程执行失败: {result.get('error', 'unknown')}", file=sys.stderr)
-                return 1
-
-            exit_code = result.get("exit_code", -1)
-            stdout = result.get("stdout", "")
-            stderr = result.get("stderr", "")
-
-            print(f"[{nest_name}]$ {command}")
-            if stdout:
-                print(stdout, end="")
-            if stderr:
-                print(f"\nSTDERR: {stderr}", end="")
-            print(f"\n退出码: {exit_code}")
-
-            return exit_code
         except urllib.error.URLError as e:
             last_error = e
             continue
         except Exception as e:
             last_error = e
             continue
+
+        # 阶段2：连接已成功，输出结果。
+        # 打印不再包在连接重试的 try 里——否则 UnicodeEncodeError 等输出异常
+        # 会被误报为"无法连接到 peng webui 服务"（事务#2658）。
+        if not result.get("success"):
+            _safe_write(sys.stderr, f"远程执行失败: {result.get('error', 'unknown')}\n")
+            return 1
+
+        exit_code = result.get("exit_code", -1)
+        stdout = result.get("stdout", "")
+        stderr = result.get("stderr", "")
+
+        _safe_write(sys.stdout, f"[{nest_name}]$ {command}\n")
+        if stdout:
+            _safe_write(sys.stdout, stdout)
+        if stderr:
+            _safe_write(sys.stdout, f"\nSTDERR: {stderr}")
+        _safe_write(sys.stdout, f"\n退出码: {exit_code}\n")
+
+        return exit_code
 
     print(f"错误：无法连接到 peng webui 服务 (尝试了: {', '.join(f'{h}:{port}' for h in api_hosts)}): {last_error}", file=sys.stderr)
     return 1
@@ -148,7 +192,8 @@ def _do_exec_stream(nest_name: str, command: str, timeout: int, port: int, api_h
                 "Accept": "text/event-stream",
             })
             
-            print(f"[{nest_name}]$ {command}", flush=True)
+            _safe_write(sys.stdout, f"[{nest_name}]$ {command}\n")
+            sys.stdout.flush()
             
             exit_code = -1
             event_type = ""
@@ -174,14 +219,14 @@ def _do_exec_stream(nest_name: str, command: str, timeout: int, port: int, api_h
                             text = json.loads(data_str)
                         except (json.JSONDecodeError, ValueError):
                             text = data_str
-                        sys.stdout.write(text)
+                        _safe_write(sys.stdout, text)
                         sys.stdout.flush()
                     elif event_type == "stderr":
                         try:
                             text = json.loads(data_str)
                         except (json.JSONDecodeError, ValueError):
                             text = data_str
-                        sys.stderr.write(text)
+                        _safe_write(sys.stderr, text)
                         sys.stderr.flush()
                     elif event_type == "done":
                         try:
@@ -192,12 +237,12 @@ def _do_exec_stream(nest_name: str, command: str, timeout: int, port: int, api_h
                     elif event_type == "error":
                         try:
                             result = json.loads(data_str)
-                            print(f"\n错误: {result.get('error', '未知错误')}", file=sys.stderr)
+                            _safe_write(sys.stderr, f"\n错误: {result.get('error', '未知错误')}\n")
                         except (json.JSONDecodeError, ValueError):
-                            print(f"\n错误: {data_str}", file=sys.stderr)
+                            _safe_write(sys.stderr, f"\n错误: {data_str}\n")
                         return 1
             
-            print(f"\n退出码: {exit_code}")
+            _safe_write(sys.stdout, f"\n退出码: {exit_code}\n")
             return exit_code
             
         except urllib.error.URLError as e:
@@ -413,6 +458,10 @@ def _cli_sync(nest_name: str, direction: str, delete: bool, dry_run: bool,
 
 def main() -> int:
     """Nest 主入口"""
+    # Windows GBK 控制台/重定向下，含 U+FFFD 等不可编码字符的远程输出
+    # 会导致 print 抛 UnicodeEncodeError（事务#2658），先让 stdio 永不因编码中断
+    _ensure_safe_stdio()
+
     parser = argparse.ArgumentParser(
         prog="nest",
         description="Nest（鹏窝）- 远程控制服务（主动连接 peng）",

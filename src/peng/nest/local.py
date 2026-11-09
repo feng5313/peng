@@ -770,7 +770,11 @@ class LocalExecutor:
                     line = await stream.readline()
                     if not line:
                         break
-                    text = line.decode("utf-8", errors="replace")
+                    # 多编码尝试（utf-8→gbk→cp936→latin-1），与非流式 _decode_output 一致。
+                    # 此前固定 utf-8+replace 会让 GBK 输出变 U+FFFD 乱码。
+                    # readline 按 \n 切分，而 GBK 双字节的次字节范围 0x40-0xFE 不含 0x0A，
+                    # 多字节字符不会被行边界截断，行级解码安全。
+                    text = _decode_output(line)
                     await queue.put(("line", source, text))
 
             queue: asyncio.Queue[tuple[str, str, str | int]] = asyncio.Queue()
