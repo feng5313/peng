@@ -117,12 +117,12 @@ class TestGetTerminationSignals:
         # SIGBREAK is Windows only
 
     @patch("peng.common.platform.IS_WINDOWS", True)
-    @patch("signal.SIGBREAK", 21)  # Mock SIGBREAK for testing
+    @patch("signal.SIGBREAK", 21, create=True)  # Linux 无 SIGBREAK 属性，需 create=True 动态注入
     def test_get_termination_signals_windows(self):
         """测试获取 Windows 平台的终止信号"""
         signals = get_termination_signals()
         assert signal.SIGINT in signals
-        # SIGBREAK may not exist on all platforms, so we just check it's in the result when mocked
+        assert 21 in signals  # mock 的 SIGBREAK 应包含在结果中
 
 
 class TestGetKillSignal:
@@ -149,15 +149,11 @@ class TestCanUseSignalHandler:
         """测试 POSIX 平台可以使用信号处理器"""
         assert can_use_signal_handler() is True
 
-    @patch("peng.common.platform.IS_WINDOWS", True)
+    @patch("peng.common.platform.IS_POSIX", False)  # can_use_signal_handler 依据 IS_POSIX 判断
     def test_can_use_signal_handler_windows(self):
         """测试 Windows 平台不能使用信号处理器"""
-        # Mock IS_WINDOWS to True and check the result
-        with patch.object(sys, "platform", "win32"):
-            # This will be checked at import time, so we need to test differently
-            # For now, just verify the function returns a boolean
-            result = can_use_signal_handler()
-            assert isinstance(result, bool)
+        # IS_WINDOWS/IS_POSIX 是模块级常量，模拟 Windows 需直接 patch IS_POSIX=False
+        assert can_use_signal_handler() is False
 
 
 class TestShutilWhich:
@@ -317,14 +313,18 @@ class TestKillProcessWindows:
         assert result is False
 
     @patch("peng.common.platform.IS_WINDOWS", True)
-    @patch("peng.common.platform.process_exists")
-    def test_kill_process_windows_not_exists(self, mock_exists):
-        """测试 Windows 平台进程不存在"""
-        mock_exists.return_value = False
+    @patch("subprocess.run")
+    def test_kill_process_windows_not_exists(self, mock_run):
+        """测试 Windows 平台进程不存在时 kill_process 跳过杀死并视为成功
 
-        result = _kill_process_windows(1234, force=False, kill_tree=False, caller="test", reason="test")
+        产品语义：存在性检查在公共入口 kill_process() 中完成，
+        进程不存在时直接返回 True，不会调用平台杀死函数。
+        """
+        with patch("peng.common.platform.process_exists", return_value=False):
+            result = kill_process(1234, force=False, kill_tree=False, caller="test", reason="test")
 
         assert result is True
+        mock_run.assert_not_called()  # 不存在时不应执行 taskkill
 
 
 class TestKillProcessPosix:
@@ -368,14 +368,18 @@ class TestKillProcessPosix:
         assert result is False
 
     @patch("peng.common.platform.IS_WINDOWS", False)
-    @patch("peng.common.platform.process_exists")
-    def test_kill_process_posix_not_exists(self, mock_exists):
-        """测试 POSIX 平台进程不存在"""
-        mock_exists.return_value = False
+    @patch("os.kill")
+    def test_kill_process_posix_not_exists(self, mock_kill):
+        """测试 POSIX 平台进程不存在时 kill_process 跳过杀死并视为成功
 
-        result = _kill_process_posix(1234, force=False, kill_tree=False, caller="test", reason="test")
+        产品语义：存在性检查在公共入口 kill_process() 中完成，
+        进程不存在时直接返回 True，不会向 pid 发送信号。
+        """
+        with patch("peng.common.platform.process_exists", return_value=False):
+            result = kill_process(1234, force=False, kill_tree=False, caller="test", reason="test")
 
         assert result is True
+        mock_kill.assert_not_called()  # 不存在时不应发送信号
 
 
 class TestKillProcess:
@@ -433,7 +437,7 @@ class TestGetChildProcesses:
     def test_get_child_processes_from_ps(self, mock_run, mock_exists):
         """测试从 ps 命令获取子进程"""
         mock_exists.return_value = False
-        mock_run.return_value = Mock(stdout="456\n789\n")
+        mock_run.return_value = Mock(returncode=0, stdout="456\n789\n")  # 产品代码要求 returncode==0 才解析输出
 
         children = _get_child_processes(123)
 
@@ -475,7 +479,8 @@ class TestKillProcessTreePosix:
     def test_kill_process_tree_by_children(self, mock_kill, mock_get_children, mock_killpg, mock_getpgid):
         """测试递归杀死子进程"""
         mock_getpgid.side_effect = OSError()  # 不是组 leader
-        mock_get_children.return_value = [456, 789]
+        # 按 pid 区分子进程查询结果，避免递归时恒返回同一子进程列表导致无限递归
+        mock_get_children.side_effect = lambda pid: [456, 789] if pid == 123 else []
 
         _kill_process_tree_posix(123, force=False, caller="test", reason="test")
 
@@ -497,6 +502,7 @@ class TestSetupSignalHandlers:
         assert loop.add_signal_handler.called
 
     @patch("peng.common.platform.IS_WINDOWS", True)
+    @patch("peng.common.platform.IS_POSIX", False)  # can_use_signal_handler 依据 IS_POSIX 判断
     def test_setup_signal_handlers_windows(self):
         """测试 Windows 平台不能设置信号处理器"""
         loop = Mock()
@@ -533,6 +539,7 @@ class TestCleanupSignalHandlers:
         assert loop.remove_signal_handler.called
 
     @patch("peng.common.platform.IS_WINDOWS", True)
+    @patch("peng.common.platform.IS_POSIX", False)  # can_use_signal_handler 依据 IS_POSIX 判断
     def test_cleanup_signal_handlers_windows(self):
         """测试 Windows 平台不能清理信号处理器"""
         loop = Mock()
@@ -546,16 +553,17 @@ class TestCleanupSignalHandlers:
 class TestEnsureUvSync:
     """测试 ensure_uv_sync 函数"""
 
-    @patch("peng.common.platform.shutil.which")
+    @patch("shutil.which")
     def test_ensure_uv_sync_no_uv(self, mock_which):
         """测试 uv 不可用时跳过"""
         mock_which.return_value = None
 
-        result = ensure_uv_sync()
+        # 显式传入空的临时项目根目录，避免真实项目 stamp 标记命中快速路径造成假通过
+        result = ensure_uv_sync(Path("/nonexistent-uv-project"))
 
         assert result is True
 
-    @patch("peng.common.platform.shutil.which")
+    @patch("shutil.which")
     @patch("pathlib.Path.exists")
     @patch("subprocess.run")
     def test_ensure_uv_sync_success(self, mock_run, mock_exists, mock_which):
@@ -567,7 +575,7 @@ class TestEnsureUvSync:
 
         assert result is True
 
-    @patch("peng.common.platform.shutil.which")
+    @patch("shutil.which")
     @patch("pathlib.Path.exists")
     @patch("subprocess.run")
     def test_ensure_uv_sync_failure(self, mock_run, mock_exists, mock_which):
@@ -579,7 +587,7 @@ class TestEnsureUvSync:
 
         assert result is False
 
-    @patch("peng.common.platform.shutil.which")
+    @patch("shutil.which")
     @patch("pathlib.Path.exists")
     @patch("subprocess.run")
     def test_ensure_uv_sync_exception(self, mock_run, mock_exists, mock_which):

@@ -20,7 +20,7 @@ from peng.common.paths import (
 class TestGetWorkingDirectory:
     """测试get_working_directory函数"""
 
-    @patch("peng.common.paths.load_config")
+    @patch("peng.config.loader.load_config")  # load_config 为 paths.py 函数内局部导入，patch 其源定义模块
     def test_get_working_directory_from_config(self, mock_load_config):
         """测试从配置获取工作目录"""
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -34,7 +34,7 @@ class TestGetWorkingDirectory:
             result = get_working_directory()
             assert result == workdir
 
-    @patch("peng.common.paths.load_config")
+    @patch("peng.config.loader.load_config")  # load_config 为 paths.py 函数内局部导入，patch 其源定义模块
     def test_get_working_directory_fallback_to_cwd(self, mock_load_config):
         """测试配置加载失败时回退到当前目录"""
         mock_load_config.side_effect = Exception("Config error")
@@ -42,7 +42,7 @@ class TestGetWorkingDirectory:
         result = get_working_directory()
         assert result == Path.cwd()
 
-    @patch("peng.common.paths.load_config")
+    @patch("peng.config.loader.load_config")  # load_config 为 paths.py 函数内局部导入，patch 其源定义模块
     def test_get_working_directory_invalid_dir(self, mock_load_config):
         """测试配置目录不存在时回退到当前目录"""
         mock_config = MagicMock()
@@ -85,7 +85,7 @@ class TestIsInWorkingDirectory:
 class TestIsProjectFile:
     """测试is_project_file函数"""
 
-    @patch("peng.common.paths.load_config")
+    @patch("peng.config.loader.load_config")  # load_config 为 paths.py 函数内局部导入，patch 其源定义模块
     def test_is_project_file_true(self, mock_load_config):
         """测试项目文件"""
         project_root = Path("/tmp/project")
@@ -97,7 +97,7 @@ class TestIsProjectFile:
 
         assert is_project_file(file_path) is True
 
-    @patch("peng.common.paths.load_config")
+    @patch("peng.config.loader.load_config")  # load_config 为 paths.py 函数内局部导入，patch 其源定义模块
     def test_is_project_file_outside(self, mock_load_config):
         """测试非项目文件"""
         project_root = Path("/tmp/project")
@@ -125,7 +125,7 @@ class TestIsTemporaryDirectory:
 class TestIsProtectedProjectPath:
     """测试is_protected_project_path函数"""
 
-    @patch("peng.common.paths.load_config")
+    @patch("peng.config.loader.load_config")  # load_config 为 paths.py 函数内局部导入，patch 其源定义模块
     def test_is_protected_project_path_true(self, mock_load_config):
         """测试受保护路径"""
         project_root = Path("/project")
@@ -138,7 +138,7 @@ class TestIsProtectedProjectPath:
 
         assert is_protected_project_path(file_path) is True
 
-    @patch("peng.common.paths.load_config")
+    @patch("peng.config.loader.load_config")  # load_config 为 paths.py 函数内局部导入，patch 其源定义模块
     def test_is_protected_project_path_allowed_dir(self, mock_load_config):
         """测试允许的目录"""
         project_root = Path("/project")
@@ -152,7 +152,7 @@ class TestIsProtectedProjectPath:
 
         assert is_protected_project_path(file_path) is False
 
-    @patch("peng.common.paths.load_config")
+    @patch("peng.config.loader.load_config")  # load_config 为 paths.py 函数内局部导入，patch 其源定义模块
     def test_is_protected_project_path_outside(self, mock_load_config):
         """测试项目外路径"""
         project_root = Path("/project")
