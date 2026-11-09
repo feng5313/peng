@@ -35,7 +35,11 @@ def glob_tool(tmp_path: Path):
     tool = GlobTool()
     # 设置上下文为临时目录，避免依赖真实的工作目录
     tool.set_context(workdir=str(tmp_path))
-    return tool
+    # 单元测试隔离：禁用 nest 转发（否则 _get_nest_client 恒返回客户端，
+    # 会经 _forward_via_server 连本机真实 peng 服务(8899)把请求发到生产
+    # 远端 nest 执行，tmp_path 在远端不存在导致随机失败，且污染生产环境）
+    with patch.object(GlobTool, "_get_nest_client", return_value=None):
+        yield tool
 
 
 class TestGlobTool:

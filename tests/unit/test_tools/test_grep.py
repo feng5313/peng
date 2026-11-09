@@ -6,7 +6,14 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock, mock_open
 
 from peng.tools.grep import GrepTool, _get_grep_limits
-from peng.tools.base import ToolError
+from peng.tools.base import DualOutput, ToolError
+
+
+def as_text(result) -> str:
+    """execute 现返回 DualOutput（summary/display 双通道），测试断言基于 summary 文本"""
+    if isinstance(result, DualOutput):
+        return result.summary
+    return str(result)
 
 
 @pytest.fixture
@@ -41,7 +48,11 @@ def temp_test_dir(tmp_path: Path) -> Path:
 def grep_tool():
     """创建GrepTool实例"""
     tool = GrepTool()
-    return tool
+    # 单元测试隔离：禁用 nest 转发（否则 _get_nest_client 恒返回客户端，
+    # 会经 _forward_via_server 连本机真实 peng 服务(8899)把请求发到生产
+    # 远端 nest 执行，tmp_path 在远端不存在导致随机失败，且污染生产环境）
+    with patch.object(GrepTool, "_get_nest_client", return_value=None):
+        yield tool
 
 
 class TestGrepLimits:
@@ -104,15 +115,17 @@ class TestGrepTool:
         grep_tool.set_context(workdir=str(temp_test_dir))
 
         result = await grep_tool.execute(pattern="Hello")
-        assert "test1.txt" in result
-        assert "test2.py" in result
+        text = as_text(result)
+        assert "test1.txt" in text
+        assert "test2.py" in text
 
     @pytest.mark.asyncio
     async def test_execute_with_path(self, temp_test_dir, grep_tool):
         """测试在指定路径搜索"""
         result = await grep_tool.execute(pattern="hello", path=str(temp_test_dir / "subdir"))
-        assert "test4.py" in result
-        assert "test1.txt" not in result  # 不在搜索范围内
+        text = as_text(result)
+        assert "test4.py" in text
+        assert "test1.txt" not in text  # 不在搜索范围内
 
     @pytest.mark.asyncio
     async def test_execute_with_glob_filter(self, temp_test_dir, grep_tool):
@@ -120,8 +133,9 @@ class TestGrepTool:
         grep_tool.set_context(workdir=str(temp_test_dir))
 
         result = await grep_tool.execute(pattern="Hello", glob="*.py")
-        assert "test2.py" in result
-        assert "test1.txt" not in result  # 不匹配*.py
+        text = as_text(result)
+        assert "test2.py" in text
+        assert "test1.txt" not in text  # 不匹配*.py
 
     @pytest.mark.asyncio
     async def test_execute_ignore_case(self, temp_test_dir, grep_tool):
@@ -130,7 +144,8 @@ class TestGrepTool:
 
         result = await grep_tool.execute(pattern="hello", ignore_case=True)
         # 应该能匹配到Hello, hello等
-        assert "test1.txt" in result or "test2.py" in result or "test4.py" in result
+        text = as_text(result)
+        assert "test1.txt" in text or "test2.py" in text or "test4.py" in text
 
     @pytest.mark.asyncio
     async def test_execute_output_mode_files_with_matches(self, temp_test_dir, grep_tool):
@@ -142,8 +157,9 @@ class TestGrepTool:
             output_mode="files_with_matches"
         )
         # 应该只显示文件名，不显示行内容
-        assert "test1.txt" in result
-        assert ":" not in result  # 不应该有行号
+        text = as_text(result)
+        assert "test1.txt" in text
+        assert ":" not in text  # 不应该有行号
 
     @pytest.mark.asyncio
     async def test_execute_output_mode_count(self, temp_test_dir, grep_tool):
@@ -154,9 +170,10 @@ class TestGrepTool:
             pattern="Hello",
             output_mode="count"
         )
-        assert "找到" in result
-        assert "处匹配" in result
-        assert "个文件中" in result
+        text = as_text(result)
+        assert "找到" in text
+        assert "处匹配" in text
+        assert "个文件中" in text
 
     @pytest.mark.asyncio
     async def test_execute_no_matches(self, temp_test_dir, grep_tool):
@@ -164,7 +181,7 @@ class TestGrepTool:
         grep_tool.set_context(workdir=str(temp_test_dir))
 
         result = await grep_tool.execute(pattern="nonexistent_pattern")
-        assert result == "未找到匹配"
+        assert as_text(result) == "未找到匹配"
 
     @pytest.mark.asyncio
     async def test_execute_invalid_regex(self, temp_test_dir, grep_tool):
@@ -190,7 +207,7 @@ class TestGrepTool:
         # 搜索.git目录中的内容
         result = await grep_tool.execute(pattern="config")
         # 不应该包含.git目录中的文件
-        assert "git/config" not in result.lower()
+        assert "git/config" not in as_text(result).lower()
 
     @pytest.mark.asyncio
     async def test_filters_binary_files(self, temp_test_dir, grep_tool):
@@ -199,7 +216,7 @@ class TestGrepTool:
 
         # 二进制文件不应该被搜索
         result = await grep_tool.execute(pattern="test")
-        assert "binary.bin" not in result
+        assert "binary.bin" not in as_text(result)
 
     @pytest.mark.asyncio
     async def test_limits_file_count(self, temp_test_dir, grep_tool):
@@ -213,8 +230,8 @@ class TestGrepTool:
 
         result = await grep_tool.execute(pattern="test")
         # 应该限制在500个文件内
-        # 验证搜索能正常完成（不抛出异常）
-        assert isinstance(result, str)
+        # 验证搜索能正常完成（返回DualOutput双通道对象）
+        assert isinstance(result, DualOutput)
 
     @pytest.mark.asyncio
     async def test_limits_match_count(self, temp_test_dir, grep_tool):
@@ -228,7 +245,8 @@ class TestGrepTool:
 
         result = await grep_tool.execute(pattern="test")
         # 应该有截断提示
-        assert "truncated" in result.lower() or len(result) > 0
+        text = as_text(result)
+        assert "truncated" in text.lower() or len(text) > 0
 
     @pytest.mark.asyncio
     async def test_line_truncation(self, temp_test_dir, grep_tool):
@@ -242,7 +260,8 @@ class TestGrepTool:
 
         result = await grep_tool.execute(pattern="test")
         # 应该有截断提示
-        assert "truncated" in result.lower() or "test" in result
+        text = as_text(result)
+        assert "truncated" in text.lower() or "test" in text
 
     @pytest.mark.asyncio
     async def test_handles_file_read_errors(self, temp_test_dir, grep_tool):
@@ -256,8 +275,8 @@ class TestGrepTool:
 
         # 应该能继续执行，跳过无法读取的文件（使用errors='ignore'模式）
         result = await grep_tool.execute(pattern="test")
-        # 其他文件应该能正常搜索
-        assert isinstance(result, str)
+        # 其他文件应该能正常搜索（返回DualOutput双通道对象）
+        assert isinstance(result, DualOutput)
 
     @pytest.mark.asyncio
     async def test_to_openai_format(self, grep_tool):
@@ -274,7 +293,7 @@ class TestGrepTool:
 
         result = await grep_tool.execute(pattern="Hello", path=str(file_path))
         # 单文件搜索时，相对路径是文件名本身或者"."
-        assert "Hello" in result
+        assert "Hello" in as_text(result)
 
     @pytest.mark.asyncio
     async def test_context_fallback_to_workdir(self, grep_tool):
