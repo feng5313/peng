@@ -139,7 +139,7 @@ async def test_write_without_progress_returns_param_error_not_crash():
     """write不传progress：明确参数错误提示，绝不出现AttributeError崩溃文案"""
     row = {"id": 42, "checklist": "", "progress": 10}
     tool = _make_checklist_tool(row)
-    result = await tool.execute(action="write", checklist_content="- [ ] 任务")
+    result = await tool.execute(action="write", content="- [ ] 任务")
     assert "write操作需要提供progress参数" in result.summary
     assert "'NoneType' object has no attribute" not in result.summary
 
@@ -149,7 +149,7 @@ async def test_write_with_int_progress():
     row = {"id": 42, "checklist": "", "progress": 0}
     tool = _make_checklist_tool(row)
     result = await tool.execute(
-        action="write", checklist_content="- [ ] 任务", progress=50
+        action="write", content="- [ ] 任务", progress=50
     )
     assert "❌" not in result.summary, f"不应失败: {result.summary}"
     call_kwargs = tool.get_context("task_manager").db.update_task.call_args.kwargs
