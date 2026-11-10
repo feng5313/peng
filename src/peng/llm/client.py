@@ -28,7 +28,7 @@ from peng.common import jsonp as json
 from peng.common.colors import ANSI_COLORS
 from peng.common.types import ToolCall
 from peng.config import load_config
-from peng.config.loader import LLMConfig, ProviderConfig
+from peng.config.loader import AllProvidersBlockedError, LLMConfig, ProviderConfig
 from peng.common.logging_config import setup_llm_logging, should_log
 from peng.llm.concurrency import acquire_llm_slots_handle
 from peng.llm.prefill_tracker import effective_stall_timeout, first_token_allowance_seconds
@@ -720,12 +720,19 @@ class GLMClient:
             fetch_result = self.config.fetch_providers(content)
             if fetch_result:
                 favorites, locked, forbidden = fetch_result
-        provider_data = self.config.get_provider(
-            current=self.provider,
-            favorites=favorites,
-            locked=locked,
-            forbidden=forbidden,
-        )
+        try:
+            provider_data = self.config.get_provider(
+                current=self.provider,
+                favorites=favorites,
+                locked=locked,
+                forbidden=forbidden,
+                wait_for_usable=False,  # 预热是信息型同步，不被额度恢复时刻挂住
+            )
+        except AllProvidersBlockedError as e:
+            # 🔧 事务#2666：所有provider额度耗尽（硬阻塞，状态已持久化）——预热
+            # 不发起请求也无需报错终止，保持当前provider待 chat_stream 等待恢复时刻
+            logger.warning(f"[LLM Client] 预热provider：{e}")
+            return
         if not provider_data:
             logger.warning("[LLM Client] 预热provider临时变量失败: 无可用provider")
             return

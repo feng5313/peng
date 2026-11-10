@@ -90,7 +90,7 @@ def print_welcome(config=None):
         from peng.config.loader import load_config
 
         config = load_config()
-        provider_data = config.llm.get_provider()
+        provider_data = config.llm.get_provider(wait_for_usable=False)
         if provider_data:
             console.print(f"[cyan]当前模型：[/cyan] {provider_data.get('provider', '未设置')}")
         else:
@@ -190,7 +190,7 @@ async def _chat_once_async(agent, config, chat_args: ChatArgs) -> int:
         from peng.config.loader import load_config
 
         cfg = load_config()
-        provider_data = cfg.llm.get_provider()
+        provider_data = cfg.llm.get_provider(wait_for_usable=False)
         if provider_data:
             console.print(f"[cyan]当前模型：[/cyan] {provider_data.get('provider', '未设置')}")
     except Exception:

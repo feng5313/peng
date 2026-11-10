@@ -181,7 +181,7 @@ async def execute_command(request: CommandRequest) -> dict[str, Any]:
             try:
                 from peng.config.loader import load_config
                 config = load_config()
-                provider_data = config.llm.get_provider()
+                provider_data = config.llm.get_provider(wait_for_usable=False)
                 model_name = provider_data.get("model", "未设置") if provider_data else "未设置"
                 result_text = f"当前模型：{model_name} (provider: {config.llm.current_provider})\n大模型已采用自动轮选机制，无需手动切换。"
                 return {"success": True, "command": "/model", "output": result_text}

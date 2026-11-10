@@ -58,11 +58,24 @@ _FETCH_PROVIDER_PATTERN = re.compile(
 
 @dataclass
 class FailureInfo:
-    """Provider 失败信息（支持自适应冷却时间）"""
+    """Provider 失败信息（支持自适应冷却时间 + 确定性硬阻塞）
+
+    两种不可用语义（事务#2666）：
+    - cooldown：**启发式**冷却（错误原因不确定，试探性回避），自适应倍增；
+    - unavailable_until：**确定性**硬阻塞到指定epoch时刻（配额耗尽429带明确
+      重置时刻、retry-after头指明恢复时间）。在此时刻前重试该provider必然再次
+      失败，是纯粹的浪费——选择逻辑必须直接跳过，而不是按冷却"赌一把"。
+    """
 
     failure_count: int = 0  # 连续失败次数
     last_failure_time: float = 0.0  # 最后一次失败的时间戳
     cooldown: int = 30  # 当前冷却时间（秒），默认 30 秒，失败加倍，成功重置
+    unavailable_until: float = 0.0  # 硬阻塞截止（epoch秒），0=无硬阻塞
+    # 【风主紧急指示】额度耗尽状态与恢复时刻是**跨进程事实声明**：任何事务遇到
+    # 额度耗尽都必须立刻落盘，新启动/restart/resume 的事务经 load_failed_providers
+    # 继承该状态，不再重复试探。声明带时间戳，多进程按"最新声明优先"合并。
+    blocked_updated_at: float = 0.0  # 额度/硬阻塞状态最后一次声明时间（权威判据）
+    blocked_reason: str = ""  # 原因文案（如"配额耗尽429，重置时刻2026-11-10 18:31:28"）
 
     def to_dict(self) -> dict[str, Any]:
         """转换为字典（用于 JSON 序列化）"""
@@ -70,6 +83,9 @@ class FailureInfo:
             "failure_count": self.failure_count,
             "last_failure_time": self.last_failure_time,
             "cooldown": self.cooldown,
+            "unavailable_until": self.unavailable_until,
+            "blocked_updated_at": self.blocked_updated_at,
+            "blocked_reason": self.blocked_reason,
         }
 
     @classmethod
@@ -79,7 +95,328 @@ class FailureInfo:
             failure_count=data.get("failure_count", 0),
             last_failure_time=data.get("last_failure_time", 0.0),
             cooldown=data.get("cooldown", 30),
+            unavailable_until=float(data.get("unavailable_until", 0.0) or 0.0),
+            blocked_updated_at=float(data.get("blocked_updated_at", 0.0) or 0.0),
+            blocked_reason=str(data.get("blocked_reason", "") or ""),
         )
+
+
+# ==================== 事务#2666：限流/配额"恢复时刻"解析与硬阻塞 ====================
+#
+# 背景（消息#12582）：429"已达到 5 小时的使用上限。您的限额将在 18:31:28 重置"
+# 这类错误是**确定性**的——在重置时刻之前重试该 provider 必然再次失败。既有
+# 自适应冷却（30s起倍增、封顶3600s）只是启发式试探，冷却到期后配额耗尽的
+# provider 会被重新选中再次撞墙，全 provider 耗尽时等待循环还按 ≤300s 冷却
+# 反复发起注定失败的请求，白白浪费时间与 token。
+#
+# 本区提供：从响应头/错误文案提取"恢复时刻"→ 建立 unavailable_until 硬阻塞，
+# provider 选择逻辑在恢复时刻前直接跳过该 provider（零注定失败请求）。
+
+#: 硬阻塞合理窗口上限（秒）：解析出的恢复时刻距今超过此值视为解析异常
+#: （时区歧义/荒谬数值），不建立硬阻塞，回落既有自适应冷却语义
+QUOTA_BLOCK_MAX_SECONDS = 72 * 3600
+
+#: 完整日期时间（ISO/API文案格式，可带时区后缀）
+_QUOTA_DATETIME_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"
+)
+#: 仅时刻（如"您的限额将在 18:31:28 重置"，省略日期→按今天/明天推算）
+_QUOTA_TIME_ONLY_RE = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
+#: 时长表述（中英文单位，如 "resets in 2 hours"、"30分钟后重置"）
+_QUOTA_DURATION_RE = re.compile(
+    r"(?:in|after|by|within)?\s*(\d{1,4})\s*(?:个)?\s*"
+    r"(hours?|hrs?|hr|h|minutes?|mins?|min|m|seconds?|secs?|sec|s|小时|分钟|秒)",
+    re.IGNORECASE,
+)
+#: 10位epoch秒（覆盖2001–2037，文案内嵌的unix时间戳）
+_QUOTA_EPOCH_RE = re.compile(r"\b(1[0-9]{9})\b")
+#: "恢复语义"上下文关键词（确认所解析数值确为恢复时刻，而非无关数字）
+_QUOTA_RESET_CONTEXT_RE = re.compile(
+    r"reset|renew|重置|恢复|将在|将于|until|expire|到期", re.IGNORECASE
+)
+
+#: 时长单位 → 秒
+_QUOTA_DURATION_UNITS: dict[str, int] = {
+    "hours": 3600, "hour": 3600, "hrs": 3600, "hr": 3600, "h": 3600,
+    "minutes": 60, "minute": 60, "mins": 60, "min": 60, "m": 60,
+    "seconds": 1, "second": 1, "secs": 1, "sec": 1, "s": 1,
+    "小时": 3600, "分钟": 60, "秒": 1,
+}
+
+#: 跨进程额度/冷却状态惰性刷新窗口（秒，事务#2666）：其他 runner 进程落盘的
+#: 额度耗尽声明要在本进程即时生效，长驻事务否则只会按自己内存的状态行事。
+FAILED_PROVIDERS_RELOAD_TTL = 2.0
+
+
+class AllProvidersBlockedError(Exception):
+    """所有 provider 均处于确定性硬阻塞（配额耗尽等）——任何请求都必然失败
+
+    调用方（tool_engine）应等待 earliest_reset 后重试（期间可被紧急info/控制
+    信号打断），而不是按启发式冷却反复试探注定失败的请求。
+
+    Attributes:
+        blocked: {provider名: 恢复时刻epoch}（全部处于硬阻塞的provider）
+        earliest_reset: 最早恢复时刻（0=未知）
+    """
+
+    def __init__(self, message: str, blocked: dict[str, float]):
+        self.blocked = blocked
+        self.earliest_reset = min(blocked.values()) if blocked else 0.0
+        super().__init__(message)
+
+
+def _quota_epoch_sane(epoch: float, now: float) -> bool:
+    """恢复时刻合理性校验：必须落在 (now, now+QUOTA_BLOCK_MAX_SECONDS] 内"""
+    return now < epoch <= now + QUOTA_BLOCK_MAX_SECONDS
+
+
+def _parse_quota_datetime_token(token: str, now: float) -> float | None:
+    """解析日期时间token为epoch秒（含时区歧义自愈）
+
+    naive 值先按本地时区解释；若得到过去时刻（文案其实是UTC墙钟），再按UTC
+    解释——取两者中落在合理未来的那个。带显式时区（Z/±hh:mm）则精确换算。
+    """
+    from datetime import datetime, timezone
+
+    candidates: list[datetime] = []
+    iso_token = token.replace(" ", "T")
+    try:
+        candidates.append(datetime.fromisoformat(iso_token))
+    except ValueError:
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%dT%H:%M",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+        ):
+            try:
+                candidates.append(datetime.strptime(token, fmt))
+            except ValueError:
+                continue
+    for dt in candidates:
+        if dt.tzinfo is not None:
+            epoch = dt.timestamp()
+            if _quota_epoch_sane(epoch, now):
+                return epoch
+        else:
+            epoch_local = dt.timestamp()  # naive → 按本地时区解释
+            if _quota_epoch_sane(epoch_local, now):
+                return epoch_local
+            epoch_utc = dt.replace(tzinfo=timezone.utc).timestamp()  # 文案为UTC墙钟
+            if _quota_epoch_sane(epoch_utc, now):
+                return epoch_utc
+    return None
+
+
+def _parse_quota_time_only(token: str, now: float) -> float | None:
+    """解析仅时刻（HH:MM[:SS]）：按今天推算，已过则顺延到明天"""
+    from datetime import datetime
+
+    parts = token.split(":")
+    try:
+        hour, minute = int(parts[0]), int(parts[1])
+        sec = int(parts[2]) if len(parts) > 2 else 0
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= sec <= 59):
+        return None
+    today = datetime.now()
+    target = today.replace(hour=hour, minute=minute, second=sec, microsecond=0)
+    epoch = target.timestamp()
+    if epoch <= now:
+        epoch += 86400  # 已过→明天（配额窗口通常≤数小时，顺延合理）
+    if _quota_epoch_sane(epoch, now):
+        return epoch
+    return None
+
+
+def _parse_quota_duration_token(token: str, value: int, unit: str, now: float) -> float | None:
+    """解析时长表述（"in 2 hours"/"30分钟后重置"）为epoch秒"""
+    secs = _QUOTA_DURATION_UNITS.get(unit.lower())
+    if secs is None:
+        return None
+    epoch = now + value * secs
+    if _quota_epoch_sane(epoch, now):
+        return epoch
+    return None
+
+
+def parse_quota_reset_time(
+    err_msg: str | None, headers: dict[str, str] | None = None, now: float | None = None
+) -> tuple[float | None, str]:
+    """从 429 响应头/错误文案提取 provider 的"恢复时刻"（epoch秒）
+
+    Args:
+        err_msg: 错误消息文本（响应体提取的错误文案）
+        headers: HTTP响应头（大小写不敏感）——权威来源（retry-after等）
+        now: 当前时间（默认 time.time()，测试可注入）
+
+    Returns:
+        (恢复时刻epoch 或 None, 来源说明/失败原因)
+
+    优先级：响应头 > 文案完整日期时间 > 文案epoch > 文案时长 > 文案仅时刻。
+    解析不出（或超出合理窗口）返回 None——调用方回落既有自适应冷却。
+    """
+    now = now if now is not None else time.time()
+
+    if headers:
+        hd = {str(k).lower(): str(v).strip() for k, v in headers.items()}
+        # retry-after-ms：毫秒增量（部分网关）
+        ms = hd.get("retry-after-ms")
+        if ms:
+            try:
+                epoch = now + float(ms) / 1000.0
+                if _quota_epoch_sane(epoch, now):
+                    return epoch, f"响应头retry-after-ms({ms}ms)"
+            except ValueError:
+                pass
+        # retry-after：秒增量 或 HTTP日期
+        ra = hd.get("retry-after")
+        if ra:
+            try:
+                secs = float(ra)
+                epoch = now + secs
+                if _quota_epoch_sane(epoch, now):
+                    return epoch, f"响应头retry-after({secs:.0f}s)"
+            except ValueError:
+                from email.utils import parsedate_to_datetime
+
+                try:
+                    dt = parsedate_to_datetime(ra)
+                    epoch = dt.timestamp()
+                    if _quota_epoch_sane(epoch, now):
+                        return epoch, "响应头retry-after(HTTP日期)"
+                except (TypeError, ValueError):
+                    pass
+        # 各类速率重置头：值>1e9视为epoch秒，否则视为剩余秒数
+        for key in ("x-ratelimit-reset", "anthropic-ratelimit-unified-reset"):
+            v = hd.get(key)
+            if not v:
+                continue
+            try:
+                val = float(v)
+            except ValueError:
+                continue
+            epoch = val if val > 1_000_000_000 else now + val
+            if _quota_epoch_sane(epoch, now):
+                return epoch, f"响应头{key}"
+
+    if not err_msg:
+        return None, "无恢复时刻信息（响应头与文案均未解析出重置时间）"
+
+    if not _QUOTA_RESET_CONTEXT_RE.search(err_msg):
+        return None, "文案无恢复语义关键词，不敢建立硬阻塞"
+
+    m = _QUOTA_DATETIME_RE.search(err_msg)
+    if m:
+        # 完整日期时间命中即定案：不再回退短模式（"18:31:28"这类片段会被
+        # 时长/仅时刻正则误读，把荒谬时刻解析成看似合理的数值）
+        epoch = _parse_quota_datetime_token(m.group(0), now)
+        if epoch is not None:
+            return epoch, f"文案重置时刻({m.group(0)})"
+        return None, "文案重置时刻无法解析或超出合理窗口（不建立硬阻塞）"
+
+    m = _QUOTA_EPOCH_RE.search(err_msg)
+    if m:
+        epoch = float(m.group(1))
+        if _quota_epoch_sane(epoch, now):
+            return epoch, f"文案内嵌epoch({m.group(1)})"
+        return None, "文案内嵌epoch超出合理窗口（不建立硬阻塞）"
+
+    dm = _QUOTA_DURATION_RE.search(err_msg)
+    if dm:
+        epoch = _parse_quota_duration_token(dm.group(0), int(dm.group(1)), dm.group(2), now)
+        if epoch is not None:
+            return epoch, f"文案重置时长({dm.group(0)})"
+        return None, "文案重置时长超出合理窗口（不建立硬阻塞）"
+
+    tm = _QUOTA_TIME_ONLY_RE.search(err_msg)
+    if tm:
+        epoch = _parse_quota_time_only(tm.group(0), now)
+        if epoch is not None:
+            return epoch, f"文案重置时刻仅时间({tm.group(0)})"
+
+    return None, "文案含恢复语义但未解析出可用时刻/时长"
+
+
+# ============ 跨进程文件锁（额度状态持久化用，稳定inode，参考 llm/concurrency.py）============
+# failed_providers.json 会被多个 runner 进程并发读写（每个事务独立进程）。
+# 额度耗尽状态是跨进程事实，写入必须互斥且原子，否则后写者覆盖丢失恢复时刻声明。
+if os.name == "nt":  # pragma: no cover - Windows
+    import msvcrt
+
+    _msvcrt: Any = msvcrt
+
+    def _flock_exclusive(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+
+    def _funlock(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
+
+else:
+
+    def _flock_exclusive(fd: int) -> None:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _funlock(fd: int) -> None:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _fmt_block_detail(entries: dict[str, tuple[float, str]]) -> str:
+    """硬阻塞详情文本：`provider 恢复于 本地时间，原因 | ...`（按恢复时刻排序）
+
+    独立成函数避开 f-string 内字面括号与嵌套调用字段混排的解析陷阱。
+    """
+    parts: list[str] = []
+    for p, (u, r) in sorted(entries.items(), key=lambda kv: kv[1][0]):
+        ts = time.strftime("%m-%d %H:%M:%S", time.localtime(u))
+        parts.append(f"{p} 恢复于 {ts}" + (f"，{r}" if r else ""))
+    return " | ".join(parts)
+
+
+class _StateFileLock:
+    """flock 独占锁（锁文件永不删除 ⇒ inode 稳定，互斥语义可靠）"""
+
+    def __init__(self, path: Path, retry_seconds: float = 1.0) -> None:
+        self.path = path
+        self.retry_seconds = retry_seconds
+        self._fd: int | None = None
+
+    def acquire(self) -> bool:
+        deadline = time.time() + self.retry_seconds
+        while True:
+            try:
+                fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o666)
+            except OSError:
+                return False
+            try:
+                _flock_exclusive(fd)
+                self._fd = fd
+                return True
+            except OSError as e:
+                os.close(fd)
+                if e.errno not in (getattr(__import__("errno"), "EWOULDBLOCK", 11), 13):
+                    logger.debug(f"[LLMConfig] 状态文件锁异常: {self.path}: {e}")
+                    return False
+                if time.time() >= deadline:
+                    return False
+                time.sleep(0.02)
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            _funlock(self._fd)
+        except Exception:
+            pass
+        os.close(self._fd)
+        self._fd = None
 
 
 # 项目根目录缓存
@@ -1375,10 +1712,26 @@ class LLMConfig(BaseModel):
                 轮换排序并登记分配。
 
         Returns:
-            最佳可用 provider 名称，如果没有可用 provider 则返回 None
+            最佳可用 provider 名称，如果没有可用 provider 则返回 None。
+            🔧 事务#2666：所有provider均处于**确定性硬阻塞**（额度耗尽带恢复时刻等）
+            时返回 None——调用方应按恢复时刻等待，而不是发起注定再次失败的请求。
         """
         shifts = self.get_shifts(task_id=task_id)
         if not shifts:
+            return None
+
+        current_time = time.time()
+        # 🔧 事务#2666：确定性硬阻塞先于一切候选逻辑排除。与启发式冷却的本质区别：
+        # 硬阻塞是服务端声明的"额度耗尽、恢复时刻T"事实，T之前重试必然再次429，
+        # 纯属浪费时间与token；冷却只是出错后试探性回避（可赌一把）。状态经
+        # failed_providers.json 持久化，新启动/restart/resume 的事务同样继承跳过。
+        unblocked_shifts = [p for p in shifts if self.blocked_remaining(p, current_time) <= 0]
+        if not unblocked_shifts:
+            blocked = self.blocked_snapshot(forbidden=forbidden, now=current_time)
+            logger.warning(
+                "[LLMConfig] 所有provider均处于硬阻塞（额度耗尽等），"
+                "不发起注定失败的请求：" + _fmt_block_detail(blocked)
+            )
             return None
 
         # 多模态优先：在支持vision的provider中按priority选最优（不含vision-only）
@@ -1386,7 +1739,7 @@ class LLMConfig(BaseModel):
         if prefer_vision:
             vision_shifts = [
                 p
-                for p in shifts
+                for p in unblocked_shifts
                 if self.providers[p].is_vision_enabled()
                 and not self.providers[p].is_vision_only()
                 and not is_provider_vision_runtime_disabled(p)
@@ -1395,9 +1748,9 @@ class LLMConfig(BaseModel):
                 candidates = vision_shifts
             else:
                 logger.warning("[LLMConfig] 无可用vision provider，多模态内容将降级为纯文本")
-                candidates = shifts
+                candidates = unblocked_shifts
         else:
-            candidates = shifts
+            candidates = unblocked_shifts
 
         # 上下文能力过滤（事务#1807）：装不下当前请求的provider不参与选择
         if min_context_tokens is not None:
@@ -1412,7 +1765,6 @@ class LLMConfig(BaseModel):
         # 将 forbidden 转换为集合以加速查找
         forbidden_set = set(forbidden) if forbidden else set()
 
-        current_time = time.time()
         for candidate in candidates:
             # 跳过被禁止的provider
             if candidate in forbidden_set:
@@ -1424,35 +1776,32 @@ class LLMConfig(BaseModel):
             if current_time - failure_info.last_failure_time > failure_info.cooldown:
                 return self._note_auto_assignment(candidate, task_id)
 
-        # 所有 provider 都在冷却中，选择冷却时间最短的（而非固定返回第一个）
+        # 可用（非硬阻塞）provider 全在冷却中：选择剩余等待时间最短的试探者
         best_candidate = None
-        best_remaining_cooldown = float("inf")
+        best_remaining = float("inf")
         for candidate in candidates:
             # 跳过被禁止的provider
             if candidate in forbidden_set:
                 continue
-            failure_info = self._get_failure_info(candidate)
-            if failure_info:
-                remaining = failure_info.cooldown - (current_time - failure_info.last_failure_time)
-                if remaining < best_remaining_cooldown:
-                    best_remaining_cooldown = remaining
-                    best_candidate = candidate
-            else:
+            remaining = self._usable_remaining(candidate, current_time)
+            if remaining < best_remaining:
+                best_remaining = remaining
                 best_candidate = candidate
-                break
         logger.warning(
-            f"[LLMConfig] 所有 provider 都在冷却中，使用冷却时间最短的: {best_candidate}"
+            f"[LLMConfig] 可用provider全在冷却中，使用剩余时间最短的: {best_candidate}"
+            f"（还需约{best_remaining:.0f}秒）"
         )
         return self._note_auto_assignment(best_candidate, task_id)
 
     def get_min_cooldown_remaining(self) -> float:
-        """获取所有provider中最短的剩余冷却时间（秒）
+        """获取所有provider中"最早可用"还需等待的秒数（冷却+硬阻塞合并，事务#2666）
 
-        用于计算"所有provider都在冷却中"时需要等待多久。
-        如果没有任何provider在冷却中，返回0。
+        用于计算"所有provider都不可用"时需要等待多久：每个provider的等待量取
+        启发式冷却剩余与确定性硬阻塞剩余中的较大者，再取全局最小（最早恢复的
+        provider 决定最短等待）。有provider立即可用时返回0。
 
         Returns:
-            最短剩余冷却时间（秒），向上取整
+            最短剩余等待时间（秒），>=0
         """
         shifts = self.get_shifts()
         if not shifts:
@@ -1461,10 +1810,9 @@ class LLMConfig(BaseModel):
         current_time = time.time()
         min_remaining = float("inf")
         for candidate in shifts:
-            failure_info = self._get_failure_info(candidate)
-            if not failure_info:
+            remaining = self._usable_remaining(candidate, current_time)
+            if remaining <= 0:
                 return 0.0  # 有provider可用，无需等待
-            remaining = failure_info.cooldown - (current_time - failure_info.last_failure_time)
             if remaining < min_remaining:
                 min_remaining = remaining
 
@@ -1525,14 +1873,94 @@ class LLMConfig(BaseModel):
         """设置 provider 的失败信息"""
         self.failed_providers[provider] = info
 
+    def _merge_failed_records(
+        self, mem: dict[str, Any], file_data: dict[str, Any]
+    ) -> dict[str, Any]:
+        """字段级双轨合并（事务#2666）：谁声明更晚谁胜出
+
+        - 启发式冷却字段（failure_count/last_failure_time/cooldown）：按
+          last_failure_time 较新的胜出；
+        - 额度硬阻塞声明（unavailable_until/blocked_updated_at/blocked_reason）：
+          按 blocked_updated_at 较新的胜出（成功解除=0 与新耗尽声明都是最新声明，
+          不会被其他进程的旧记录复活/覆盖）。
+
+        Args:
+            mem: 内存记录（可序列化字典形式）
+            file_data: 磁盘记录字典
+
+        Returns:
+            合并后的记录字典（不修改入参）
+        """
+        merged_all = dict(mem)
+        for provider, fi in file_data.items():
+            if not isinstance(fi, dict):
+                continue
+            mi = merged_all.get(provider)
+            if not isinstance(mi, dict):
+                # 仅文件中有：保留（可能来自其他进程）
+                merged_all[provider] = fi
+                continue
+            merged = dict(mi)
+            file_time = float(fi.get("last_failure_time", 0) or 0)
+            mem_time = float(mi.get("last_failure_time", 0) or 0)
+            if file_time > mem_time:
+                merged["last_failure_time"] = file_time
+                merged["failure_count"] = fi.get("failure_count", merged.get("failure_count", 0))
+                merged["cooldown"] = fi.get("cooldown", merged.get("cooldown", 30))
+            file_bu = float(fi.get("blocked_updated_at", 0.0) or 0.0)
+            mem_bu = float(mi.get("blocked_updated_at", 0.0) or 0.0)
+            if file_bu > mem_bu:
+                merged["unavailable_until"] = float(fi.get("unavailable_until", 0.0) or 0.0)
+                merged["blocked_updated_at"] = file_bu
+                merged["blocked_reason"] = str(fi.get("blocked_reason", "") or "")
+            merged_all[provider] = merged
+        return merged_all
+
+    def _maybe_reload_failed_providers(self) -> None:
+        """跨进程额度/冷却状态惰性刷新（事务#2666，窗口 FAILED_PROVIDERS_RELOAD_TTL）
+
+        其他 runner 进程把额度耗尽声明落盘后，本进程（长驻事务）必须及时感知，
+        否则仍会按自己内存里的陈旧状态去撞墙。读取按时间戳合并，绝不丢失本进程
+        更新的声明；窗口内复用避免高频文件读。
+        """
+        failed_file = getattr(self, "_failed_providers_path", None)
+        if not failed_file or not failed_file.exists():
+            return
+        now = time.time()
+        if now - float(getattr(self, "_failed_reload_at", 0.0) or 0.0) < FAILED_PROVIDERS_RELOAD_TTL:
+            return
+        self._failed_reload_at = now
+        try:
+            with open(failed_file, encoding="utf-8") as f:
+                file_data = json.load(f)
+            if not isinstance(file_data, dict):
+                return
+            mem_serial = {
+                p: (i.to_dict() if isinstance(i, FailureInfo) else i)
+                for p, i in self.failed_providers.items()
+            }
+            merged = self._merge_failed_records(mem_serial, file_data)
+            self.failed_providers = {
+                p: FailureInfo.from_dict(v) if isinstance(v, dict) else v
+                for p, v in merged.items()
+            }
+        except Exception as e:
+            logger.debug(f"[LLMConfig] 跨进程失败/额度状态刷新失败(忽略): {e}")
+
     def _clean_expired_failures(self) -> None:
-        """清理过期的失败记录"""
+        """清理过期的失败记录（冷却到期**且**硬阻塞已解除才清除，事务#2666）
+
+        未到期硬阻塞（额度耗尽恢复时刻在未来）必须保留——它是跨进程事实，
+        清除会让其他事务重新发起注定失败的请求。
+        """
         current_time = time.time()
         expired = []
 
         for provider in self.failed_providers:
             info = self._get_failure_info(provider)
             if info and (current_time - info.last_failure_time) > info.cooldown:
+                if info.unavailable_until > current_time:
+                    continue  # 硬阻塞未到期，保留（额度恢复时刻是权威状态）
                 expired.append(provider)
 
         for provider in expired:
@@ -1567,6 +1995,141 @@ class LLMConfig(BaseModel):
         # 立即持久化失败记录到磁盘（跨进程共享冷却状态）
         self.save_failed_providers()
 
+    def _usable_remaining(self, provider: str, now: float | None = None) -> float:
+        """该provider距"可用"还需等待的秒数（冷却启发式与硬阻塞取较大者，0=立即可用）"""
+        # 先刷新跨进程状态（其他事务落盘的额度声明要在本进程即时生效，事务#2666）
+        self._maybe_reload_failed_providers()
+        now = now if now is not None else time.time()
+        info = self._get_failure_info(provider)
+        if info is None:
+            return 0.0
+        cooldown_rem = info.cooldown - (now - info.last_failure_time)
+        block_rem = (info.unavailable_until - now) if info.unavailable_until > 0 else 0.0
+        rem = max(cooldown_rem, block_rem)
+        return rem if rem > 0 else 0.0
+
+    def blocked_remaining(self, provider: str, now: float | None = None) -> float:
+        """确定性硬阻塞剩余秒数（事务#2666：配额耗尽等，0=无硬阻塞）
+
+        与冷却的区别：硬阻塞是服务端**声明**的确定性不可用（带恢复时刻），
+        在此之前重试必然再次失败；冷却只是出错后的启发式试探回避。
+        """
+        self._maybe_reload_failed_providers()  # 跨进程额度声明即时生效（事务#2666）
+        now = now if now is not None else time.time()
+        info = self._get_failure_info(provider)
+        if info is None or info.unavailable_until <= 0:
+            return 0.0
+        rem = info.unavailable_until - now
+        if rem <= 0:
+            # 恢复时刻已到：清除过期硬阻塞声明（原因文案一并清除）
+            info.unavailable_until = 0.0
+            info.blocked_reason = ""
+            self._set_failure_info(provider, info)
+            self.save_failed_providers()
+            return 0.0
+        return rem
+
+    def provider_blocked(self, provider: str, now: float | None = None) -> tuple[float, str] | None:
+        """硬阻塞详情：(恢复时刻epoch, 原因文案) 或 None（未阻塞）"""
+        now = now if now is not None else time.time()
+        info = self._get_failure_info(provider)
+        if info is None or info.unavailable_until <= now:
+            return None
+        return info.unavailable_until, info.blocked_reason
+
+    def blocked_snapshot(
+        self, forbidden: list[str] | None = None, now: float | None = None
+    ) -> dict[str, tuple[float, str]]:
+        """启用且非vision-only的provider中处于硬阻塞者的快照 {provider: (恢复时刻, 原因)}"""
+        now = now if now is not None else time.time()
+        forbidden_set = set(forbidden) if forbidden else set()
+        snapshot: dict[str, tuple[float, str]] = {}
+        for name, cfg in self.providers.items():
+            if not cfg.enable or cfg.is_vision_only() or name in forbidden_set:
+                continue
+            detail = self.provider_blocked(name, now)
+            if detail:
+                snapshot[name] = detail
+        return snapshot
+
+    def _wait_provider_usable(self, provider: str, task_id: int | None = None) -> float:
+        """等待 provider 可用（启发式冷却与确定性硬阻塞均计入），期间刷新心跳
+
+        🔧 事务#2666：显式指定/锁定的provider处于额度硬阻塞时，尊重用户意图仍
+        用它，但必须等到恢复时刻再发请求——立即返回只会发起注定失败的429请求。
+
+        Returns:
+            实际等待秒数（0=立即可用）
+        """
+        wait_needed = self._usable_remaining(provider)
+        if wait_needed <= 0:
+            return 0.0
+        blocked_detail = self.provider_blocked(provider)
+        logger.warning(
+            f"[LLMConfig] {provider} 不可用（冷却/额度硬阻塞），等待 {wait_needed:.1f} 秒后返回"
+            + (
+                f"（额度恢复时刻 "
+                f"{time.strftime('%m-%d %H:%M:%S', time.localtime(blocked_detail[0]))}"
+                f"{('，' + blocked_detail[1]) if blocked_detail[1] else ''}）"
+                if blocked_detail
+                else ""
+            )
+        )
+        # 等待期间每30秒更新一次心跳，避免心跳超时
+        wait_interval = 30
+        wait_remaining = wait_needed
+        while wait_remaining > 0:
+            sleep_time = min(wait_interval, wait_remaining)
+            time.sleep(sleep_time)
+            wait_remaining -= sleep_time
+            if task_id is not None:
+                try:
+                    from peng.task.manager import TaskManager
+
+                    task_manager = TaskManager()
+                    task_manager.update_heartbeat(task_id)
+                except Exception as e:
+                    logger.debug(f"[LLMConfig] 心跳更新失败: {e}")
+        return wait_needed
+
+    def mark_provider_blocked(
+        self, provider: str, until_ts: float | None, reason: str = "额度耗尽(429)"
+    ) -> None:
+        """标记 provider 确定性硬阻塞到恢复时刻并**立即持久化**（事务#2666）
+
+        【风主紧急指示】额度耗尽状态与恢复时间是跨进程事实：任何事务遇到
+        额度耗尽报错都必须立刻落盘，新启动/restart/resume 的事务经
+        load_failed_providers 继承该状态，绝不重复发起注定失败的请求。
+
+        Args:
+            provider: provider名称
+            until_ts: 恢复时刻（epoch秒）。None=服务端未给出恢复时间——
+                仍持久化"额度耗尽"事实，按 max_cooldown 保守冷却回避试探。
+            reason: 原因文案（写入持久化记录，便于诊断与UI展示）
+        """
+        if not provider:
+            return
+        now = time.time()
+        info = self._get_failure_info(provider)
+        if info is None:
+            info = FailureInfo(failure_count=0, last_failure_time=now, cooldown=self.default_cooldown)
+
+        info.failure_count += 1
+        info.last_failure_time = now
+        if until_ts is not None and until_ts > now:
+            # 新声明不缩短既有阻塞（多个事务先后报错时取更保守的恢复时刻）
+            info.unavailable_until = max(info.unavailable_until, until_ts)
+            # 启发式冷却同步到阻塞窗口（封顶max_cooldown），使冷却语义与硬阻塞一致
+            info.cooldown = max(info.cooldown, min(int(until_ts - now), self.max_cooldown))
+        else:
+            # 额度耗尽但无恢复时刻：最长保守冷却，避免其他事务反复撞墙
+            info.cooldown = self.max_cooldown
+        info.blocked_updated_at = now
+        info.blocked_reason = reason[:200]
+
+        self._set_failure_info(provider, info)
+        self.save_failed_providers()
+
     def get_icon(self, provider: str) -> str:
         v = self.providers.get(provider)
         if v:
@@ -1574,24 +2137,30 @@ class LLMConfig(BaseModel):
         return None
 
     def mark_success(self, provider: str) -> None:
-        """
-        标记 provider 成功（重置冷却时间）
+        """标记 provider 成功（重置冷却 + 显式解除硬阻塞声明）
 
         成功时：
-        - 失败次数清零
-        - 冷却时间重置为默认值（30 秒）
-        - 保留记录但冷却时间过期后会自动清理
+        - 失败次数清零、冷却时间重置为默认值（30 秒）
+        - 硬阻塞（额度耗尽等）声明被**显式解除**并写入新的声明时间戳——
+          成功请求证明该 provider 当前可用，此声明对其他进程同样权威
+        - 保留记录但冷却过期后会自动清理
         """
+        now = time.time()
         info = self._get_failure_info(provider)
-        if info:
-            # 重置为初始状态
-            info.failure_count = 0
-            info.cooldown = self.default_cooldown
-            # 更新最后失败时间，让清理机制尽快移除
-            info.last_failure_time = time.time() - info.cooldown - 1
-            self._set_failure_info(provider, info)
-            # 立即持久化成功记录到磁盘（跨进程共享冷却状态）
-            self.save_failed_providers()
+        if info is None:
+            info = FailureInfo(failure_count=0, cooldown=self.default_cooldown)
+        info.failure_count = 0
+        info.cooldown = self.default_cooldown
+        # 更新最后失败时间，让清理机制尽快移除
+        info.last_failure_time = now - info.cooldown - 1
+        if info.unavailable_until > 0:
+            # 显式解除硬阻塞：声明时间戳更新，其他进程按最新声明恢复可用
+            info.unavailable_until = 0.0
+            info.blocked_reason = ""
+        info.blocked_updated_at = now
+        self._set_failure_info(provider, info)
+        # 立即持久化成功记录到磁盘（跨进程共享冷却/额度状态）
+        self.save_failed_providers()
 
     def match_provider(self, provider: str, include_disabled: bool = False) -> str | None:
         """
@@ -1700,6 +2269,7 @@ class LLMConfig(BaseModel):
         forbidden: list[str] | None = None,
         prefer_vision: bool = False,
         min_context_tokens: int | None = None,
+        wait_for_usable: bool = True,
     ) -> dict[str, any] | None:
         """
         获取 provider 配置（统一入口）
@@ -1714,8 +2284,27 @@ class LLMConfig(BaseModel):
                 不会被切换选中，防止切换后必然400超限；全部不足时兜底返回能力
                 最大的provider走既有400→冷却→上下文紧张→压缩/重启自愈链路。
                 锁定(@provider!)与enable_fallback=False场景尊重用户显式意图，仅告警。
+            wait_for_usable: 🔧 事务#2666。True=选中provider处于冷却/额度硬阻塞时
+                **在本函数内等待到可用**再返回（请求路径用，避免发起注定失败的请求）。
+                False=立即返回配置，不等待——信息型调用（UI/WebUI显示、单价/图标查询、
+                配置预热）必须传False，否则会被额度恢复时刻挂住。
+
+        Raises:
+            AllProvidersBlockedError: 🔧 事务#2666——所有可用provider均处于
+                **确定性硬阻塞**（额度耗尽带恢复时刻，状态持久化跨进程）。
+                此时任何请求都必然再次失败，调用方（tool_engine）应按
+                earliest_reset 等待后重试，而不是反复试探浪费时间与token。
+
+        Returns:
+            provider 配置字典（锁定/单provider模式尊重显式意图；显式指定的
+            provider处于硬阻塞时在本函数内等待到恢复时刻再返回）
         """
         import time
+
+        # 🔧 事务#2666：先刷新跨进程失败/额度状态——其他事务落盘的额度耗尽声明
+        # 必须对本事务即时生效（含锁定与单provider路径），避免长驻事务按自己
+        # 内存里的陈旧状态反复撞墙。
+        self._maybe_reload_failed_providers()
 
         # provider锁定：即使失败也不切换，直接返回锁定的provider配置
         if locked:
@@ -1763,6 +2352,12 @@ class LLMConfig(BaseModel):
                             f"(请求输入~{min_context_tokens}tokens)，仍按锁定使用，"
                             f"请求可能上下文超限400（事务#1807）"
                         )
+                    # 🔧 事务#2666：锁定provider额度耗尽（确定性硬阻塞）时仍尊重
+                    # 用户显式意图用它，但等待到恢复时刻再返回——立即返回只会让
+                    # 调用方发起注定再次429的请求，白白浪费时间与token。
+                    # 信息型调用（wait_for_usable=False）不等待，避免被挂住。
+                    if wait_for_usable:
+                        self._wait_provider_usable(locked_provider, task_id)
                     return {
                         "provider": locked_provider,
                         "api_key": prov_config.api_key,
@@ -1841,6 +2436,18 @@ class LLMConfig(BaseModel):
             # 如果 current_provider 被禁止，即使 enable_fallback=False 也要切换
             if self.current_provider in forbidden_set:
                 pass  # 进入后面的切换逻辑
+            elif (blocked_now := self.provider_blocked(self.current_provider)) is not None:
+                # 🔧 事务#2666：单provider模式下该provider处于确定性硬阻塞
+                # （额度耗尽带恢复时刻）——绝不发起注定失败的请求，由调用方
+                # （tool_engine）等待到恢复时刻。阻塞状态已持久化，新启动/
+                # restart/resume 的事务经 load_failed_providers 同样跳过。
+                raise AllProvidersBlockedError(
+                    f"单provider模式(enable_fallback=False)指定的 {self.current_provider} "
+                    f"额度耗尽/硬阻塞至 "
+                    f"{time.strftime('%m-%d %H:%M:%S', time.localtime(blocked_now[0]))}"
+                    + (f"（{blocked_now[1]}）" if blocked_now[1] else ""),
+                    {self.current_provider: blocked_now[0]},
+                )
             else:
                 # 返回完整的 provider 字典
                 prov_config = self.providers[self.current_provider]
@@ -1969,6 +2576,18 @@ class LLMConfig(BaseModel):
                 logger.info(
                     f"[LLMConfig] {current}不支持多模态，切换到vision provider处理多模态内容"
                 )
+            elif self.blocked_remaining(current) > 0:
+                # 🔧 事务#2666：current处于确定性硬阻塞（额度耗尽带恢复时刻），
+                # 复用必然再次429——不复用，落入切换逻辑选其他可用provider；
+                # 若全部硬阻塞则 get_provider 抛 AllProvidersBlockedError 由
+                # tool_engine 等待恢复时刻（状态持久化，跨事务生效）
+                detail = self.provider_blocked(current) or (0.0, "")
+                logger.warning(
+                    f"[LLMConfig] {current}额度耗尽/硬阻塞至"
+                    f" {time.strftime('%m-%d %H:%M:%S', time.localtime(detail[0]))}"
+                    f"{('（' + detail[1] + '）') if detail[1] else ''}，不复用current，"
+                    f"切换到其他可用provider（事务#2666）"
+                )
             else:
                 # 上下文能力校验（事务#1807）：current装不下当前请求时不复用
                 # （config热改compact_threshold/上下文跨阈值增长等场景），落入切换逻辑
@@ -2082,8 +2701,22 @@ class LLMConfig(BaseModel):
             forbidden_set = set(forbidden) if forbidden else set()
             valid_favorites = [fav for fav in favorites if fav not in forbidden_set]
             if valid_favorites:
-                r = random.randint(0, len(valid_favorites) - 1)
-                target_provider = self.match_provider(valid_favorites[r])
+                # 🔧 事务#2666：显式@指定的favorites中优先选未处于硬阻塞者——
+                # 全部favorites都硬阻塞时保留用户显式意图（不擅自换provider），
+                # 由下方等待逻辑等到恢复时刻，绝不发起注定失败的请求。
+                usable_favs = [
+                    fav
+                    for fav in valid_favorites
+                    if self.blocked_remaining(self.match_provider(fav) or fav) <= 0
+                ]
+                pool = usable_favs or valid_favorites
+                if not usable_favs:
+                    logger.warning(
+                        "[LLMConfig] 显式指定的favorites全部处于硬阻塞"
+                        "（额度耗尽等），按用户意图保留并等待恢复时刻（事务#2666）"
+                    )
+                r = random.randint(0, len(pool) - 1)
+                target_provider = self.match_provider(pool[r])
             else:
                 # 所有favorites都被禁止，使用自动选择
                 target_provider = self._get_best_available_provider(
@@ -2093,22 +2726,31 @@ class LLMConfig(BaseModel):
                 )
                 auto_selected = True
 
-        # 如果未找到匹配的 provider，尝试使用第一个可用的provider
+        # 🔧 事务#2666：target缺失时的兜底必须尊重硬阻塞事实——所有启用provider
+        # 都在硬阻塞（额度耗尽带恢复时刻）时抛 AllProvidersBlockedError，由
+        # tool_engine 等待最早恢复时刻；绝不兜底挑一个注定再次429的provider。
         if not target_provider or target_provider not in self.providers:
-            # 尝试使用第一个启用的provider（按priority排序），排除被禁止的
-            enabled_providers = self._get_enabled_providers_sorted()
-            # 过滤掉被禁止的provider
-            if forbidden:
-                enabled_providers = [p for p in enabled_providers if p not in set(forbidden)]
-            first_provider = enabled_providers[0] if enabled_providers else None
-            if first_provider:
-                logger.warning(
-                    f"[LLMConfig] target_provider无效 ({target_provider})，使用priority最高的provider: {first_provider}"
-                )
-                target_provider = first_provider
-            else:
+            enabled_usable = [
+                p
+                for p in self._get_enabled_providers_sorted()
+                if p not in forbidden_set and self.blocked_remaining(p) <= 0
+            ]
+            if not enabled_usable:
+                blocked_all = self.blocked_snapshot(forbidden=forbidden)
+                if blocked_all:
+                    raise AllProvidersBlockedError(
+                        f"所有provider均处于额度耗尽/硬阻塞，不发起注定失败的请求："
+                        f"{_fmt_block_detail(blocked_all)}",
+                        {p: u for p, (u, _r) in blocked_all.items()},
+                    )
                 logger.error("❌ [LLMConfig] config/peng.json中没有可用的provider配置！")
                 sys.exit(1)
+            first_provider = enabled_usable[0]
+            logger.warning(
+                f"[LLMConfig] target_provider无效 ({target_provider})，"
+                f"使用priority最高的可用provider: {first_provider}"
+            )
+            target_provider = first_provider
 
         # 检查target_provider是否启用
         original_provider = target_provider  # 保存原始provider名称，用于日志记录
@@ -2120,11 +2762,18 @@ class LLMConfig(BaseModel):
             # 过滤掉被禁止的provider
             if forbidden:
                 enabled_providers = [p for p in enabled_providers if p not in set(forbidden)]
-            if enabled_providers:
-                # 使用priority最高的启用的provider
-                target_provider = enabled_providers[0]
+            # 🔧 事务#2666：同样优先非硬阻塞者；全硬阻塞则等待恢复时刻而非死磕
+            enabled_usable = [p for p in enabled_providers if self.blocked_remaining(p) <= 0]
+            if enabled_usable:
+                # 使用priority最高的启用的provider（排除硬阻塞）
+                target_provider = enabled_usable[0]
                 logger.warning(
                     f"[LLMConfig] {original_provider}{reason}，切换到priority最高的provider: {target_provider}"
+                )
+            elif enabled_providers:
+                logger.warning(
+                    f"[LLMConfig] {original_provider}{reason}，其余provider均处于硬阻塞"
+                    f"（额度耗尽等），保留 {original_provider} 并等待恢复时刻（事务#2666）"
                 )
             else:
                 logger.error("❌ [LLMConfig] config/peng.json中没有可用的provider！")
@@ -2146,32 +2795,9 @@ class LLMConfig(BaseModel):
                         logger.warning(f"[LLMConfig] {target_provider}在冷却中，切换到: {fallback}")
                         target_provider = fallback
 
-        # 检查 target_provider 是否仍在冷却中，如果在则等待冷却结束
-        # 这可以防止在所有 provider 都在冷却中时立即返回导致的报错循环
-        target_failure_info = self._get_failure_info(target_provider)
-        if target_failure_info:
-            elapsed = time.time() - target_failure_info.last_failure_time
-            if elapsed <= target_failure_info.cooldown:
-                wait_time = target_failure_info.cooldown - elapsed
-                logger.warning(
-                    f"[LLMConfig] {target_provider} 仍在冷却中，等待 {wait_time:.1f} 秒后返回"
-                )
-                # 等待期间每30秒更新一次心跳，避免心跳超时
-                wait_interval = 30
-                wait_remaining = wait_time
-                while wait_remaining > 0:
-                    sleep_time = min(wait_interval, wait_remaining)
-                    time.sleep(sleep_time)
-                    wait_remaining -= sleep_time
-                    # 更新心跳
-                    if task_id is not None:
-                        try:
-                            from peng.task.manager import TaskManager
-
-                            task_manager = TaskManager()
-                            task_manager.update_heartbeat(task_id)
-                        except Exception as e:
-                            logger.debug(f"[LLMConfig] 心跳更新失败: {e}")
+        # 🔧 事务#2666：target仍不可用（冷却/确定性硬阻塞）时等待到可用再返回，
+        # 避免立即返回导致报错循环——显式指定provider时用户意图是"就用它"，
+        # 等到额度恢复时刻再发请求（等待统一走 _wait_provider_usable）。
 
         # 上下文能力最终guard（事务#1807）：favorites匹配/target无效时的兜底列表
         # 等路径可能选中能力不足的provider（_get_best_available_provider全被过滤
@@ -2183,18 +2809,53 @@ class LLMConfig(BaseModel):
             enabled_providers = self._get_enabled_providers_sorted()
             if forbidden:
                 enabled_providers = [p for p in enabled_providers if p not in set(forbidden)]
-            if enabled_providers:
-                best_capacity = max(
-                    enabled_providers, key=lambda p: self._effective_compact_threshold(p)
+            # 🔧 事务#2666：能力足够的provider全部处于硬阻塞时，宁可等待恢复时刻，
+            # 也不发起注定400超限的请求（换到能力不足的provider同样必然失败）。
+            # 排序优先级：能力足够且未阻塞 → 能力足够但阻塞（等待）→ 全能力不足
+            # 时兜底能力最大者（走既有400→压缩/重启自愈链路）。
+            capable = [p for p in enabled_providers if self._context_capacity_ok(p, min_context_tokens)]
+            capable_unblocked = [p for p in capable if self.blocked_remaining(p) <= 0]
+            _prev_target = target_provider
+            if capable_unblocked:
+                target_provider = max(
+                    capable_unblocked, key=lambda p: self._effective_compact_threshold(p)
                 )
                 logger.warning(
-                    f"[LLMConfig] {target_provider}上下文能力不足"
-                    f"(请求输入~{min_context_tokens}tokens)，无能力足够的可用provider，"
-                    f"兜底使用能力最大的provider: {best_capacity} "
-                    f"(compact_threshold={self._effective_compact_threshold(best_capacity)})，"
-                    f"可能仍上下文超限，将走压缩/重启自愈链路（事务#1807）"
+                    f"[LLMConfig] {_prev_target}上下文能力不足"
+                    f"(请求输入~{min_context_tokens}tokens)，"
+                    f"切换到能力足够且未阻塞的provider: {target_provider} "
+                    f"(compact_threshold={self._effective_compact_threshold(target_provider)})（事务#1807）"
                 )
-                target_provider = best_capacity
+            elif capable:
+                best_capable = max(capable, key=lambda p: self._effective_compact_threshold(p))
+                logger.warning(
+                    f"[LLMConfig] 上下文能力足够的provider全部处于硬阻塞（额度耗尽等），"
+                    f"选择能力最大的 {best_capable} 并等待其额度恢复时刻再发请求"
+                    f"（不发起注定超限400的请求，事务#2666/#1807）"
+                )
+                target_provider = best_capable
+            else:
+                usable_pool = [p for p in enabled_providers if self.blocked_remaining(p) <= 0]
+                if not usable_pool:
+                    usable_pool = enabled_providers
+                if usable_pool:
+                    best_capacity = max(
+                        usable_pool, key=lambda p: self._effective_compact_threshold(p)
+                    )
+                    logger.warning(
+                        f"[LLMConfig] {target_provider}上下文能力不足"
+                        f"(请求输入~{min_context_tokens}tokens)，无能力足够的可用provider，"
+                        f"兜底使用能力最大的provider: {best_capacity} "
+                        f"(compact_threshold={self._effective_compact_threshold(best_capacity)})，"
+                        f"可能仍上下文超限，将走压缩/重启自愈链路（事务#1807）"
+                    )
+                    target_provider = best_capacity
+
+        # 🔧 事务#2666：最终选定的provider若仍不可用（冷却/额度硬阻塞），
+        # 等待到可用才返回——绝不把"注定失败的provider"交还给调用方发请求。
+        # 信息型调用（wait_for_usable=False）立即返回，不被额度恢复时刻挂住。
+        if wait_for_usable:
+            self._wait_provider_usable(target_provider, task_id)
 
         # 同步更新 current_provider（跟踪当前实际使用的 provider）
         self.current_provider = target_provider
@@ -2273,22 +2934,38 @@ class LLMConfig(BaseModel):
         return result  # 永不返回None
 
     def save_failed_providers(self) -> None:
-        """
-        保存失败记录到磁盘（合并策略：先读取文件当前内容，与内存记录合并后写回）
+        """保存失败/额度状态记录到磁盘（跨进程合并 + flock互斥 + 原子替换）
 
-        合并规则：对于同一个 provider，取 last_failure_time 较新的记录。
-        这样在多进程场景下，各进程的失败记录不会互相覆盖丢失。
+        【风主紧急指示】额度耗尽状态与恢复时刻是**跨进程事实**：任何事务遇到
+        额度耗尽报错都必须立即落盘，新启动/restart/resume 的事务经
+        load_failed_providers 继承该状态，绝不重复发起注定失败的请求。多个
+        runner 进程并发读写同一文件，因此必须互斥且原子：
+        - flock 独占锁（锁文件永不删除，inode 稳定，沿用 llm/concurrency.py 教训）
+        - tmp + os.replace 原子替换（避免读到半截 JSON）
+        - **字段级双轨合并**（谁声明更晚谁胜出）：
+          * 启发式冷却字段（failure_count/last_failure_time/cooldown）：按
+            last_failure_time 较新的胜出；
+          * 额度硬阻塞声明（unavailable_until/blocked_updated_at/blocked_reason）：
+            按 blocked_updated_at 较新的胜出——"成功解除"(unavailable_until=0)
+            与"新额度耗尽声明"都是最新声明，不会被其他进程的旧记录复活覆盖。
 
         文件格式:
         {
-            "zhipu": {"failure_count": 2, "last_failure_time": 1234567890.123, "cooldown": 10},
-            "dashscope": {"failure_count": 1, "last_failure_time": 1234567891.456, "cooldown": 5}
+            "zhipu": {"failure_count": 2, "last_failure_time": 1234567890.123,
+                      "cooldown": 10, "unavailable_until": 1770000000.0,
+                      "blocked_updated_at": 1769999999.5,
+                      "blocked_reason": "额度耗尽(429)，文案重置时刻2026-11-10 18:31:28"},
+            "dashscope": {"failure_count": 1, "last_failure_time": ..., "cooldown": 5}
         }
         """
         failed_file = getattr(self, "_failed_providers_path", None)
         if not failed_file:
             return
-        ensure_dir_with_owner(failed_file.parent)
+        try:
+            ensure_dir_with_owner(failed_file.parent)
+        except Exception as e:
+            logger.debug(f"[LLMConfig] 失败记录目录准备失败(忽略): {e}")
+            return
 
         # 转换为可序列化的字典
         data = {
@@ -2296,45 +2973,53 @@ class LLMConfig(BaseModel):
             for provider, info in self.failed_providers.items()
         }
 
-        # 合并策略：先读取文件当前内容，与内存记录按 last_failure_time 取较新的
-        if failed_file.exists():
-            try:
-                with open(failed_file, encoding="utf-8") as f:
-                    file_data = json.load(f)
-                if isinstance(file_data, dict):
-                    for provider, file_info in file_data.items():
-                        if not isinstance(file_info, dict):
-                            continue
-                        if provider in data:
-                            # 两边都有：取 last_failure_time 较新的
-                            mem_time = data[provider].get("last_failure_time", 0)
-                            file_time = file_info.get("last_failure_time", 0)
-                            if file_time > mem_time:
-                                data[provider] = file_info
-                        else:
-                            # 仅文件中有：保留（可能来自其他进程）
-                            data[provider] = file_info
-            except Exception:
-                # 文件读取失败，使用内存中的数据继续写入
-                pass
-
+        lock = _StateFileLock(failed_file.with_name(failed_file.name + ".lock"))
+        locked = lock.acquire()
+        if not locked:
+            logger.debug(
+                "[LLMConfig] failed_providers 锁获取失败，直接写入内存状态"
+                "（其他进程的额度声明按时间戳在下次合并时胜出）"
+            )
         try:
-            with open(failed_file, "w", encoding="utf-8") as f:
+            # 合并策略：读取文件当前内容，与内存记录按字段级"最新声明优先"合并
+            # （规则见 _merge_failed_records——冷却按last_failure_time，额度
+            # 硬阻塞按blocked_updated_at，多进程互不覆盖丢失）
+            if failed_file.exists():
+                try:
+                    with open(failed_file, encoding="utf-8") as f:
+                        file_data = json.load(f)
+                    if isinstance(file_data, dict):
+                        data = self._merge_failed_records(data, file_data)
+                except Exception as e:
+                    logger.debug(f"[LLMConfig] 失败记录读取/合并失败(用内存状态继续): {e}")
+
+            # 原子写（tmp + os.replace），配合flock保证多进程不互相覆盖
+            tmp = failed_file.with_name(failed_file.name + f".tmp{os.getpid()}")
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(str(tmp), str(failed_file))
+            try:
+                chown_to_project_owner(failed_file)
+            except Exception:
+                pass
         except Exception as e:
             import traceback
 
             logger.error(
-                f"❌ save_failed_providers() - loader.py:734: 异常 - {e}\n{traceback.format_exc()}"
+                f"❌ save_failed_providers() - loader.py: 异常 - {e}\n{traceback.format_exc()}"
             )
             # 静默失败，不影响主流程
             pass
+        finally:
+            if locked:
+                lock.release()
 
     def load_failed_providers(self) -> None:
-        """
-        从磁盘加载失败记录（路径由 PathsConfig.failed_providers_json 配置）
+        """从磁盘加载失败记录（路径由 PathsConfig.failed_providers_json 配置）
 
-        启动时调用，恢复之前的失败状态和冷却时间
+        启动时调用，恢复之前的失败状态和冷却时间。🔧 事务#2666：额度耗尽硬阻塞
+        状态（unavailable_until/blocked_reason）同样在此恢复——新启动/restart/
+        resume 的事务因此能直接跳过额度已耗尽的 provider，不重复撞墙。
         """
         failed_file = getattr(self, "_failed_providers_path", None)
         if not failed_file:

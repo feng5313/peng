@@ -256,7 +256,7 @@ async def get_task_context_info(task_id: int) -> dict[str, Any]:
                 from peng.config.loader import load_config
 
                 cfg = load_config()
-                pcfg = cfg.llm.get_provider(current=provider, locked=True)
+                pcfg = cfg.llm.get_provider(current=provider, locked=True, wait_for_usable=False)
                 price_input_hit = pcfg.get("price_input_hit", 0) or 0
                 price_input_miss = pcfg.get("price_input_miss", 0) or 0
                 price_output = pcfg.get("price_output", 0) or 0

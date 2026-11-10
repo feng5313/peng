@@ -192,7 +192,9 @@ def _get_compact_threshold(provider: str = "") -> int:
 
         config = load_config()
         if provider:
-            provider_data = config.llm.get_provider(current=provider, locked=True)
+            provider_data = config.llm.get_provider(
+                current=provider, locked=True, wait_for_usable=False
+            )
             if provider_data:
                 return provider_data.get("compact_threshold", config.llm.compact_threshold)
         return config.llm.compact_threshold

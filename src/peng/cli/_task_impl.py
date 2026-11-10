@@ -1144,7 +1144,9 @@ def render_task_detail_html(
                 from peng.config.loader import load_config
 
                 _cfg = load_config()
-                _pcfg = _cfg.llm.get_provider(current=_provider_name, locked=True)
+                _pcfg = _cfg.llm.get_provider(
+                    current=_provider_name, locked=True, wait_for_usable=False
+                )
                 _price_hit = _pcfg.get("price_input_hit", 0) or 0
                 _price_miss = _pcfg.get("price_input_miss", 0) or 0
                 _price_out = _pcfg.get("price_output", 0) or 0

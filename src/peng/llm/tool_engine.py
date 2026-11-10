@@ -38,6 +38,7 @@ from peng.service.tool_backup import ToolBackupManager
 import json
 from peng.common.colors import ANSI_COLORS, colorize, get_colors
 from peng.config import get_agent_name, get_master_name, load_config
+from peng.config.loader import AllProvidersBlockedError, parse_quota_reset_time
 from peng.hooks.manager import HookManager
 from peng.llm.client import GLMClient, LLMError, StreamStallError, TaskCancelledError
 from peng.task.info import is_urgent_content
@@ -186,6 +187,37 @@ _SERVER_CONTEXT_LIMIT_PATTERNS = [
 # 任何LLM的上下文窗口都≥2048；声称值低于此下限必然是服务端状态异常
 # （引擎未就绪/配置损坏），绝非真实上下文容量。
 SERVER_CONTEXT_LIMIT_SANITY_FLOOR = 1024
+
+
+# 🔧 事务#2666：额度耗尽（429配额）确定性硬阻塞的等待参数
+#: 全provider额度耗尽时的分段等待上限（秒）。每段结束重新检测持久化状态与
+#: 中断信号，避免一次死等数小时期间错过配置热改/紧急info/额度提前恢复。
+QUOTA_WAIT_CHUNK_SECONDS = 3600
+
+#: 临时限流(429)带明确等待时长超过此值时改为硬阻塞等待（不再0.5秒高频抢流量）：
+#: 服务端已声明"要等这么久"，高频空转只会烧token与时间
+RATE_LIMIT_HAMMER_MAX_SECONDS = 5.0
+
+
+def fmt_wait_duration(seconds: float) -> str:
+    """把等待秒数格式化为可读中文时长（用于用户可见提示，事务#2666）"""
+    s = int(max(0, seconds))
+    if s < 60:
+        return f"{s}秒"
+    if s < 3600:
+        m, sec = divmod(s, 60)
+        return f"{m}分{sec}秒" if sec else f"{m}分钟"
+    h, rem = divmod(s, 3600)
+    m = rem // 60
+    return f"{h}小时{m}分" if m else f"{h}小时"
+
+
+def quota_eta_text(epoch: float | None) -> str:
+    """额度恢复时刻的可读文本（本地时间 + 距今时长），None=未知"""
+    if not epoch:
+        return "恢复时刻未知"
+    local = datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
+    return f"{local}（约{fmt_wait_duration(epoch - time.time())}后）"
 
 
 def extract_server_context_limit(err_msg: str) -> int | None:
@@ -2541,6 +2573,31 @@ class ToolExecutionEngine:
 
         return True
 
+    def _mark_provider_blocked(self, until_epoch: float | None, reason: str) -> bool:
+        """把当前 provider 的额度耗尽/限流状态**持久化**为确定性硬阻塞（事务#2666）
+
+        【风主紧急指示】额度耗尽状态与恢复时刻必须落盘（failed_providers.json），
+        让其他事务——包括新启动/restart/resume 的——经 load_failed_providers 继承
+        该状态并直接跳过该 provider，绝不重复发起注定再次429的请求。
+
+        Args:
+            until_epoch: 恢复时刻（epoch秒），None=服务端未声明恢复时间（保守冷却）
+            reason: 原因文案（写入持久化记录，便于诊断）
+
+        Returns:
+            True: 已标记且当前处于硬阻塞；False: provider/配置缺失或标记失败
+        """
+        provider = self.llm.provider or ""
+        cfg = getattr(self.llm, "config", None)
+        if not provider or cfg is None:
+            return False
+        try:
+            cfg.mark_provider_blocked(provider, until_epoch, reason)
+            return cfg.blocked_remaining(provider) > 0
+        except Exception as e:
+            logger.debug(f"[ToolEngine] 持久化额度硬阻塞标记失败(忽略): {provider}: {e}")
+            return False
+
     def _has_pending_interrupts(self) -> bool:
         """
         检测事务是否有待处理的**控制信号**中断：
@@ -3071,6 +3128,7 @@ class ToolExecutionEngine:
                     current=getattr(self.llm, "provider", None),
                     favorites=favorites,
                     prefer_vision=prefer_vision,
+                    wait_for_usable=False,  # 能力预判是信息型查询，不等待
                 )
                 if provider_data:
                     provider_config = provider_data
@@ -4622,6 +4680,70 @@ class ToolExecutionEngine:
                         break
                     self.exit_on_unexpected_status()
                     continue
+                except AllProvidersBlockedError as e:
+                    # 🔧 事务#2666：所有provider均处于**持久化确定性硬阻塞**（额度
+                    # 耗尽带恢复时刻）——chat_stream 根本不发起请求（零注定失败请求），
+                    # 此处等待最早恢复时刻后重试。等待分段进行（每段≤
+                    # QUOTA_WAIT_CHUNK_SECONDS），每段重新检测持久化状态（额度可能提前
+                    # 恢复/其他事务已解除），期间可被感叹号紧急info与控制信号立刻打断，
+                    # 并定期刷新心跳保活事务。
+                    retry = 0
+                    is_rate_limited = False
+                    is_content_filtered = False
+                    is_transient_error = False
+                    is_service_unavailable = False
+                    is_context_overflow = False
+                    self.llm.error = str(e)
+                    logger.warning(
+                        f"⛔ [ToolEngine] 事务#{task_id}所有provider额度耗尽/硬阻塞，"
+                        f"不发起请求，等待恢复：{e}"
+                    )
+                    _blk_detail = " | ".join(
+                        f"{p}→{quota_eta_text(u)}" for p, u in sorted(e.blocked.items())
+                    )
+                    _blk_msg = (
+                        f"⏳  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        f"]{ANSI_COLORS.get('bright_yellow')}"
+                        f"所有大模型provider额度耗尽（状态已持久化，新事务同样跳过）："
+                        f"{_blk_detail}。不发起注定失败的请求，等待最早恢复时刻后重试..."
+                        f"{ANSI_COLORS.get('reset')}\n"
+                    )
+                    if self._should_report_system_error(_blk_msg):
+                        get_output_manager().write_output(
+                            task_id=task_id, content=_blk_msg, source="system"
+                        )
+                    # 无恢复时刻信息时按30秒短等待重新评估（持久化状态可能已被其他事务更新）；
+                    # 有恢复时刻则至少等1秒，避免时钟边界导致的空转热循环
+                    _wait_seconds = (
+                        max(1.0, e.earliest_reset - time.time()) if e.earliest_reset else 30.0
+                    )
+                    deadline = time.monotonic() + min(_wait_seconds, QUOTA_WAIT_CHUNK_SECONDS)
+                    _hb_last = time.monotonic()
+                    while time.monotonic() < deadline:
+                        self.exit_on_unexpected_status()
+                        # 心跳保活：每30秒刷新一次（长等待不被误判为卡死）
+                        if task_id and time.monotonic() - _hb_last >= 30:
+                            try:
+                                self.task_manager.update_heartbeat(task_id)
+                            except Exception as _hb_err:
+                                logger.debug(f"[ToolEngine] 额度等待心跳更新失败(忽略): {_hb_err}")
+                            _hb_last = time.monotonic()
+                        # 中断检测：控制信号/感叹号紧急info立刻跳出等待处理
+                        _wait_interrupt = self._has_pending_interrupts()
+                        _wait_urgent = None if _wait_interrupt else self._has_urgent_interrupts()
+                        if _wait_interrupt or _wait_urgent:
+                            logger.info(
+                                f"⚡ [ToolEngine] 事务#{task_id}额度等待期间检测到"
+                                f"{'控制信号' if _wait_interrupt else '紧急中断'}，立刻跳出等待"
+                            )
+                            self._last_urgent_check_ts = 0.0
+                            self._last_urgent_interrupt_reason = None
+                            break
+                        remaining = deadline - time.monotonic()
+                        if remaining > 0:
+                            await asyncio.sleep(min(1, remaining))
+                    continue  # 回到外层 while True：恢复时刻到/状态已更新，重新选择provider
+
                 except LLMError as e:
                     # LLM API 返回错误（如上下文长度超限）：切换provider重试
                     retry += 1
@@ -4704,9 +4826,18 @@ class ToolExecutionEngine:
                         detail += f" - {err_msg}"
                     self.llm.error = detail
                     # 区分429类型：临时限流 vs 配额耗尽
-                    # 临时限流：抢流量重试同一provider
-                    # 配额耗尽：切换provider（未锁定时）
+                    # 临时限流：抢流量重试同一provider（服务端要求久等时改为硬阻塞等待）
+                    # 配额耗尽：切换provider（未锁定时）+ **持久化额度状态**
+                    # 🔧 事务#2666：先提取服务端声明的"恢复时刻"（响应头 retry-after /
+                    # x-ratelimit-reset / anthropic-ratelimit-unified-reset 权威，其次
+                    # 文案中的重置时刻/时长），据此建立跨进程持久化硬阻塞。
+                    _quota_reset_epoch: float | None = None
+                    _quota_reset_src = ""
                     if status_code == 429:
+                        _resp_headers = dict(e.response.headers) if e.response.headers else {}
+                        _quota_reset_epoch, _quota_reset_src = parse_quota_reset_time(
+                            err_msg, _resp_headers
+                        )
                         # 检测配额耗尽特征（中英文关键词）
                         quota_keywords = [
                             "使用上限",
@@ -4726,19 +4857,59 @@ class ToolExecutionEngine:
                             kw in err_msg.lower() for kw in [k.lower() for k in quota_keywords]
                         )
                         if is_quota_exhausted:
-                            # 配额耗尽：不抢流量，按普通错误处理（切换provider）
+                            # 配额耗尽：确定性不可用（恢复时刻前重试必然再次429）。
+                            # 【风主紧急指示】额度状态+恢复时刻立即持久化，期间该
+                            # provider 不被任何事务尝试；同一provider重试无意义，
+                            # 下方 _max_retry=0 立刻跳出转公共等待/切换路径。
                             is_rate_limited = False
+                            _blocked = self._mark_provider_blocked(
+                                _quota_reset_epoch,
+                                f"额度耗尽(429){'，' + _quota_reset_src if _quota_reset_src else ''}",
+                            )
+                            _eta = quota_eta_text(_quota_reset_epoch)
                             logger.warning(
                                 f"{icon} {self.llm.provider} 事务#{task_id}大模型API配额耗尽(429)。"
-                                f"切换provider！详情: {err_msg[:150]}\n"
+                                f"已持久化硬阻塞（{_eta}{'，状态已落盘' if _blocked else ''}），"
+                                f"恢复前该provider不再被任何事务尝试。详情: {err_msg[:150]}\n"
                             )
+                            _q_msg = (
+                                f"⛔  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                                f"]{ANSI_COLORS.get('bright_yellow')}"
+                                f"{icon} {self.llm.provider} 额度耗尽(429)，已持久化标记：恢复时刻 "
+                                f"{_eta}。在此之前该provider不会被任何事务尝试（不浪费请求）。"
+                                f"详情: {err_msg[:150]}{ANSI_COLORS.get('reset')}\n"
+                            )
+                            if self._should_report_system_error(_q_msg):
+                                get_output_manager().write_output(
+                                    task_id=task_id, content=_q_msg, source="system"
+                                )
                         else:
-                            # 临时限流：不冷却不切换，间隔0.5秒重试抢流量
-                            is_rate_limited = True
-                            logger.warning(
-                                f"{icon} {self.llm.provider} 事务#{task_id}大模型API限流(429)。"
-                                f"不冷却不切换，0.5秒后重试抢流量(第{retry}次) URL={url}\n"
+                            # 临时限流。🔧 事务#2666：服务端声明的等待时长较长时
+                            # （retry-after等）不再0.5秒高频抢流量——同样持久化硬阻塞
+                            # 等待到恢复时刻，高频空转只会烧时间与token。
+                            _wait_declared = (
+                                (_quota_reset_epoch - time.time())
+                                if _quota_reset_epoch
+                                else 0.0
                             )
+                            if _quota_reset_epoch and _wait_declared > RATE_LIMIT_HAMMER_MAX_SECONDS:
+                                is_rate_limited = False
+                                self._mark_provider_blocked(
+                                    _quota_reset_epoch, f"限流(429)，{_quota_reset_src}"
+                                )
+                                logger.warning(
+                                    f"{icon} {self.llm.provider} 事务#{task_id}大模型API限流(429)"
+                                    f"（服务端要求等待{fmt_wait_duration(_wait_declared)}，"
+                                    f"{_quota_reset_src}）。改为持久化硬阻塞等待，不再高频抢流量。"
+                                    f"详情: {err_msg[:150]}\n"
+                                )
+                            else:
+                                # 短暂限流：不冷却不切换，间隔0.5秒重试抢流量
+                                is_rate_limited = True
+                                logger.warning(
+                                    f"{icon} {self.llm.provider} 事务#{task_id}大模型API限流(429)。"
+                                    f"不冷却不切换，0.5秒后重试抢流量(第{retry}次) URL={url}\n"
+                                )
                     else:
                         is_rate_limited = False
                         # 🔧 事务#2002：检测400上下文长度超标：请求token数超过provider
@@ -4834,14 +5005,22 @@ class ToolExecutionEngine:
                     # 不可恢复的客户端错误(4xx)不应无限重试，最多重试2次后跳出
                     # 可恢复的服务端错误(5xx)最多重试5次
                     # 429临时限流特殊处理：大幅增加重试次数（抢流量策略）
-                    # 429配额耗尽：按普通错误处理（2次后切换provider）
+                    # 🔧 事务#2666：429配额耗尽/声明较长等待→已持久化硬阻塞，
+                    #   _max_retry=0 首次失败即跳出（同一provider重试注定再次429）
                     # 400内容审核：重试1次（_max_retry=2），之后由外层删除user输入继续
                     # 🔧 事务#2002：400上下文长度超标：不切换provider，compact压缩
                     # 上下文后重试（最多3次，外层每轮compact一次），仍失败则拒绝处理
                     if status_code == 429 and is_rate_limited:
                         _max_retry = 30
                     elif status_code == 429 and not is_rate_limited:
-                        _max_retry = 2  # 配额耗尽：快速切换
+                        # 🔧 事务#2666：额度状态已落盘为确定性硬阻塞时，立即跳出内层
+                        # 重试循环——转公共路径按持久化状态切换其他可用provider，或
+                        # 全阻塞时等待最早恢复时刻；绝不重试注定失败的provider。
+                        _blocked_now = bool(
+                            self.llm.config
+                            and self.llm.config.blocked_remaining(self.llm.provider or "") > 0
+                        )
+                        _max_retry = 0 if _blocked_now else 2
                     elif status_code == 400 and is_context_overflow:
                         # 上下文长度超标：错误是确定性的（非瞬时），重试必然同样
                         # 失败，只有compact压缩上下文才能解决。_max_retry=0使首次
@@ -5227,27 +5406,44 @@ class ToolExecutionEngine:
                         content=_breaker_msg,
                         source="system",
                     )
-                # 根据provider冷却时间动态计算等待时间
-                wait_time = self.llm.config.get_min_cooldown_remaining()
-                # 取冷却剩余时间+5秒余量，至少30秒，最多300秒
-                wait_time = max(30, min(int(wait_time) + 5, 300))
-                logger.warning(
-                    f"⚠️ [ToolEngine] 事务#{task_id} 所有provider重试均失败"
-                    f"(连续第{self._all_failed_rounds}轮)，等待{wait_time}秒后重试..."
-                )
-                _sys_err = (
-                    f"⏳  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
-                    f"{ANSI_COLORS.get('bright_yellow')}"
-                    f"所有大模型provider均不可用，等待{wait_time}秒后重试..."
-                    f"(连续第{self._all_failed_rounds}轮)"
-                    f"{ANSI_COLORS.get('reset')}\n"
-                )
-                if self._should_report_system_error(_sys_err):
-                    get_output_manager().write_output(
-                        task_id=task_id,
-                        content=_sys_err,
-                        source="system",
+                # 🔧 事务#2666：等待时长按provider真实可用状态计算（启发式冷却与
+                # 额度硬阻塞合并，取最早恢复者）。有provider立即可用时不再强等30秒
+                # ——本轮失败可能只是内容/瞬时问题，立刻重试即可换到可用provider。
+                _wait_base = self.llm.config.get_min_cooldown_remaining()
+                if _wait_base <= 0:
+                    wait_time = 0
+                    logger.info(
+                        f"🔁 [ToolEngine] 事务#{task_id}本轮失败但仍有provider立即可用，"
+                        f"立刻重试（不等待）(连续第{self._all_failed_rounds}轮)"
                     )
+                else:
+                    # 最早恢复时刻+5秒余量，至少30秒，最多300秒
+                    wait_time = max(30, min(int(_wait_base) + 5, 300))
+                    logger.warning(
+                        f"⚠️ [ToolEngine] 事务#{task_id} 所有provider重试均失败"
+                        f"(连续第{self._all_failed_rounds}轮)，等待{fmt_wait_duration(wait_time)}后重试..."
+                    )
+                    _blocked_snap = self.llm.config.blocked_snapshot()
+                    _blk_detail = (
+                        "（额度硬阻塞："
+                        + " | ".join(f"{p}→{quota_eta_text(u)}" for p, (u, _r) in sorted(_blocked_snap.items()))
+                        + "）"
+                        if _blocked_snap
+                        else ""
+                    )
+                    _sys_err = (
+                        f"⏳  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        f"]{ANSI_COLORS.get('bright_yellow')}"
+                        f"所有大模型provider均不可用，等待{fmt_wait_duration(wait_time)}后重试..."
+                        f"(连续第{self._all_failed_rounds}轮){_blk_detail}"
+                        f"{ANSI_COLORS.get('reset')}\n"
+                    )
+                    if self._should_report_system_error(_sys_err):
+                        get_output_manager().write_output(
+                            task_id=task_id,
+                            content=_sys_err,
+                            source="system",
+                        )
                 # 使用绝对deadline避免误差积累（exit_on_unexpected_status执行时间不可忽略）
                 deadline = time.monotonic() + wait_time
                 while time.monotonic() < deadline:

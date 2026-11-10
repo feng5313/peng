@@ -682,7 +682,7 @@ async def get_models() -> dict[str, Any]:
         from peng.config.loader import load_config
 
         config = load_config()
-        provider_data = config.llm.get_provider()
+        provider_data = config.llm.get_provider(wait_for_usable=False)
         return {
             "models": [],
             "current": provider_data.get("model") if provider_data else None,
