@@ -1335,6 +1335,16 @@ class GLMClient:
                             )
                         )
                         return
+                    # 🔧 事务#2667：响应头已到达（连接真实建立、服务存活），
+                    # 解除prefill提示门控。此前连接阶段不显示"prefill中"——
+                    # 本地provider关闭时ConnectTimeout等满timeout_connect（30s）
+                    # 恰达提示阈值，每轮重试刷一条假进度掩盖"服务已死"的真相。
+                    try:
+                        from peng.llm.prefill_tracker import get_prefill_tracker
+
+                        get_prefill_tracker().mark_connected(task_id)
+                    except Exception:
+                        pass
                     for line in resp.iter_lines():
                         _line_q.put(line)
                     _line_q.put(_stream_end)

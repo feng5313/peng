@@ -220,6 +220,26 @@ def quota_eta_text(epoch: float | None) -> str:
     return f"{local}（约{fmt_wait_duration(epoch - time.time())}后）"
 
 
+def is_service_unavailable_error(e: BaseException) -> bool:
+    """🔧 事务#2667：传输错误"服务不可用"分类（纯函数便于测试锁死语义）
+
+    ConnectError（连接被拒绝）/ ConnectTimeout（连接超时）/ RemoteProtocolError
+    （对端异常断开）三者语义等同：TCP连接无法建立或建立后被异常断开，服务进程
+    大概率已崩溃/关闭——本地provider（localhost）尤其如此，不存在"网络抖动"。
+
+    🔧 事务#2667根因：原分类漏掉ConnectTimeout。WSL2 NAT环境下宿主机服务关闭
+    时SYN包被丢弃（不回RST），表现为ConnectTimeout而非ConnectError（现场取证：
+    swift-qwen3.8-iq3关闭后，#2642/#2663连续65+次ConnectTimeout循环30分钟，
+    is_transient_error=True→failed=False→永不mark_failed/冷却/切换，直到人工
+    禁用provider才恢复）。ConnectTimeout归入服务不可用后走#2474路径：同provider
+    快速重试3次→全败→切换provider（mark_failed 30s冷却起步，服务恢复自动切回）。
+    云端provider偶发连接抖动由3次快速重试窗口兜底，3次全败才切换，风险可控。
+    """
+    return isinstance(
+        e, (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError)
+    )
+
+
 def extract_server_context_limit(err_msg: str) -> int | None:
     """从错误消息提取服务端声称的上下文窗口大小。
 
@@ -3950,7 +3970,7 @@ class ToolExecutionEngine:
         self._context_overflow_rounds: int = 0
         # 全provider失败等待重试的连续轮次计数（仅用于警告提示，不暂停事务）
         self._all_failed_rounds: int = 0
-        # 🔧 事务#2474：服务不可用(ConnectError/RemoteProtocolError)同provider重试
+        # 🔧 事务#2474：服务不可用(ConnectError/ConnectTimeout/RemoteProtocolError)同provider重试
         # 耗尽后待切换标志——重试期间chat_stream传failed=False保持同provider
         # （provider未被标记失败），若耗尽后仅靠retry>0推导failed则公共路径
         # sleep后continue回外层时retry已重置为0，get_provider(failed=False)会
@@ -4233,7 +4253,7 @@ class ToolExecutionEngine:
                 False  # 网络瞬时错误标志(ReadError等)：禁止切换provider，同provider重试
             )
             is_service_unavailable = (
-                False  # 🔧 事务#2474：服务不可用标志(ConnectError/RemoteProtocolError)：
+                False  # 🔧 事务#2474：服务不可用标志(ConnectError/ConnectTimeout/RemoteProtocolError)：
                 # 同provider重试期间传failed=False保持不切换，连续3次耗尽才切换
             )
             is_context_overflow = (
@@ -5054,12 +5074,14 @@ class ToolExecutionEngine:
                     self.exit_on_unexpected_status()
                     continue
                 except httpx.TransportError as e:
-                    # 网络传输错误分层处理（事务#2016/#2474）：
-                    # - ConnectError/RemoteProtocolError：无法建立连接/对端异常断开，
-                    #   可能是服务进程崩溃/重启（如本地sglang段错误自动重启），
-                    #   也可能只是瞬时网络闪断/对端偶发断开。🔧 事务#2474：先同
-                    #   provider快速重试3次（failed=False保持不切换，不mark_failed
-                    #   不冷却），连续3次重试均失败才置_provider_switch_pending，
+                    # 网络传输错误分层处理（事务#2016/#2474/#2667）：
+                    # - ConnectError/ConnectTimeout/RemoteProtocolError：无法建立
+                    #   连接/连接超时/对端异常断开，可能是服务进程崩溃/重启（如本地
+                    #   sglang段错误自动重启；WSL2 NAT下服务关闭SYN被丢弃表现为
+                    #   ConnectTimeout，事务#2667），也可能只是瞬时网络闪断/对端
+                    #   偶发断开。🔧 事务#2474：先同provider快速重试3次
+                    #   （failed=False保持不切换，不mark_failed不冷却），连续3次
+                    #   重试均失败才置_provider_switch_pending，
                     #   由外层"所有provider失败"分支按冷却等待后显式failed=True
                     #   切换provider（mark_failed自适应冷却+按优先级切换），
                     #   绝不无限死磕已崩溃的服务。
@@ -5069,6 +5091,9 @@ class ToolExecutionEngine:
                     #   形同虚设，一次RemoteProtocolError即触发💠已切换）
                     #   （#2016原行为：无限重试同一provider直到服务自行恢复，导致
                     #   事务在服务重启期间长时间卡在prefill状态）
+                    #   （#2667修复前：ConnectTimeout被漏分到下方"瞬时错误"分支，
+                    #   本地provider意外关闭后65+次ConnectTimeout死循环30分钟
+                    #   不切换，直到人工禁用provider）
                     # - 其他传输错误（ReadTimeout/ReadError/WriteError等）：多为网络
                     #   抖动，保持原策略：同provider重试5次，标记瞬时错误不切换provider。
                     retry += 1
@@ -5080,9 +5105,11 @@ class ToolExecutionEngine:
                         self.llm.error = f"{type(e).__name__}: {err_str}"
                     else:
                         self.llm.error = f"{type(e).__name__}"
-                    service_unavailable = isinstance(
-                        e, (httpx.ConnectError, httpx.RemoteProtocolError)
-                    )
+                    # 🔧 事务#2667：ConnectTimeout同样归入服务不可用——WSL2 NAT下
+                    # 服务关闭时SYN被丢弃（不回RST），表现为连接超时而非连接拒绝，
+                    # 语义等同"服务已死"。分类逻辑提取为is_service_unavailable_error
+                    # 纯函数（上方定义，测试锁死语义）。
+                    service_unavailable = is_service_unavailable_error(e)
                     # 🔧 事务#2474：重试期间保持同provider（chat_stream传failed=False，
                     # 不mark_failed不冷却），连续3次（max_retry=3）全失败才切换
                     is_service_unavailable = service_unavailable
@@ -5232,6 +5259,12 @@ class ToolExecutionEngine:
                     # 3轮耗尽（15次流全失败）说明服务器持续性故障，放弃5秒高频
                     # 死磕，落入下方公共provider失败等待路径（30-300秒长冷却+
                     # _all_failed_rounds计数+==5醒目警告，事务保活，恢复后自动继续）
+                    # 🔧 事务#2667：熔断还必须触发provider切换（_provider_switch_pending
+                    # =True→下次chat_stream failed=True→mark_failed+切换）。修复前
+                    # 熔断只改等待时长：transient路径从未mark_failed→无冷却记录→
+                    # get_min_cooldown_remaining()=0→公共路径"立刻重试"→get_provider
+                    # 复用current死provider→无限死循环（现场取证：#2642 65+次
+                    # ConnectTimeout循环30分钟，直到人工禁用provider）。
                     self._transient_rounds += 1
                     if self._transient_rounds >= 3:
                         _te_msg = (
@@ -5239,13 +5272,15 @@ class ToolExecutionEngine:
                             f"{ANSI_COLORS.get('bright_red')}"
                             f"事务#{task_id}网络瞬时错误持续断流（连续第{self._transient_rounds}轮耗尽，"
                             f"provider={self.llm.provider}，流均在收到内容前中断），停止5秒高频重试，"
-                            f"转入长冷却等待。请检查该provider服务状态（部署日志/网络）。"
-                            f"事务保持运行，冷却后自动重试。"
+                            f"标记该provider失败并切换其他provider。请检查该provider服务状态"
+                            f"（部署日志/网络）。事务保持运行，切换后自动继续；无其他可用provider"
+                            f"时按冷却等待后重试。"
                             f"{ANSI_COLORS.get('reset')}\n"
                         )
                         logger.error(
                             f"⛔ [ToolEngine] 事务#{task_id} 瞬时错误熔断"
-                            f"(连续{self._transient_rounds}轮耗尽)，转入公共provider失败等待路径"
+                            f"(连续{self._transient_rounds}轮耗尽)，置_provider_switch_pending"
+                            f"标记失败并切换provider，落入公共provider失败等待路径"
                         )
                         if self._should_report_system_error(_te_msg):
                             get_output_manager().write_output(
@@ -5253,6 +5288,10 @@ class ToolExecutionEngine:
                                 content=_te_msg,
                                 source="system",
                             )
+                        # 🔧 事务#2667：熔断必触发切换——置位后公共路径"立刻重试"
+                        # 中的下一次chat_stream会failed=True→mark_failed（30s冷却
+                        # 起步）+切换到可用provider；服务恢复后冷却到期自动切回
+                        self._provider_switch_pending = True
                         # 不continue：落入下方公共provider失败等待路径
                     else:
                         logger.info(

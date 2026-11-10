@@ -223,19 +223,44 @@ class PrefillTracker:
                 return
 
             stop_event = threading.Event()
+            # 🔧 事务#2667：连接门控——收到响应头（连接真实建立）后才置位。
+            # 连接阶段（ConnectTimeout等满timeout_connect恰达提示阈值）显示
+            # "prefill中"是误导：本地provider关闭时每轮重试刷一条假进度，
+            # 掩盖"服务已死、连接从未建立"的真相
+            connected_event = threading.Event()
             thread = threading.Thread(
                 target=self._track_loop,
-                args=(task_id, est_tokens, provider, compact_threshold, stop_event),
+                args=(task_id, est_tokens, provider, compact_threshold, stop_event, connected_event),
                 daemon=True,
                 name=f"prefill-tracker-{task_id}",
             )
-            self._active[task_id] = {"thread": thread, "stop_event": stop_event}
+            self._active[task_id] = {
+                "thread": thread,
+                "stop_event": stop_event,
+                "connected": connected_event,
+            }
 
             # 注意：不立即写状态文件/输出提示——prefill超过 PREFILL_OUTPUT_MIN_ELAPSED
             # 秒才开始提示（事务#1866：立即提示导致每次请求都出现"已等待0秒"，刷屏）。
             # 心跳保护不受影响：_track_loop 从第5秒起持续刷新事务心跳。
 
             thread.start()
+
+    def mark_connected(self, task_id: int | None) -> None:
+        """标记连接已建立（收到响应头）——之后才显示"prefill中"提示（事务#2667）
+
+        client.py 的 _sse_reader 在响应头到达且状态码<300时调用。连接阶段
+        （TCP未建立/等待响应头）不写prefill状态文件/进度行——本地provider
+        关闭时 ConnectTimeout 等满 timeout_connect（默认30s）恰好达到
+        PREFILL_OUTPUT_MIN_ELAPSED 提示阈值，每轮重试刷一条"⏳ LLM prefill中
+        X%"假进度，掩盖"服务已死、连接从未建立"的真相。心跳保活不受影响。
+        """
+        if not task_id:
+            return
+        with self._lock:
+            entry = self._active.get(task_id)
+        if entry:
+            entry["connected"].set()
 
     def finish_request(self, task_id: int | None) -> None:
         """标记prefill阶段结束（首个chunk到达时调用）
@@ -267,8 +292,13 @@ class PrefillTracker:
         provider: str | None,
         compact_threshold: int | None,
         stop_event: threading.Event,
+        connected: threading.Event,
     ) -> None:
-        """后台追踪线程：定期更新心跳+写状态文件+写输出进度行"""
+        """后台追踪线程：定期更新心跳+写状态文件+写输出进度行
+
+        🔧 事务#2667：connected 未置位（响应头未到达）时只刷新心跳，不写
+        prefill状态文件/进度行——连接阶段的"prefill中"提示是误导。
+        """
         start_time = time.time()
         last_output_write = 0.0  # 0.0表示尚未写过输出进度行（首次达标即写）
         heartbeat_capped_logged = False  # 心跳续命达上限后仅告警一次
@@ -304,6 +334,14 @@ class PrefillTracker:
             # 2. prefill未超过PREFILL_OUTPUT_MIN_ELAPSED秒不提示（短请求无感知，
             #    避免"已等待0秒"刷屏）——状态文件与输出进度行同阈值
             if elapsed < PREFILL_OUTPUT_MIN_ELAPSED:
+                continue
+
+            # 🔧 事务#2667：连接未建立（响应头未到达）不写prefill状态/进度行。
+            # 连接阶段（ConnectTimeout等满timeout_connect恰达30秒提示阈值）
+            # 显示"prefill中"是误导——根本没有prefill发生，服务可能已死
+            # （本地provider关闭时每轮重试刷一条假进度掩盖真相）。心跳保活
+            # 照常（上方第1步），事务不会被误杀。
+            if not connected.is_set():
                 continue
 
             # 3. 写状态文件（webui/CLI读取显示百分比）
