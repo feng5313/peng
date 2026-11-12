@@ -2130,6 +2130,62 @@ class LLMConfig(BaseModel):
         self._set_failure_info(provider, info)
         self.save_failed_providers()
 
+    def rate_domain_for(self, provider: str) -> str:
+        """🔧 事务#2689：该provider的限流域key（同api_key+base_url归组为同一账户）"""
+        cfg = self.providers.get(provider)
+        if cfg is None:
+            return ""
+        try:
+            from peng.llm.rate_gate import rate_domain_key
+
+            return rate_domain_key(
+                {"base_url": cfg.base_url, "api_key": cfg.api_key, "provider": provider}
+            )
+        except Exception as e:  # pragma: no cover - 闸门模块不可用时不阻塞主流程
+            logger.debug(f"[LLMConfig] 限流域key计算失败(忽略): {provider}: {e}")
+            return ""
+
+    def providers_in_rate_domain(self, domain: str) -> list[str]:
+        """同限流域（同账户共享RPM配额池）内的启用provider（事务#2689）"""
+        if not domain:
+            return []
+        try:
+            from peng.llm.rate_gate import rate_domain_key
+        except Exception:  # pragma: no cover
+            return []
+        names: list[str] = []
+        for name, cfg in self.providers.items():
+            if not cfg.enable or cfg.is_vision_only():
+                continue
+            try:
+                if rate_domain_key(
+                    {"base_url": cfg.base_url, "api_key": cfg.api_key, "provider": name}
+                ) == domain:
+                    names.append(name)
+            except Exception:  # pragma: no cover
+                continue
+        return names
+
+    def mark_domain_blocked(
+        self, provider: str, until_ts: float | None, reason: str = "速率限制(429)"
+    ) -> list[str]:
+        """把与provider同限流域（同账户）的启用provider**一并**持久化硬阻塞（事务#2689）
+
+        现场取证：z-glm5.3 与 z-glm5.3-flash 共用同一api_key（同账户共享RPM池），
+        账户被速率限制后切换到 flash 必然再次429——切换同域provider毫无意义，
+        必须整域一起回避，只有其他账户的provider才可能拿到流量。
+        """
+        domain = self.rate_domain_for(provider)
+        names = self.providers_in_rate_domain(domain) if domain else [provider]
+        marked: list[str] = []
+        for name in names:
+            try:
+                self.mark_provider_blocked(name, until_ts, reason)
+                marked.append(name)
+            except Exception as e:
+                logger.debug(f"[LLMConfig] 同域硬阻塞标记失败(忽略): {name}: {e}")
+        return marked
+
     def get_icon(self, provider: str) -> str:
         v = self.providers.get(provider)
         if v:

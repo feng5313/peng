@@ -31,6 +31,7 @@ from peng.config import load_config
 from peng.config.loader import AllProvidersBlockedError, LLMConfig, ProviderConfig
 from peng.common.logging_config import setup_llm_logging, should_log
 from peng.llm.concurrency import acquire_llm_slots_handle
+from peng.llm.rate_gate import rate_domain_key
 from peng.llm.prefill_tracker import effective_stall_timeout, first_token_allowance_seconds
 
 logger = logging.getLogger(__name__)
@@ -656,6 +657,47 @@ class GLMClient:
         except Exception as e:
             logger.debug(f"[LLM Client] 并发等待提示输出失败(忽略): {e}")
 
+    def _notify_rate_wait(self, task_id: int | None, remaining: float, reason: str) -> None:
+        """限流闸门排队超过阈值时向事务输出打印提示（事务#2689：用户可见，
+        消除"卡死无输出"观感——旧实现429静默重试只写logger，UI毫无动静）"""
+        if not task_id:
+            return
+        try:
+            from peng.task.output_manager import get_output_manager
+
+            get_output_manager().write_output(
+                task_id=task_id,
+                source="system",
+                content=(
+                    f"⏳ {ANSI_COLORS['blue']} 大模型速率限制排队 {remaining:.0f}s"
+                    f"（同账户共享限流窗口，不再高频抢流量）"
+                    f"{f'：{reason}' if reason else ''}{ANSI_COLORS['reset']}\n"
+                ),
+            )
+        except Exception as e:
+            logger.debug(f"[LLM Client] 限流排队提示输出失败(忽略): {e}")
+
+    def _rate_interrupt(self, task_id: int | None) -> bool:
+        """限流排队期间检测控制信号/终态（事务#2689）：被取消/暂停时立刻放弃等待"""
+        if not task_id or not self.task_manager:
+            return False
+        try:
+            t = self.task_manager.db.get_task(task_id)
+            if t and t.get("status") in (
+                "cancelled",
+                "paused",
+                "interrupted",
+                "failed",
+                "completed",
+            ):
+                return True
+            controls = self.task_manager.db.get_unprocessed_task_controls()
+            if controls and any(c.get("task_id") == task_id for c in controls):
+                return True
+        except Exception as e:
+            logger.debug(f"[LLM Client] 限流等待中断检测失败(忽略): {e}")
+        return False
+
     def _error_signature(self, content: str) -> str:
         """生成报错的标准化签名（用于去重比较）"""
         import re
@@ -995,6 +1037,32 @@ class GLMClient:
         concurrency_specs = self._get_concurrency_specs(
             effective_model, current_small_model, self.provider
         )
+        # 🔧 事务#2689：跨进程限流闸门排队（同账户共享RPM池）——旧实现每个事务
+        # 各自0.5秒"抢流量"重试，被拒请求同样消耗账户配额窗口，多事务同时打满
+        # 形成活锁自锁（实测#2665/#2678/#2683连续数百次429无进展，且该路径不写
+        # 事务输出 ⇒ 风主看到"卡死无输出"）。排队放在并发槽位之前：等待期间
+        # 不占用 max_concurrent 槽位。
+        _rate_domain = rate_domain_key(provider_data)
+        self._rate_domain = _rate_domain
+        if _rate_domain:
+            try:
+                from peng.llm.rate_gate import get_rate_gate
+
+                _gate_wait = await get_rate_gate().acquire(
+                    _rate_domain,
+                    task_id=task_id,
+                    heartbeat_cb=lambda: self._slot_heartbeat(task_id),
+                    notice_cb=lambda rem, reason: self._notify_rate_wait(task_id, rem, reason),
+                    interrupt_cb=lambda: self._rate_interrupt(task_id),
+                )
+                if _gate_wait > 0:
+                    logger.info(
+                        f"[LLM Client] 事务#{task_id}限流排队{_gate_wait:.1f}s后发送请求"
+                        f"(provider={self.provider}, domain={_rate_domain})"
+                    )
+            except Exception as _rg_err:
+                logger.debug(f"[LLM Client] 限流闸门排队失败(忽略，不阻断请求): {_rg_err}")
+
         logger.debug(f"[LLM Client] 尝试获取并发槽位: {concurrency_specs}")
         # 槽位必须覆盖"请求发出 → SSE 流式读取结束"的完整窗口：chat_stream 的请求块
         # 位于函数体顶层缩进（见下方 try），无法包进 async with，因此用显式句柄并在
@@ -1335,6 +1403,16 @@ class GLMClient:
                             )
                         )
                         return
+                    # 🔧 事务#2689：响应头已到达且状态<300 ⇒ 服务端接受了本次请求
+                    # （429在响应头阶段抛出），据此清零限流退避状态恢复全速。
+                    # 只在真正被接受时清零，避免"重试也被拒"时误恢复全速抢流量。
+                    if _rate_domain:
+                        try:
+                            from peng.llm.rate_gate import get_rate_gate
+
+                            get_rate_gate().record_success(_rate_domain)
+                        except Exception as _rg_err:
+                            logger.debug(f"[LLM Client] 限流状态清零失败(忽略): {_rg_err}")
                     # 🔧 事务#2667：响应头已到达（连接真实建立、服务存活），
                     # 解除prefill提示门控。此前连接阶段不显示"prefill中"——
                     # 本地provider关闭时ConnectTimeout等满timeout_connect（30s）

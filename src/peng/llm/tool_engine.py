@@ -39,6 +39,7 @@ import json
 from peng.common.colors import ANSI_COLORS, colorize, get_colors
 from peng.config import get_agent_name, get_master_name, load_config
 from peng.config.loader import AllProvidersBlockedError, parse_quota_reset_time
+from peng.llm.rate_gate import RATE_GATE_MAX_WINDOW_SECONDS, get_rate_gate, rate_domain_key
 from peng.hooks.manager import HookManager
 from peng.llm.client import GLMClient, LLMError, StreamStallError, TaskCancelledError
 from peng.task.info import is_urgent_content
@@ -194,9 +195,46 @@ SERVER_CONTEXT_LIMIT_SANITY_FLOOR = 1024
 #: 中断信号，避免一次死等数小时期间错过配置热改/紧急info/额度提前恢复。
 QUOTA_WAIT_CHUNK_SECONDS = 3600
 
-#: 临时限流(429)带明确等待时长超过此值时改为硬阻塞等待（不再0.5秒高频抢流量）：
+#: 临时限流(429)带明确等待时长超过此值时改为硬阻塞等待（不再高频抢流量）：
 #: 服务端已声明"要等这么久"，高频空转只会烧token与时间
 RATE_LIMIT_HAMMER_MAX_SECONDS = 5.0
+
+# 🔧 事务#2689（消息#12863）：速率限制(RPM节流)特征关键词——必须**优先于**配额
+# 关键词判定。现场取证：智谱429响应 {"code":"1302","message":"您的账户已达到
+# 速率限制，请您控制请求频率"}，响应头无 retry-after/x-ratelimit（独立curl实测
+# 单独一次请求也429）——这是账户级速率限制，绝非额度耗尽。旧实现只用
+# quota_keywords("exceeded"/"limit reached")分类，英文"Rate limit exceeded"这类
+# 文案会被误判成配额耗尽并持久化硬阻塞整个provider（明明没到额度却被所有事务
+# 放弃），而中文"速率限制"文案则落入0.5秒高频抢流量路径（活锁自锁）。
+RATE_LIMIT_KEYWORDS = [
+    "速率限制",
+    "请求频率",
+    "请求过于频繁",
+    "频率限制",
+    "限流",
+    "rate limit",
+    "too many requests",
+    "ratelimit",
+    "throttl",
+    "requests per minute",
+    "per minute",
+    "rpm",
+    "tpm",
+]
+
+#: 同限流域连续重试轮数上限：超过则走公共路径（切换其他账户provider/长等待）
+RATE_LIMIT_RETRY_ROUNDS = 12
+
+
+def is_rate_limit_message(err_msg: str) -> bool:
+    """429是否为**速率限制**（RPM节流）而非配额耗尽（纯函数便于测试锁死语义）
+
+    事务#2689根因之一：配额关键词含"exceeded"/"limit reached"，英文限流文案
+    "Rate limit exceeded"命中后被当成额度耗尽→持久化硬阻塞provider。速率限制
+    是可恢复的短期节流，必须走跨进程闸门退避（llm/rate_gate.py），绝不当配额。
+    """
+    low = (err_msg or "").lower()
+    return any(k in low for k in RATE_LIMIT_KEYWORDS)
 
 
 def fmt_wait_duration(seconds: float) -> str:
@@ -2618,6 +2656,82 @@ class ToolExecutionEngine:
             logger.debug(f"[ToolEngine] 持久化额度硬阻塞标记失败(忽略): {provider}: {e}")
             return False
 
+    def _mark_rate_domain_blocked(self, until_epoch: float, reason: str) -> list[str]:
+        """🔧 事务#2689：持续速率限制升级——把**同限流域（同账户）**的启用provider
+        一并持久化硬阻塞（旧实现只标记当前provider，切换到同账户的flash必然再次429）
+
+        Returns:
+            被标记的provider名列表（配置缺失/异常时返回[]）
+        """
+        cfg = getattr(self.llm, "config", None)
+        provider = self.llm.provider or ""
+        if not provider or cfg is None:
+            return []
+        try:
+            marked = cfg.mark_domain_blocked(provider, until_epoch, reason)
+            if not marked:
+                # 域归组失败兜底：至少标记当前provider
+                self._mark_provider_blocked(until_epoch, reason)
+                marked = [provider]
+            logger.warning(
+                f"[ToolEngine] 事务#{self._task_id}限流域整体硬阻塞（同账户共享配额池）: "
+                f"{', '.join(marked)}，恢复时刻{quota_eta_text(until_epoch)}"
+            )
+            return marked
+        except Exception as e:
+            logger.debug(f"[ToolEngine] 同域硬阻塞标记失败(忽略): {e}")
+            self._mark_provider_blocked(until_epoch, reason)
+            return [provider]
+
+    def _rate_domain(self) -> str:
+        """🔧 事务#2689：当前provider的限流域key（同api_key+base_url归组）
+
+        同一账户的不同模型（如 z-glm5.3 与 z-glm5.3-flash 共用同一api_key）共享
+        一个RPM配额池，必须共享一个闸门——分开计数必然各自打满账户配额形成活锁。
+        """
+        cfg = getattr(self.llm, "provider_config", None)
+        if not isinstance(cfg, dict):
+            return ""
+        try:
+            return rate_domain_key(cfg)
+        except Exception as e:
+            logger.debug(f"[ToolEngine] 限流域key计算失败(忽略): {e}")
+            return ""
+
+    def _record_rate_throttle(self, reason: str, declared_wait: float | None) -> dict[str, Any]:
+        """🔧 事务#2689：把一次速率限制(429)登记到跨进程限流闸门
+
+        Returns:
+            闸门退避状态 {"interval","wait","count","until","throttled_total","escalate"}
+        """
+        domain = self._rate_domain()
+        if not domain:
+            # 无法归组（provider配置缺失）：保守按基础窗口退避，绝不放行高频试探
+            now = time.time()
+            return {
+                "interval": 1.0,
+                "wait": RATE_GATE_MAX_WINDOW_SECONDS,
+                "count": 0,
+                "until": now + RATE_GATE_MAX_WINDOW_SECONDS,
+                "throttled_total": 0.0,
+                "escalate": False,
+            }
+        try:
+            return get_rate_gate().record_throttle(
+                domain, reason=reason, declared_wait=declared_wait
+            )
+        except Exception as e:
+            logger.debug(f"[ToolEngine] 限流闸门登记失败(忽略): {e}")
+            now = time.time()
+            return {
+                "interval": 1.0,
+                "wait": RATE_GATE_MAX_WINDOW_SECONDS,
+                "count": 0,
+                "until": now + RATE_GATE_MAX_WINDOW_SECONDS,
+                "throttled_total": 0.0,
+                "escalate": False,
+            }
+
     def _has_pending_interrupts(self) -> bool:
         """
         检测事务是否有待处理的**控制信号**中断：
@@ -4858,6 +4972,10 @@ class ToolExecutionEngine:
                         _quota_reset_epoch, _quota_reset_src = parse_quota_reset_time(
                             err_msg, _resp_headers
                         )
+                        # 🔧 事务#2689：速率限制优先判定（见 is_rate_limit_message）——
+                        # 命中限流特征即确定为"短期节流"，绝不落入配额耗尽分支
+                        # （配额分支会持久化硬阻塞provider，明明没到额度却被放弃）
+                        _is_rate_limit_msg = is_rate_limit_message(err_msg)
                         # 检测配额耗尽特征（中英文关键词）
                         quota_keywords = [
                             "使用上限",
@@ -4873,7 +4991,7 @@ class ToolExecutionEngine:
                             "subscription",
                             "billing",
                         ]
-                        is_quota_exhausted = any(
+                        is_quota_exhausted = not _is_rate_limit_msg and any(
                             kw in err_msg.lower() for kw in [k.lower() for k in quota_keywords]
                         )
                         if is_quota_exhausted:
@@ -4924,12 +5042,62 @@ class ToolExecutionEngine:
                                     f"详情: {err_msg[:150]}\n"
                                 )
                             else:
-                                # 短暂限流：不冷却不切换，间隔0.5秒重试抢流量
-                                is_rate_limited = True
-                                logger.warning(
-                                    f"{icon} {self.llm.provider} 事务#{task_id}大模型API限流(429)。"
-                                    f"不冷却不切换，0.5秒后重试抢流量(第{retry}次) URL={url}\n"
+                                # 🔧 事务#2689：短暂限流由**跨进程限流闸门**调度退避
+                                # （llm/rate_gate.py），废除旧实现的"0.5秒后重试抢流量"——
+                                # 三个事务各自每0.5秒向同一账户发请求，被拒请求同样消耗
+                                # 账户RPM窗口 ⇒ 每分钟数百请求全落在注定被拒的试探上，
+                                # 活锁自锁永远抢不到流量；且该路径只写logger不写事务输出，
+                                # UI毫无动静（风主看到的"卡死无输出"）。
+                                # 发送时刻排队在 chat_stream 的 gate.acquire() 内统一执行，
+                                # 本处只登记被拒事件并按窗口/轮数决定是否升级。
+                                _gstate = self._record_rate_throttle(
+                                    f"{err_msg[:120] or 'HTTP 429'}", _wait_declared or None
                                 )
+                                _rl_eta = quota_eta_text(_gstate.get("until"))
+                                if _gstate.get("escalate") or retry >= RATE_LIMIT_RETRY_ROUNDS:
+                                    # 持续限流升级：本限流域内provider确定性不可用——持久化
+                                    # 硬阻塞并走公共路径切换**其他账户**provider（同账户的
+                                    # flash必然同样被限，切换它毫无意义）或等待窗口恢复。
+                                    is_rate_limited = False
+                                    _marked = self._mark_rate_domain_blocked(
+                                        _gstate.get("until", time.time()) + 15.0,
+                                        f"速率限制持续{int(_gstate.get('throttled_total', 0))}s（同账户共享配额池）",
+                                    )
+                                    _rl_msg = (
+                                        f"⛔  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                                        f"]{ANSI_COLORS.get('bright_yellow')}"
+                                        f"{icon} {self.llm.provider} 事务#{task_id}速率限制(429)持续"
+                                        f"{int(_gstate.get('throttled_total', 0))}s（连续被拒"
+                                        f"{_gstate.get('count', 0)}次），已持久化标记同账户限流域"
+                                        f"（{', '.join(_marked)}）：暂不尝试这些provider，"
+                                        f"恢复时刻{_rl_eta}，改用其他可用账户或等待。"
+                                        f"详情: {err_msg[:150]}{ANSI_COLORS.get('reset')}\n"
+                                    )
+                                    logger.warning(
+                                        f"{icon} {self.llm.provider} 事务#{task_id}速率限制(429)持续"
+                                        f"{int(_gstate.get('throttled_total', 0))}s（连续{_gstate.get('count', 0)}次）"
+                                        f"→升级硬阻塞限流域并走公共切换/等待路径。详情: {err_msg[:150]}\n"
+                                    )
+                                else:
+                                    is_rate_limited = True
+                                    _rl_msg = (
+                                        f"⏳  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                                        f"]{ANSI_COLORS.get('bright_yellow')}"
+                                        f"{icon} {self.llm.provider} 事务#{task_id}速率限制(429)"
+                                        f"（连续被拒{_gstate.get('count', 0)}次，非额度耗尽）："
+                                        f"同账户共享限流窗口，静默至{_rl_eta}后自动继续"
+                                        f"（不再高频抢流量）。详情: {err_msg[:150]}{ANSI_COLORS.get('reset')}\n"
+                                    )
+                                    logger.warning(
+                                        f"{icon} {self.llm.provider} 事务#{task_id}大模型API限流(429)。"
+                                        f"闸门退避：连续被拒{_gstate.get('count', 0)}次，"
+                                        f"窗口余{fmt_wait_duration(_gstate.get('wait', 0.0))}"
+                                        f"(第{retry}/{RATE_LIMIT_RETRY_ROUNDS}轮) URL={url}\n"
+                                    )
+                                if self._should_report_system_error(_rl_msg):
+                                    get_output_manager().write_output(
+                                        task_id=task_id, content=_rl_msg, source="system"
+                                    )
                     else:
                         is_rate_limited = False
                         # 🔧 事务#2002：检测400上下文长度超标：请求token数超过provider
@@ -5024,14 +5192,10 @@ class ToolExecutionEngine:
                             )
                     # 不可恢复的客户端错误(4xx)不应无限重试，最多重试2次后跳出
                     # 可恢复的服务端错误(5xx)最多重试5次
-                    # 429临时限流特殊处理：大幅增加重试次数（抢流量策略）
-                    # 🔧 事务#2666：429配额耗尽/声明较长等待→已持久化硬阻塞，
-                    #   _max_retry=0 首次失败即跳出（同一provider重试注定再次429）
-                    # 400内容审核：重试1次（_max_retry=2），之后由外层删除user输入继续
-                    # 🔧 事务#2002：400上下文长度超标：不切换provider，compact压缩
-                    # 上下文后重试（最多3次，外层每轮compact一次），仍失败则拒绝处理
+                    # 429临时限流：按限流域退避重试（🔧 事务#2689：轮数上限取代旧30次
+                    # 高频抢流量，耗尽后走公共路径切换其他账户provider/等待窗口恢复）
                     if status_code == 429 and is_rate_limited:
-                        _max_retry = 30
+                        _max_retry = RATE_LIMIT_RETRY_ROUNDS
                     elif status_code == 429 and not is_rate_limited:
                         # 🔧 事务#2666：额度状态已落盘为确定性硬阻塞时，立即跳出内层
                         # 重试循环——转公共路径按持久化状态切换其他可用provider，或
@@ -5068,9 +5232,11 @@ class ToolExecutionEngine:
                                 source="system",
                             )
                         break
-                    # 429限流：重试前等待0.5秒，避免疯狂空转
+                    # 🔧 事务#2689：429限流重试前不再固定0.5秒抢流量——发送时刻由
+                    # 跨进程限流闸门排队（chat_stream的gate.acquire）统一调度。
+                    # 无闸门归组信息时（provider配置缺失）给1秒兜底间隔防零间隔空转。
                     if is_rate_limited:
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.2 if self._rate_domain() else 1.0)
                     self.exit_on_unexpected_status()
                     continue
                 except httpx.TransportError as e:
@@ -5244,13 +5410,19 @@ class ToolExecutionEngine:
             # 此时不应继续处理空响应（会导致上下文被清空），而应等待provider恢复后重试。
             if not llm_finish:
                 if is_rate_limited:
-                    # 429限流：0.5秒间隔重试同一provider抢流量
+                    # 🔧 事务#2689：限流重试轮数耗尽后继续同一provider，由**跨进程
+                    # 限流闸门**排队决定发送时刻（指数退避 + 同账户串行），不再
+                    # 0.5秒高频抢流量；累计节流时长达阈值时 record_throttle 返回
+                    # escalate → 上方已转持久化硬阻塞走公共切换/等待路径。
                     logger.info(
-                        f"🔥 [ToolEngine] 事务#{task_id} 429限流重试耗尽，"
-                        f"0.5秒间隔继续抢流量！provider={self.llm.provider}"
+                        f"🔥 [ToolEngine] 事务#{task_id} 429限流重试轮数耗尽，"
+                        f"转限流闸门排队继续同一provider={self.llm.provider}"
                     )
-                    await asyncio.sleep(0.5)
-                    continue  # 回到外层 while True 循环，重试同一provider
+                    # 兜底限频：无闸门归组信息时（provider配置缺失）闸门不排队，
+                    # 此处给1秒间隔防外层零间隔空转（正常路径由闸门槽位决定发送时刻）
+                    if not self._rate_domain():
+                        await asyncio.sleep(1.0)
+                    continue  # 回到外层 while True 循环（chat_stream内按闸门槽位排队）
                 if is_transient_error:
                     # 🔧 事务#2235：网络瞬时错误无限死磕兜底——原实现5次重试
                     # 耗尽后sleep(5)+continue回外层无限重来（retry清零）。content
