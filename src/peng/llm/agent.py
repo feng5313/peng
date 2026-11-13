@@ -37,6 +37,35 @@ logger = logging.getLogger(__name__)
 # 获取颜色配置
 _COLORS = get_colors()
 
+# 🔧 事务#2694：WebUI xterm 工具结果回显最大行数（风主要求截断到10行以内）
+_DISPLAY_MAX_LINES = 10
+
+
+def _truncate_display_lines(display: Any, max_lines: int = _DISPLAY_MAX_LINES) -> Any:
+    """🔧 事务#2694：工具结果 xterm 回显截断——最多显示 max_lines 行
+
+    WebUI xterm 终端只用于人工观察事务进度，超长工具结果（read 全文 /
+    grep 海量匹配 / bash 长输出）整段回显纯属刷屏，淹没关键信息。
+    截断仅影响终端回显路径（executor.write_output → 输出文件 → xterm），
+    大模型仍通过 tool_engine 的 history.add_tool_result 收到完整 summary，
+    上下文能力不受任何影响。
+
+    - 超过 max_lines 行时：保留前 max_lines-1 行 + 1 行省略提示
+      （提示总行数/已截断，指向编辑器"输出全文"入口）
+    - 尾部追加 ANSI reset，防止截断残留的跨行颜色码泄漏污染后续输出
+    """
+    if not isinstance(display, str) or not display:
+        return display
+    lines = display.rstrip("\n").split("\n")
+    if len(lines) <= max_lines:
+        return display
+    kept = max_lines - 1  # 留 1 行给省略提示
+    notice = (
+        f"… [结果共 {len(lines)} 行，回显截断为前 {kept} 行；"
+        f"完整结果已提供给大模型，可用「输出全文」按钮查看] \x1b[0m"
+    )
+    return "\n".join(lines[:kept]) + "\n" + notice
+
 
 class AgentState(Enum):
     """Agent状态"""
@@ -578,7 +607,9 @@ class PengAgent:
 
             elif isinstance(event, ToolResultEvent):
                 tc = event.call
-                display = event.display  # DualOutput 的 display 部分（如 diff）
+                # 🔧 事务#2694：回显前截断——WebUI xterm 最多显示10行，
+                # 防止 read/grep/bash 超长结果刷屏（大模型仍收到完整 summary）
+                display = _truncate_display_lines(event.display)
                 # 输出工具结果摘要到 stdout
                 result_color = _COLORS.agent("result")
                 prompt = "📤 命令执行结果" if tc.name in ("bash", "cmd") else "📤 工具调用结果"
