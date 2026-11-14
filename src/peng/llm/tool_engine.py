@@ -4091,6 +4091,16 @@ class ToolExecutionEngine:
         # 直接复用健康的原provider，导致永不切换死循环。故耗尽break前置True，
         # 下一次chat_stream调用传failed=True显式触发mark_failed+切换后复位。
         self._provider_switch_pending: bool = False
+        # 🔧 事务#2695：SSE流停滞事务级熔断（禁止列表）——
+        # 背景事故：z-glm5.3对超大上下文(207K+多模态附件)请求流式中途停滞，
+        # 停滞路径is_transient_error=True→failed=False→不mark_failed无冷却；
+        # 而provider级failure_count被其他事务的小请求成功不断洗白重置，
+        # 冷却永远60秒→priority选中→停滞→耗尽→sleep(5)→再选中→死循环
+        # （#2693实测107次调用/28.38元零推进）。事务级禁止列表绕开全局状态
+        # 互相干扰：本事务确认"该provider对我的请求模式必然失败"后永不回头，
+        # 其他事务不受影响。provider成功服务本事务一次即清空（服务恢复自愈）。
+        self._stall_banned_providers: set[str] = set()
+        self._stall_breaker_rounds: int = 0
         # 🔧 事务#2235：网络瞬时错误(ReadError等)熔断计数——
         # _transient_rounds：内层5次重试耗尽的连续轮次（成功一次流即重置）。
         # content非空的断流在TransportError分支直接保留响应走正常收尾（不重试），
@@ -4464,6 +4474,13 @@ class ToolExecutionEngine:
                         thinking_mode=effective_thinking_override,
                         retry=retry,
                         failed=_failed_arg,
+                        # 🔧 事务#2695：事务级停滞熔断禁止列表（provider对本事务
+                        # 请求模式持续流中断时禁止选用，不影响其他事务）
+                        extra_forbidden=(
+                            list(self._stall_banned_providers)
+                            if self._stall_banned_providers
+                            else None
+                        ),
                     )
                     logger.debug("[ToolEngine] chat_stream调用成功，开始迭代")
                     # 每次LLM调用前更新定价（provider可能切换）
@@ -4811,6 +4828,24 @@ class ToolExecutionEngine:
                         logger.error(
                             f"🤖 事务#{task_id}SSE流停滞已重试{retry}次仍失败，跳出重试循环。"
                         )
+                        # 🔧 事务#2695：停滞重试轮次熔断——连续2轮（10次停滞）
+                        # 耗尽说明该provider对本事务的请求模式（上下文大小/附件）
+                        # 持续流中断，与其他事务的成功无关（全局failure_count会被
+                        # 小请求成功洗白，冷却机制对此无效）。加入本事务禁止列表
+                        # 强制fallback其他provider，且本事务不再回头。
+                        self._stall_breaker_rounds += 1
+                        if self._stall_breaker_rounds >= 2 and provider_name not in (
+                            "unknown",
+                            "",
+                        ):
+                            if provider_name not in self._stall_banned_providers:
+                                self._stall_banned_providers.add(provider_name)
+                                logger.warning(
+                                    f"🤖 事务#{task_id} provider={provider_name}连续"
+                                    f"{self._stall_breaker_rounds}轮SSE停滞耗尽，"
+                                    f"加入本事务禁止列表（事务级熔断，不影响其他事务），"
+                                    f"强制切换其他provider。"
+                                )
                         break
                     self.exit_on_unexpected_status()
                     continue
@@ -5404,6 +5439,15 @@ class ToolExecutionEngine:
                 # 🔧 事务#2289：流完整正常结束（非断流保留路径，断流保留的break
                 # 跳过本重置区），服务器已恢复，重置断流保留熔断计数
                 self._stream_kept_rounds = 0
+                # 🔧 事务#2695：流完整成功，重置停滞熔断计数；当前provider成功
+                # 服务本事务一次即从禁止列表移除（服务恢复自愈，允许重新尝试）
+                self._stall_breaker_rounds = 0
+                if self.llm.provider in self._stall_banned_providers:
+                    self._stall_banned_providers.discard(self.llm.provider)
+                    logger.info(
+                        f"🤖 事务#{task_id} provider={self.llm.provider}流完整成功，"
+                        f"从事务级停滞禁止列表移除（自愈）。"
+                    )
 
             # 如果重试循环因错误耗尽而break退出（llm_finish仍为False），
             # 说明所有provider都不可用（如全部被限流/冷却中）。

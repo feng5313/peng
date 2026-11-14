@@ -801,6 +801,7 @@ class GLMClient:
         thinking_budget: int | None = None,
         retry: int | None = None,
         failed: bool | None = None,
+        extra_forbidden: list[str] | None = None,
     ) -> AsyncGenerator[StreamChunk]:
         """
         流式调用 LLM
@@ -829,6 +830,12 @@ class GLMClient:
             favorite_providers = fetch_result[0] if fetch_result else None
             provider_locked = fetch_result[1] if fetch_result else False
             forbidden_providers = fetch_result[2] if fetch_result else None
+            # 🔧 事务#2695：合并事务级停滞熔断禁止列表（ToolEngine传入，
+            # 该provider对本事务请求模式持续流中断时禁止选用）
+            if extra_forbidden:
+                forbidden_providers = list(
+                    set(forbidden_providers or []) | set(extra_forbidden)
+                )
             # 多模态检测：事务内容/未读info包含 @file=<path>/[附件] 多模态引用时
             # 优先使用支持vision的provider（显式@provider指定优先级更高）
             prefer_vision = False
