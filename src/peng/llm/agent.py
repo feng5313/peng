@@ -652,9 +652,14 @@ class PengAgent:
                 # 🔧 事务#2694：回显前截断——WebUI xterm 最多显示10行，
                 # 防止 read/grep/bash 超长结果刷屏（大模型仍收到完整 summary；
                 # 全文落盘 tool-results/，提示行路径可点击查看）
-                display = _truncate_display_lines(
-                    event.display, task_id=task_id, tool_name=tc.name
-                )
+                # 🔧 事务#2694续2（风主要求）：checklist/report 的工具返回
+                # 不截断——二者是事务状态关键回执，完整性优先于防刷屏
+                if tc.name not in ("checklist", "report"):
+                    display = _truncate_display_lines(
+                        event.display, task_id=task_id, tool_name=tc.name
+                    )
+                else:
+                    display = event.display
                 # 输出工具结果摘要到 stdout
                 result_color = _COLORS.agent("result")
                 prompt = "📤 命令执行结果" if tc.name in ("bash", "cmd") else "📤 工具调用结果"
