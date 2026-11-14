@@ -41,7 +41,43 @@ _COLORS = get_colors()
 _DISPLAY_MAX_LINES = 10
 
 
-def _truncate_display_lines(display: Any, max_lines: int = _DISPLAY_MAX_LINES) -> Any:
+def _save_full_result(display: str, task_id: Any, tool_name: str) -> str | None:
+    """🔧 事务#2694续：超长工具结果全文落盘（data/output/tool-results/）
+
+    xterm 回显已截断，输出文件中也不含全文；将完整 display 写入
+    输出目录下的 tool-results 子目录（与 task-N.out 同目录同生命周期），
+    截断提示行引用该绝对路径——前端 convertFilePathsToLinks 自动将
+    路径转为 OSC8 可点击链接，风主点击即在编辑器中查看全文。
+
+    Returns:
+        落盘文件的绝对路径；失败返回 None（提示行降级为无路径文案）
+    """
+    try:
+        import re
+        import time as _time
+
+        from peng.task.output_manager import get_output_manager
+
+        base_dir = get_output_manager().get_output_file_path(task_id).parent
+        out_dir = base_dir / "tool-results"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_tool = re.sub(r"[^a-zA-Z0-9_-]", "_", str(tool_name))[:30] or "tool"
+        tid = task_id if task_id is not None else "adhoc"
+        fname = f"task-{tid}-{_time.strftime('%Y%m%d-%H%M%S')}-{int(_time.time() * 1000) % 1000:03d}-{safe_tool}.txt"
+        path = out_dir / fname
+        path.write_text(display, encoding="utf-8", errors="replace")
+        return str(path)
+    except Exception as e:
+        logging.getLogger(__name__).debug(f"工具结果全文落盘失败(降级为无路径提示): {e}")
+        return None
+
+
+def _truncate_display_lines(
+    display: Any,
+    max_lines: int = _DISPLAY_MAX_LINES,
+    task_id: Any = None,
+    tool_name: str = "",
+) -> Any:
     """🔧 事务#2694：工具结果 xterm 回显截断——最多显示 max_lines 行
 
     WebUI xterm 终端只用于人工观察事务进度，超长工具结果（read 全文 /
@@ -50,8 +86,9 @@ def _truncate_display_lines(display: Any, max_lines: int = _DISPLAY_MAX_LINES) -
     大模型仍通过 tool_engine 的 history.add_tool_result 收到完整 summary，
     上下文能力不受任何影响。
 
-    - 超过 max_lines 行时：保留前 max_lines-1 行 + 1 行省略提示
-      （提示总行数/已截断，指向编辑器"输出全文"入口）
+    - 超过 max_lines 行时：保留前 max_lines-1 行 + 1 行省略提示行
+    - 全文同步落盘 data/output/tool-results/，提示行含绝对路径
+      （xterm 中自动变为可点击链接，点击即打开编辑器查看全文）
     - 尾部追加 ANSI reset，防止截断残留的跨行颜色码泄漏污染后续输出
     """
     if not isinstance(display, str) or not display:
@@ -60,10 +97,15 @@ def _truncate_display_lines(display: Any, max_lines: int = _DISPLAY_MAX_LINES) -
     if len(lines) <= max_lines:
         return display
     kept = max_lines - 1  # 留 1 行给省略提示
-    notice = (
-        f"… [结果共 {len(lines)} 行，回显截断为前 {kept} 行；"
-        f"完整结果已提供给大模型，可用「输出全文」按钮查看] \x1b[0m"
-    )
+    saved_path = _save_full_result(display, task_id, tool_name)
+    if saved_path:
+        notice = (
+            f"… [结果共 {len(lines)} 行，回显截断为前 {kept} 行，全文已存: {saved_path} （点击路径查看；完整结果已提供给大模型）] \x1b[0m"
+        )
+    else:
+        notice = (
+            f"… [结果共 {len(lines)} 行，回显截断为前 {kept} 行；完整结果已提供给大模型] \x1b[0m"
+        )
     return "\n".join(lines[:kept]) + "\n" + notice
 
 
@@ -608,8 +650,11 @@ class PengAgent:
             elif isinstance(event, ToolResultEvent):
                 tc = event.call
                 # 🔧 事务#2694：回显前截断——WebUI xterm 最多显示10行，
-                # 防止 read/grep/bash 超长结果刷屏（大模型仍收到完整 summary）
-                display = _truncate_display_lines(event.display)
+                # 防止 read/grep/bash 超长结果刷屏（大模型仍收到完整 summary；
+                # 全文落盘 tool-results/，提示行路径可点击查看）
+                display = _truncate_display_lines(
+                    event.display, task_id=task_id, tool_name=tc.name
+                )
                 # 输出工具结果摘要到 stdout
                 result_color = _COLORS.agent("result")
                 prompt = "📤 命令执行结果" if tc.name in ("bash", "cmd") else "📤 工具调用结果"
