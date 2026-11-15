@@ -78,6 +78,8 @@ _MULTIMODAL_PART_ESTIMATED_TOKENS = 1000
 # 🔧 事务#1959：附件触发的vision provider切换最多服务的迭代数（含附件轮
 # 本身）。切换后第2个非附件迭代开始强制切回原provider，防止"没有出错就
 # 不切换"原则让事务长期滞留在flash等轻量vision模型上。
+# 🔧 事务#2728：窗口预算仅由"待发送附件part"刷新（prefer_vision_parts），
+# content中的历史文本引用不再锁死窗口。
 VISION_SWITCH_MAX_ROUNDS = 2
 
 
@@ -553,21 +555,27 @@ class GLMClient:
                 llm_logger = setup_llm_logging()
                 logger.warning(f"加载 LLM 日志配置失败：{e}\n{traceback.format_exc()}")
 
-    def _vision_window_advance(self, prefer_vision: bool) -> str | None:
-        """vision切换回退窗口每轮推进（事务#1959）
+    def _vision_window_advance(self, prefer_vision_parts: bool) -> str | None:
+        """vision切换回退窗口每轮推进（事务#1959；刷新判据修正于事务#2728）
 
         窗口开启（附件触发过vision切换）时按迭代计数推进：
-        - 本轮仍有附件（prefer_vision）：刷新预算（图片必须发给vision
-          provider，不能为回切而丢附件），不强制回切
-        - 本轮无附件：计数+1；达到 VISION_SWITCH_MAX_ROUNDS 后返回需强制
-          回切的原provider名
+        - 本轮仍有待发送附件part（prefer_vision_parts）：刷新预算（图片必须
+          发给vision provider，不能为回切而丢附件），不强制回切
+        - 本轮无待发送附件：计数+1；达到 VISION_SWITCH_MAX_ROUNDS 后返回需
+          强制回切的原provider名
+        - 🔧 事务#2728：刷新判据由"文本引用或附件part"改为**仅附件part**。
+          task.content中的@file=/[附件]文本引用永久存在，而附件发送后已被
+          strip_sent_attachments清除，旧判据把"引用文本仍在"误当作"本轮仍有
+          附件"，窗口预算每轮被刷新、永不回切（识别图片后永久滞留vision
+          provider的根因）。文本引用只负责首次切换与开窗
+          （_vision_window_on_selected用合并信号），不锁死窗口。
 
         Returns:
             需强制回切的原provider名；None=无需强制回切
         """
         if not self._vision_switch_from:
             return None
-        if prefer_vision:
+        if prefer_vision_parts:
             self._vision_switch_used = 0
             return None
         self._vision_switch_used += 1
@@ -838,7 +846,16 @@ class GLMClient:
                 )
             # 多模态检测：事务内容/未读info包含 @file=<path>/[附件] 多模态引用时
             # 优先使用支持vision的provider（显式@provider指定优先级更高）
+            # 🔧 事务#2728：拆分双信号——
+            #   prefer_vision        合并信号：驱动首切vision provider与开窗
+            #   prefer_vision_parts  真待发送附件part信号：唯一能刷新vision
+            #       回切窗口预算的判据（也是强制回切轮get_provider的prefer_vision值）
+            #   原因：task.content中的@file=/[附件]文本引用**永久存在**，而附件
+            #   发送成功后已被strip_sent_attachments清除（只发送一次机制）。
+            #   旧实现把"文本引用仍在"误当作"本轮仍有附件"，每轮刷新窗口预算，
+            #   导致vision切换后永不回切原provider（事务#1959机制失效）。
             prefer_vision = False
+            prefer_vision_parts = False
             mm_source = content or ""
             if task:
                 try:
@@ -865,17 +882,19 @@ class GLMClient:
             # 请求消息中已携带多模态附件part（read等工具结果附件，或上下文恢复的
             # 未发送附件）时必须使用vision provider，否则文本provider收到不支持的
             # 消息格式会报400并误触发该provider冷却
-            if not prefer_vision:
-                try:
-                    from peng.llm.multimodal import messages_have_attachment_parts
+            # 🔧 事务#2728：附件part检测独立执行（旧实现挂在`if not prefer_vision`
+            # 之后，文本引用命中时会漏检parts，导致窗口刷新判据失效）
+            try:
+                from peng.llm.multimodal import messages_have_attachment_parts
 
-                    if messages_have_attachment_parts(messages):
-                        prefer_vision = True
-                        logger.info(
-                            "[LLM Client] 检测到请求携带多模态附件，优先选择vision provider"
-                        )
-                except Exception as e:
-                    logger.debug(f"[LLM Client] 附件part检测失败(忽略): {e}")
+                if messages_have_attachment_parts(messages):
+                    prefer_vision = True
+                    prefer_vision_parts = True
+                    logger.info(
+                        "[LLM Client] 检测到请求携带多模态附件，优先选择vision provider"
+                    )
+            except Exception as e:
+                logger.debug(f"[LLM Client] 附件part检测失败(忽略): {e}")
             # failed 参数优先级：显式传入 > retry推断
             # 对于429限流错误，调用方可传 failed=False 来保持同一provider
             should_mark_failed = failed if failed is not None else (retry and retry > 0)
@@ -893,9 +912,12 @@ class GLMClient:
             # 🔧 事务#1959：vision切换回退窗口——附件触发的vision provider切换
             # 最多服务 VISION_SWITCH_MAX_ROUNDS 个迭代，之后必须切回原provider
             # （get_provider"没有出错就不切换"原则会让current一直复用vision
-            # provider，事务长期滞留flash等轻量模型）。本轮仍有附件时刷新预算
-            # （图片必须发给vision provider，不能为回切而丢附件）。
-            _vision_return_target = self._vision_window_advance(prefer_vision)
+            # provider，事务长期滞留flash等轻量模型）。本轮仍有**待发送附件part**
+            # 时刷新预算（图片必须发给vision provider，不能为回切而丢附件）。
+            # 🔧 事务#2728：刷新判据从合并prefer_vision改为仅prefer_vision_parts
+            # ——task.content中的文本引用永久存在，若据此刷新预算则窗口永不
+            # 到期（识别图片后永久滞留vision provider的根因）
+            _vision_return_target = self._vision_window_advance(prefer_vision_parts)
             prev_provider = self.provider
             # failed标记语义作用于"当前实际provider"，强制回切仅在成功路径
             # 覆盖current（失败路径按优先级重选即可达到回切效果）
@@ -909,7 +931,13 @@ class GLMClient:
                 task_id=task_id,
                 locked=provider_locked,
                 forbidden=forbidden_providers,
-                prefer_vision=prefer_vision,
+                # 🔧 事务#2728：强制回切轮必须传parts信号（该轮必然无待发送
+                # 附件，故为False）。若传合并prefer_vision，content中残留的
+                # 旧文本引用会让get_provider判定"current不支持多模态→切回
+                # vision provider"，回切被双重锁死
+                prefer_vision=(
+                    prefer_vision_parts if _vision_return_target else prefer_vision
+                ),
                 min_context_tokens=min_context_tokens,
             )
         else:
