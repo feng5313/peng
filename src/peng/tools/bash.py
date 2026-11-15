@@ -363,34 +363,61 @@ class BashTool(Tool):
     async def _handle_stop_builtin(self, command: str):
         """stop内置命令：停止daemon工具启动的后台进程（bash/daemon工具通用）
 
-        拦截规则：命令首词为 stop，且其余部分为空、纯daemon id列表（或all）。
-        避免误拦截真实shell命令：如 "stop; rm xx"、"stop && xx" 等不拦截。
-
-        Args:
-            command: 原始命令
+        拦截规则（事务#2729）：
+        1. 纯形式：命令整体为 stop [ids|all]（宽松id格式，原有行为）
+        2. 复合形式：stop <严格daemon id|all> [&|&&|;] <其余命令>
+           #2726实证高频写法"stop d5ef7 & 重启命令"——旧版不拦截时stop段被
+           当作远程shell命令执行（'stop'不是shell命令→报错不生效），daemon
+           没有被停止而后续命令照常执行，产生无人管理的残留进程。
+           复合形式要求id严格匹配 ^d[0-9a-fA-F]{4}$ 或单独all
+           （防止误拦真实shell命令，如"stop nginx & ..."）。
 
         Returns:
-            拦截返回DualOutput结果，未拦截返回None（继续正常执行）
+            (stop结果DualOutput, 剩余命令str|None)；未拦截返回None（继续正常执行）
         """
+        from peng.common.daemon_registry import stop_daemon_ids, stop_all_daemons
+
+        # 复合形式优先匹配：stop <ids> [&|&&|;] <tail>
+        m = re.match(
+            r"^\s*stop\s+([A-Za-z0-9_.\-]+(?:\s+[A-Za-z0-9_.\-]+)*)\s*(&&|&|;)\s*(.+)$",
+            command,
+            re.DOTALL,
+        )
+        if m:
+            ids = m.group(1).split()
+            tail = m.group(3).strip()
+            # 严格daemon id格式（d+4hex）或单独all才拦截（防误拦真实shell命令）
+            is_all = ids == ["all"]
+            strict_ids = all(re.fullmatch(r"[dD][0-9a-fA-F]{4}", i) for i in ids)
+            if is_all or strict_ids:
+                output = (
+                    await stop_all_daemons() if is_all else await stop_daemon_ids(ids)
+                )
+                return (
+                    DualOutput(summary=f"\n{output}", display=output),
+                    tail,
+                )
+            # 不满足严格格式：不拦截，按普通shell命令继续（后续纯形式也不匹配）
+            return None
+
+        # 纯形式：命令整体为 stop [ids|all]（宽松id格式，原有行为）
         m = re.match(r"^\s*stop(?:\s+(.+?))?\s*$", command)
         if not m:
             return None
         rest = (m.group(1) or "").strip()
 
-        from peng.common.daemon_registry import stop_daemon_ids, stop_all_daemons
-
         if not rest:
             usage = "用法: stop <daemon_id> [daemon_id2 ...] 或 stop all 清理全部daemon"
-            return DualOutput(summary=f"\n{usage}", display=usage)
+            return (DualOutput(summary=f"\n{usage}", display=usage), None)
         if rest == "all":
             output = await stop_all_daemons()
-            return DualOutput(summary=f"\n{output}", display=output)
+            return (DualOutput(summary=f"\n{output}", display=output), None)
         ids = rest.split()
         # 全部是纯id形式才拦截（防止误拦截真实shell命令）
         if not all(re.fullmatch(r"[A-Za-z0-9_.\-]+", i) for i in ids):
             return None
         output = await stop_daemon_ids(ids)
-        return DualOutput(summary=f"\n{output}", display=output)
+        return (DualOutput(summary=f"\n{output}", display=output), None)
 
     async def execute(self, **kwargs: Any) -> str:
         """执行shell命令（通过 nest 远程执行）"""
@@ -409,11 +436,27 @@ class BashTool(Tool):
         if not self._is_command_safe(command):
             raise ToolError("命令被拒绝：包含危险模式")
 
-        # 🔧 stop内置命令：停止daemon后台进程
-        stop_result = await self._handle_stop_builtin(command)
-        if stop_result is not None:
-            return stop_result
+        # 🔧 stop内置命令：停止daemon后台进程（事务#2729支持复合命令）
+        handled = await self._handle_stop_builtin(command)
+        if handled is not None:
+            stop_output, rest = handled
+            if not rest:
+                return stop_output
+            # 复合形式 "stop <ids> & <其余命令>"：先停止daemon，
+            # 剩余部分按本工具语义递归执行（bash=前台shell，daemon=后台启动）
+            rest_result = await self.execute(command=rest, timeout=timeout, purpose=purpose)
+            if isinstance(rest_result, DualOutput):
+                summary = (stop_output.summary or "") + "\n" + (rest_result.summary or "")
+                display = (stop_output.display or "") + "\n" + (rest_result.display or "")
+            else:
+                summary = (stop_output.summary or "") + "\n" + str(rest_result)
+                display = stop_output.display or ""
+            return DualOutput(summary=summary, display=display)
 
+        return await self._execute_shell(command, timeout, purpose)
+
+    async def _execute_shell(self, command: str, timeout: int, purpose: str) -> str:
+        """实际执行shell命令（sleep检查 + nest本地/远程分流）"""
         # 检查 sleep 时长
         sleep_error = self._check_sleep_duration(command)
         if sleep_error:
@@ -1611,10 +1654,21 @@ class DaemonTool(BashTool):
         if not self._is_command_safe(command):
             raise ToolError("命令被拒绝：包含危险模式")
 
-        # 🔧 stop内置命令：停止daemon后台进程
-        stop_result = await self._handle_stop_builtin(command)
-        if stop_result is not None:
-            return stop_result
+        # 🔧 stop内置命令：停止daemon后台进程（事务#2729支持复合命令：
+        # "stop <ids> & <长命令>" → 先停止daemon，剩余部分按daemon语义后台启动）
+        handled = await self._handle_stop_builtin(command)
+        if handled is not None:
+            stop_output, rest = handled
+            if not rest:
+                return stop_output
+            rest_result = await self.execute(command=rest, timeout=timeout, purpose=purpose)
+            if isinstance(rest_result, DualOutput):
+                summary = (stop_output.summary or "") + "\n" + (rest_result.summary or "")
+                display = (stop_output.display or "") + "\n" + (rest_result.display or "")
+            else:
+                summary = (stop_output.summary or "") + "\n" + str(rest_result)
+                display = stop_output.display or ""
+            return DualOutput(summary=summary, display=display)
 
         if not command.strip():
             raise ToolError("命令不能为空")
@@ -1641,7 +1695,7 @@ class DaemonTool(BashTool):
                 backup_info = self._backup_files_if_needed(command)
                 if backup_info:
                     logger.info(backup_info)
-                pid, log_file = dr.start_local_daemon(command, workdir, daemon_id)
+                pid, log_file, job_mode = dr.start_local_daemon(command, workdir, daemon_id)
                 entry = dr.register_daemon(
                     task_id=task_id,
                     command=command,
@@ -1651,13 +1705,14 @@ class DaemonTool(BashTool):
                     workdir=str(workdir) if workdir else None,
                     platform=platform,
                     daemon_id=daemon_id,
+                    job=job_mode,
                 )
             else:
                 # 远程nest：通过nest在远程机器启动daemon
                 client = self._get_nest_client()
                 if not client:
                     raise NestError(f"Nest '{nest_name}' 客户端不可用，无法远程启动daemon")
-                pid, log_file = await dr.start_remote_daemon(
+                pid, log_file, job_mode = await dr.start_remote_daemon(
                     client,
                     command=command,
                     workdir=workdir,
@@ -1675,6 +1730,7 @@ class DaemonTool(BashTool):
                     workdir=str(workdir) if workdir else None,
                     platform=platform,
                     daemon_id=daemon_id,
+                    job=job_mode,
                 )
         except ToolError:
             raise

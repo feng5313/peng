@@ -122,6 +122,7 @@ def register_daemon(
     workdir: str | None = None,
     platform: str | None = None,
     daemon_id: str | None = None,
+    job: bool = False,
 ) -> dict[str, Any]:
     """注册一个daemon进程
 
@@ -135,6 +136,8 @@ def register_daemon(
         platform: daemon所在机器平台（linux/darwin/windows）
         daemon_id: 指定daemon id（启动辅助函数已用该id生成日志文件名时必须传入，
                    保持id与日志文件名一致；默认自动生成）
+        job: Windows Job模式（宿主及全部后代绑入KILL_ON_JOB_CLOSE的Job，
+             stop杀宿主即连锁清杀所有孤儿后代；False=NOJOB降级/Unix）
 
     Returns:
         完整的daemon条目
@@ -154,6 +157,7 @@ def register_daemon(
         "log_file": log_file,
         "workdir": workdir,
         "platform": platform,
+        "job": bool(job),
         "start_time": time.time(),
     }
     data[daemon_id] = entry
@@ -551,9 +555,27 @@ def _kill_local_daemon(pid: int) -> tuple[bool, str]:
 
 
 def _build_remote_kill_command(pid: int, platform: str | None) -> str:
-    """构建远程杀daemon命令（杀进程及其子进程，并验证退出）"""
+    """构建远程杀daemon命令（杀进程及其子进程，并验证退出）
+
+    Windows（事务#2729修复）:
+    - 旧命令 "taskkill /PID {pid} /T /F & exit /b 0" 尾部的 "& exit /b 0"
+      强制退出码0，而 _parse_remote_kill_result 对Windows无ALIVE/DEAD验证
+      输出时按 exit_code==0 判定成功——导致 taskkill 无论成败（进程不存在/
+      权限不足/树断裂孤儿残留）一律谎报"已停止(远程)"
+    - 新命令: taskkill 杀树 + ping 延迟1秒（timeout 命令在 stdin 重定向的
+      非交互环境下报"输入重定向不支持"错误，改用 ping 计时）+ PowerShell
+      按 PID 验证存活并输出 ALIVE/DEAD 标记（解析协议 Linux 分支已用）
+    - Job 模式（启动端已绑 KILL_ON_JOB_CLOSE Job，见 start 端）下宿主 cmd
+      被杀时其持有的最后一个 job 句柄关闭，内核连锁清杀全部孤儿后代
+      （含 start /b 脱链进程）；NOJOB 降级模式验证宿主 PID 诚实报告
+    """
     if platform and "windows" in platform.lower():
-        return f"taskkill /PID {pid} /T /F & exit /b 0"
+        return (
+            f"taskkill /PID {pid} /T /F >nul 2>&1 & "
+            f"ping -n 2 127.0.0.1 >nul & "
+            f"powershell -NoProfile -NonInteractive -Command "
+            f"\"if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ 'ALIVE' }} else {{ 'DEAD' }}\""
+        )
     if platform and "linux" in platform.lower():
         # Linux: daemon是会话首进程（pgid==pid），负PID杀整组
         return (
@@ -853,26 +875,176 @@ def parse_exit_code(log_tail: str) -> int | None:
     return int(matches[-1]) if matches else None
 
 
-def _build_windows_start_ps(bat_file: str) -> str:
-    """构建 PowerShell Start-Process 启动脚本体（本地/远程通用）
+# ============================================================
+# Windows Job启动器（事务#2729：stop杀不净孤儿进程的根治）
+# ============================================================
+# 旧模式的缺陷：daemon宿主cmd.exe是唯一记录PID，taskkill /T 按PPID树杀后代；
+# 当用户命令含 start /b（后台派生）时宿主cmd提前退出，孙进程成为孤儿
+# （PPID链断裂），taskkill /T 杀不到，stop 谎报成功后残留进程继续运行
+# （#2726: 测试实例残留导致 install.bat LNK1104 exe被锁失败多次）。
+#
+# 根治：宿主cmd + 其全部后代绑入 Job（KILL_ON_JOB_CLOSE）。Job成员关系由
+# 内核按进程继承维护，孤儿进程也无法逃逸（Job未允许breakaway）。句柄链：
+#   powershell创建job → CREATE_SUSPENDED挂起创建宿主cmd（零竞态：宿主未执行
+#   任何代码，其后代必然继承Job）→ DuplicateHandle把job句柄复制进宿主进程
+#   → Assign入Job → ResumeThread → powershell退出（自己那份句柄关闭，
+#   宿主持有的副本维持job存活，不触发kill-on-close）。
+# 此后宿主无论正常退出还是被taskkill强杀，其句柄表被清理→job最后一个句柄
+# 关闭→内核自动杀掉Job内全部残余进程（含孤儿）。
+# DuplicateHandle失败时不Assign（否则powershell退出时自己那份就是最后句柄，
+# 会立即触发kill-on-close误杀daemon），降级NOJOB模式（行为同旧版）。
 
-    使用 PowerShell 而非 wmic：wmic 在 Win11 24H2+ 已移除，PowerShell 全版本可用。
-    Start-Process 启动的cmd父进程为本powershell（立即退出）→
-    断开与task进程的进程树链，task进程cancel的taskkill /T 不会波及daemon。
-    PID 经 stdout 输出回传。
+_WINDOWS_JOB_START_PS1 = r"""
+param([string]$BatFile)
+# peng daemon Windows Job launcher (#2729)
+# Wraps the daemon host cmd.exe and ALL its descendants into a Job with
+# KILL_ON_JOB_CLOSE. When the host exits (normally or killed by taskkill),
+# its job handle is closed, and the kernel kills every leftover descendant,
+# including orphan processes spawned via "start /b" (they cannot escape the
+# Job because breakaway is not allowed).
+# Output: PID=<n> and MODE=JOB or MODE=NOJOB (fallback without Job).
 
-    注意：脚本体内部只用单引号（远程经cmd外层双引号包裹时无嵌套转义问题）。
+$ErrorActionPreference = 'Stop'
+
+$src = @'
+using System;
+using System.Runtime.InteropServices;
+public static class PengJobStart {
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern IntPtr CreateJobObject(IntPtr a, string n);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool SetInformationJobObject(IntPtr h, int c, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION i, int len);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool AssignProcessToJobObject(IntPtr h, IntPtr p);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool DuplicateHandle(IntPtr sp, IntPtr sh, IntPtr tp, out IntPtr th, int access, bool inherit, int options);
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern bool CreateProcessW(IntPtr app, string cmd, IntPtr pa, IntPtr ta, bool inh, int flags, IntPtr env, IntPtr cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern uint ResumeThread(IntPtr t);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool CloseHandle(IntPtr h);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        public long PerProcessUserTimeLimit; public long PerJobUserTimeLimit;
+        public uint LimitFlags; public UIntPtr MinimumWorkingSetSize; public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit; public UIntPtr Affinity; public uint PriorityClass; public uint SchedulingClass;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct IO_COUNTERS {
+        public ulong ReadOperationCount; public ulong WriteOperationCount; public ulong OtherOperationCount;
+        public ulong ReadTransferCount; public ulong WriteTransferCount; public ulong OtherTransferCount;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit; public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed; public UIntPtr PeakJobMemoryUsed;
+    }
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+    public struct STARTUPINFO {
+        public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+        public int dwX; public int dwY; public int dwXSize; public int dwYSize;
+        public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute; public int dwFlags;
+        public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2;
+        public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_INFORMATION {
+        public IntPtr hProcess; public IntPtr hThread; public int dwProcessId; public int dwThreadId;
+    }
+}
+'@
+
+function Write-Result([int]$ProcId, [string]$Mode) {
+    Write-Output ("PID=" + $ProcId)
+    Write-Output ("MODE=" + $Mode)
+    exit 0
+}
+
+function Start-Fallback {
+    # NOJOB degraded mode: plain Start-Process (orphan descendants cannot be
+    # cleaned up automatically; stop falls back to taskkill /T behavior).
+    $p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', $BatFile -WindowStyle Hidden -PassThru
+    Write-Result $p.Id 'NOJOB'
+}
+
+try { Add-Type -TypeDefinition $src } catch { Start-Fallback }
+
+$job = [IntPtr]::Zero
+try {
+    $job = [PengJobStart]::CreateJobObject([IntPtr]::Zero, $null)
+    if ($job -eq [IntPtr]::Zero) { Start-Fallback }
+    $info = New-Object PengJobStart+JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    $info.BasicLimitInformation.LimitFlags = 0x2000
+    $null = [PengJobStart]::SetInformationJobObject($job, 9, [ref]$info, [System.Runtime.InteropServices.Marshal]::SizeOf($info))
+} catch { Start-Fallback }
+
+$si = New-Object PengJobStart+STARTUPINFO
+$si.cb = [System.Runtime.InteropServices.Marshal]::SizeOf($si)
+$pi = New-Object PengJobStart+PROCESS_INFORMATION
+$cmdline = 'cmd.exe /c "' + $BatFile + '"'
+# CREATE_NO_WINDOW(0x08000000) | CREATE_SUSPENDED(0x4)
+$created = $false
+try {
+    # Pass IntPtr.Zero as lpApplicationName and lpCurrentDirectory:
+    # PowerShell marshals a $null STRING ARGUMENT into an EMPTY STRING, and
+    # an empty string as lpApplicationName/lpCurrentDirectory fails with
+    # ERROR_INVALID_NAME (123). IntPtr-typed params accept IntPtr.Zero cleanly.
+    # (Struct string FIELDS initialized to $null do marshal as null pointers,
+    # so STARTUPINFO's lpReserved/lpDesktop/lpTitle are safe as string.)
+    $created = [PengJobStart]::CreateProcessW([IntPtr]::Zero, $cmdline, [IntPtr]::Zero, [IntPtr]::Zero, $false, 0x800004, [IntPtr]::Zero, [IntPtr]::Zero, [ref]$si, [ref]$pi)
+} catch { $created = $false }
+if (-not $created) { Start-Fallback }
+
+$mode = 'NOJOB'
+try {
+    $dup = [IntPtr]::Zero
+    # Duplicate the job handle INTO the suspended host process FIRST, only
+    # then assign. If duplication fails we must not assign: with only our own
+    # handle left, this PowerShell exiting would trigger KILL_ON_JOB_CLOSE
+    # immediately and kill the daemon.
+    $dupOk = [PengJobStart]::DuplicateHandle([PengJobStart]::GetCurrentProcess(), $job, $pi.hProcess, [ref]$dup, 0, $false, 2)
+    if ($dupOk) {
+        if ([PengJobStart]::AssignProcessToJobObject($job, $pi.hProcess)) { $mode = 'JOB' }
+    } else {
+        $null = [PengJobStart]::CloseHandle($job)
+    }
+} catch { }
+
+$null = [PengJobStart]::ResumeThread($pi.hThread)
+$null = [PengJobStart]::CloseHandle($pi.hThread)
+$null = [PengJobStart]::CloseHandle($pi.hProcess)
+Write-Result $pi.dwProcessId $mode
+"""
+
+
+def _windows_daemon_ps1_file(log_dir: str) -> str:
+    """Job启动器ps1文件路径（各daemon日志目录共用一份，幂等覆盖写）"""
+    import ntpath
+
+    return ntpath.join(log_dir, "daemon_start.ps1")
+
+
+def _parse_windows_daemon_start_output(stdout: str) -> tuple[int | None, bool]:
+    """解析Windows Job启动器输出 → (pid, job_mode)
+
+    输出协议（_WINDOWS_JOB_START_PS1）: "PID=<n>" + "MODE=JOB|NOJOB"
+    MODE缺省视为NOJOB（降级，行为同旧版）
     """
-    return (
-        "$p = Start-Process -FilePath 'cmd.exe' "
-        f"-ArgumentList '/c','{bat_file}' "
-        "-WindowStyle Hidden -PassThru; Write-Output $p.Id"
-    )
+    m_pid = re.search(r"PID=(\d+)", stdout or "")
+    m_mode = re.search(r"MODE=(JOB|NOJOB)", stdout or "")
+    pid = int(m_pid.group(1)) if m_pid else None
+    job = bool(m_mode and m_mode.group(1) == "JOB")
+    return pid, job
 
 
 def start_local_daemon(
     command: str, workdir: str | Path | None, daemon_id: str
-) -> tuple[int, str]:
+) -> tuple[int, str, bool]:
     """本地启动非阻塞daemon进程（与task进程完全脱钩）
 
     🔒 daemon进程不跟随task进程结束！只能自行结束或stop/kill结束。
@@ -880,9 +1052,11 @@ def start_local_daemon(
     - POSIX: 中间bash执行 "setsid nohup ... & echo $!" 后立即退出并reparent：
       daemon经setsid自成会话首进程，被init收养。
       task进程cancel时的kill_tree递归收集/proc/children不再包含daemon。
-    - Windows: bat包装daemon命令 + PowerShell Start-Process创建（wmic在Win11 24H2+已移除）；
-      启动的cmd父进程为powershell（立即退出），断开与task进程的进程树链，
-      taskkill /T 不会波及daemon。
+    - Windows（事务#2729改造）: bat包装daemon命令 + Job启动器ps1创建宿主cmd
+      并绑入KILL_ON_JOB_CLOSE的Job（宿主及其全部后代含start /b孤儿均无法
+      逃逸；宿主退出/被杀时内核自动清杀Job内全部残余进程）；
+      Job创建失败时降级NOJOB（Start-Process，行为同旧版，孤儿无法自动清理）。
+      宿主cmd父进程为powershell（立即退出），断开与task进程的进程树链。
 
     Args:
         command: 要运行的命令
@@ -890,7 +1064,8 @@ def start_local_daemon(
         daemon_id: daemon id（用于日志文件名）
 
     Returns:
-        (pid, log_file绝对路径)
+        (pid, log_file绝对路径, job_mode)——job_mode=True表示已绑Job
+        （stop杀宿主即连锁清杀全部后代），False为NOJOB降级模式
 
     Raises:
         OSError: 启动失败
@@ -900,6 +1075,7 @@ def start_local_daemon(
     log_dir, log_file = _log_paths(workdir, daemon_id)
     Path(log_dir).mkdir(parents=True, exist_ok=True)
 
+    job_mode = False
     if sys.platform == "win32":
         bat_file = Path(log_dir) / f"daemon_{daemon_id}.bat"
         inner_file = Path(log_dir) / f"daemon_{daemon_id}_cmd.bat"
@@ -908,24 +1084,29 @@ def start_local_daemon(
         )
         inner_file.write_text(inner, encoding="utf-8")
         bat_file.write_text(outer, encoding="utf-8")
-        # PowerShell Start-Process（wmic在Win11 24H2+已移除）
-        # list形式传参：无cmd引号转义问题
+        # Job启动器（wmic在Win11 24H2+已移除，PowerShell全版本可用）。
+        # ps1写文件后以-File执行：长脚本不经cmd命令行（8191字符限制+引号
+        # 转义地狱），list形式传参无转义问题；Add-Type首次编译约1-2秒，
+        # timeout放宽到60秒
+        ps1_file = _windows_daemon_ps1_file(str(log_dir))
+        Path(ps1_file).write_text(_WINDOWS_JOB_START_PS1, encoding="ascii")
         result = subprocess.run(
             [
-                "powershell", "-NoProfile", "-NonInteractive", "-Command",
-                _build_windows_start_ps(str(bat_file)),
+                "powershell", "-NoProfile", "-NonInteractive",
+                "-ExecutionPolicy", "Bypass",
+                "-File", ps1_file, "-BatFile", str(bat_file),
             ],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=120,  # Add-Type首次编译冷启动可达30s+（杀软扫描），给足余量
         )
-        m = re.search(r"^\s*(\d+)\s*$", result.stdout, re.MULTILINE)
-        if result.returncode != 0 or not m:
+        out = (result.stdout or "") + "\n" + (result.stderr or "")
+        pid, job_mode = _parse_windows_daemon_start_output(out)
+        if result.returncode != 0 or pid is None:
             raise OSError(
                 f"PowerShell启动daemon失败(rc={result.returncode}): "
                 f"{result.stdout[:200]} {result.stderr[:200]}"
             )
-        pid = int(m.group(1))
     else:
         inner = shlex.quote(wrap_command_with_exit_code(command, log_file))
         # setsid使daemon自成会话首进程（非交互shell下$!即最终PID）
@@ -967,8 +1148,10 @@ def start_local_daemon(
                 break  # 进程已退出（短命命令）
             time.sleep(0.05)
 
-    logger.info(f"daemon {daemon_id} 本地启动: pid={pid}, cmd={command[:100]}, log={log_file}")
-    return pid, str(Path(log_file).resolve())
+    logger.info(
+        f"daemon {daemon_id} 本地启动: pid={pid}, job={job_mode}, cmd={command[:100]}, log={log_file}"
+    )
+    return pid, str(Path(log_file).resolve()), job_mode
 
 
 async def start_remote_daemon(
@@ -979,11 +1162,14 @@ async def start_remote_daemon(
     is_windows: bool = False,
     platform: str | None = None,
     timeout: int = 30000,
-) -> tuple[int, str]:
+) -> tuple[int, str, bool]:
     """通过nest远程启动非阻塞daemon进程
 
     Unix远程: setsid nohup bash -c 'cmd' >> log 2>&1 & echo DAEMON_PID=$!
-    Windows远程: PowerShell Start-Process -PassThru（返回PID）
+    Windows远程（事务#2729改造）: Job启动器ps1创建宿主cmd并绑入
+    KILL_ON_JOB_CLOSE的Job（宿主及全部后代含start /b孤儿无法逃逸，
+    宿主退出/被杀时内核自动清杀Job内全部残余）；Job失败降级NOJOB
+    （Start-Process，行为同旧版）
 
     Args:
         client: nest客户端（已set_nest_name）
@@ -995,7 +1181,7 @@ async def start_remote_daemon(
         timeout: 启动命令超时（毫秒）
 
     Returns:
-        (远程pid, 远程日志文件路径)
+        (远程pid, 远程日志文件路径, job_mode)——job_mode=True表示已绑Job
 
     Raises:
         ToolError: 启动失败或无法解析PID
@@ -1004,7 +1190,7 @@ async def start_remote_daemon(
 
     if is_windows or (platform or "").lower().startswith("win"):
         # Windows远程：用户命令原样写入inner.bat（零转义），outer.bat调用并
-        # 捕获退出码（经nest write_file写bat），PowerShell Start-Process启动
+        # 捕获退出码（经nest write_file写bat），Job启动器ps1启动
         # （wmic在Win11 24H2+已移除，PowerShell全版本可用）
         wd = workdir or "%CD%"
         log_dir = f"{wd}\\.peng\\daemon"
@@ -1013,28 +1199,35 @@ async def start_remote_daemon(
         inner_file = f"{log_dir}\\daemon_{daemon_id}_cmd.bat"
 
         outer, inner = _build_windows_daemon_bats(command, workdir, log_file, inner_file)
+        ps1_file = _windows_daemon_ps1_file(log_dir)
         try:
             await client.write_file(inner_file, inner)
             await client.write_file(bat_file, outer)
+            # ps1写文件后以-File执行：长脚本不经cmd命令行（8191字符限制+引号转义地狱）
+            await client.write_file(ps1_file, _WINDOWS_JOB_START_PS1)
         except Exception as e:
             from peng.tools.base import ToolError
 
-            raise ToolError(f"远程写入daemon bat失败: {e}") from e
+            raise ToolError(f"远程写入daemon启动文件失败: {e}") from e
 
-        # cmd外层双引号包PS命令体，PS体内部全单引号（无嵌套转义问题；cmd不解析$变量）
-        ps_body = _build_windows_start_ps(bat_file)
-        start_cmd = f'powershell -NoProfile -NonInteractive -Command "{ps_body}"'
-        result = await client.bash(command=start_cmd, cwd=workdir, timeout=timeout)
-        stdout = result.get("stdout", "") or ""
-        m = re.search(r"^\s*(\d+)\s*$", stdout, re.MULTILINE)
-        if not m:
+        start_cmd = (
+            f'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass '
+            f'-File "{ps1_file}" -BatFile "{bat_file}"'
+        )
+        # ps1含Add-Type首次编译（实测冷启动可达30s+，受杀软扫描影响），
+        # 执行超时取max(启动timeout, 120s)防误杀启动器
+        ps_timeout = max(timeout, 120000)
+        result = await client.bash(command=start_cmd, cwd=workdir, timeout=ps_timeout)
+        stdout = (result.get("stdout", "") or "") + "\n" + (result.get("stderr", "") or "")
+        pid, job_mode = _parse_windows_daemon_start_output(stdout)
+        if pid is None:
             from peng.tools.base import ToolError
 
             raise ToolError(
                 f"远程daemon启动失败（无法解析PowerShell输出的PID）: {stdout[:200]} "
                 f"{result.get('stderr', '')[:200]}"
             )
-        return int(m.group(1)), log_file
+        return pid, log_file, job_mode
 
     # Unix远程
     wd = workdir or "."
@@ -1072,7 +1265,8 @@ async def start_remote_daemon(
             f"远程daemon启动失败（无法解析DAEMON_PID）: {stdout[:200]} "
             f"{result.get('stderr', '')[:200]}"
         )
-    return int(m.group(1)), log_file
+    # Unix无Job概念（False）：Linux依赖setsid进程组杀整组，macOS用kill+pkill -P
+    return int(m.group(1)), log_file, False
 
 
 # ============================================================

@@ -120,7 +120,7 @@ class TestStartLocalDaemon:
         cmd = "echo daemon-started; sleep 300"
 
         t0 = time.time()
-        pid, log_file = dr.start_local_daemon(cmd, workdir, "dtest01")
+        pid, log_file, _job = dr.start_local_daemon(cmd, workdir, "dtest01")
         elapsed = time.time() - t0
         # 非阻塞：立即返回
         assert elapsed < 5, f"daemon启动阻塞了 {elapsed:.1f}s"
@@ -156,7 +156,7 @@ class TestStartLocalDaemon:
         workdir.mkdir()
         # daemon bash 启动一个子sleep
         cmd = "sleep 300 & echo CHILD=$!; sleep 300"
-        pid, log_file = dr.start_local_daemon(cmd, workdir, "dtest02")
+        pid, log_file, _job = dr.start_local_daemon(cmd, workdir, "dtest02")
         try:
             for _ in range(30):
                 content = Path(log_file).read_text()
@@ -187,7 +187,7 @@ class TestStopBuiltinLogic:
     def test_stop_daemon_ids(self, tmp_path):
         workdir = tmp_path / "wd"
         workdir.mkdir()
-        pid, log_file = dr.start_local_daemon("sleep 300", workdir, "dtest03")
+        pid, log_file, _job = dr.start_local_daemon("sleep 300", workdir, "dtest03")
         entry = dr.register_daemon(
             task_id=7, command="sleep 300", pid=pid,
             log_file=log_file, workdir=str(workdir), platform=sys.platform,
@@ -211,7 +211,7 @@ class TestStopBuiltinLogic:
         entries = []
         try:
             for i in range(2):
-                pid, log_file = dr.start_local_daemon("sleep 300", workdir, f"dtest0{i}")
+                pid, log_file, _job = dr.start_local_daemon("sleep 300", workdir, f"dtest0{i}")
                 pids.append(pid)
                 entries.append(dr.register_daemon(
                     task_id=8, command="sleep 300", pid=pid, log_file=log_file,
@@ -243,21 +243,29 @@ class TestStopBuiltinIntercept:
     def test_intercepts_pure_ids(self, tool):
         result = asyncio.run(tool._handle_stop_builtin("stop d1a2b3"))
         assert result is not None
-        assert "d1a2b3" in result.summary
+        output, rest = result
+        assert rest is None
+        assert "d1a2b3" in output.summary
 
     def test_intercepts_multiple_ids(self, tool):
         result = asyncio.run(tool._handle_stop_builtin("stop d1 d2"))
         assert result is not None
-        assert "d1" in result.summary and "d2" in result.summary
+        output, rest = result
+        assert rest is None
+        assert "d1" in output.summary and "d2" in output.summary
 
     def test_intercepts_all(self, tool):
         result = asyncio.run(tool._handle_stop_builtin("stop all"))
         assert result is not None
+        output, rest = result
+        assert rest is None
 
     def test_intercepts_usage(self, tool):
         result = asyncio.run(tool._handle_stop_builtin("stop"))
         assert result is not None
-        assert "用法" in result.summary
+        output, rest = result
+        assert rest is None
+        assert "用法" in output.summary
 
     def test_no_intercept_shell_commands(self, tool):
         # 含shell元字符的命令不拦截（防误杀真实shell命令）
@@ -488,7 +496,7 @@ class TestSyncKillAPI:
     def test_kill_by_id(self, tmp_path):
         workdir = tmp_path / "wd"
         workdir.mkdir()
-        pid, log_file = dr.start_local_daemon("sleep 300", workdir, "dtest04")
+        pid, log_file, _job = dr.start_local_daemon("sleep 300", workdir, "dtest04")
         entry = dr.register_daemon(task_id=9, command="sleep 300", pid=pid, log_file=log_file)
         try:
             result = dr.kill_daemon_by_id_sync(entry["id"])
@@ -508,8 +516,8 @@ class TestSyncKillAPI:
     def test_kill_task_and_all(self, tmp_path):
         workdir = tmp_path / "wd"
         workdir.mkdir()
-        p1, l1 = dr.start_local_daemon("sleep 300", workdir, "dtest05")
-        p2, l2 = dr.start_local_daemon("sleep 300", workdir, "dtest06")
+        p1, l1, _j1 = dr.start_local_daemon("sleep 300", workdir, "dtest05")
+        p2, l2, _j2 = dr.start_local_daemon("sleep 300", workdir, "dtest06")
         e1 = dr.register_daemon(task_id=11, command="a", pid=p1, log_file=l1)
         e2 = dr.register_daemon(task_id=22, command="b", pid=p2, log_file=l2)
         try:
@@ -757,7 +765,7 @@ class TestExitCodeCapture:
             time.sleep(0.2)
 
     def test_local_daemon_exit_code(self, tmp_path):
-        pid, log_file = dr.start_local_daemon("echo capture-ok; exit 7", tmp_path, "dcap01")
+        pid, log_file, _job = dr.start_local_daemon("echo capture-ok; exit 7", tmp_path, "dcap01")
         self._wait_exit(pid)
         assert not _alive(pid)
         entry = {"id": "dcap01", "pid": pid, "nest": None, "log_file": log_file}
@@ -769,7 +777,7 @@ class TestExitCodeCapture:
     def test_exit_code_zero_and_one_boundaries(self, tmp_path):
         """退出码0/1边界：echo参数双引号包裹规避 '0>>'/'1>>' fd重定向歧义"""
         for expected, cmd in [(0, "echo ok"), (1, "echo bad >&2; exit 1")]:
-            pid, log_file = dr.start_local_daemon(cmd, tmp_path, f"dcap{expected}")
+            pid, log_file, _job = dr.start_local_daemon(cmd, tmp_path, f"dcap{expected}")
             self._wait_exit(pid)
             entry = {"id": f"dcap{expected}", "pid": pid, "nest": None, "log_file": log_file}
             ec, _ = asyncio.run(dr.read_daemon_exit_code(entry))
@@ -832,7 +840,7 @@ class TestExitWatcher:
         wd = tmp_path / "wd"
         wd.mkdir()
         cmd = "echo watcher-test-output; exit 3"
-        pid, log_file = dr.start_local_daemon(cmd, wd, "dwt01")
+        pid, log_file, _job = dr.start_local_daemon(cmd, wd, "dwt01")
         entry = dr.register_daemon(task_id=42, command=cmd, pid=pid, log_file=log_file)
 
         asyncio.run(tool._watch_daemon_exit(entry))
@@ -853,7 +861,7 @@ class TestExitWatcher:
         """stop移除条目 → watcher静默退出，不注入提醒"""
         wd = tmp_path / "wd"
         wd.mkdir()
-        pid, log_file = dr.start_local_daemon("sleep 60", wd, "dwt02")
+        pid, log_file, _job = dr.start_local_daemon("sleep 60", wd, "dwt02")
         entry = dr.register_daemon(task_id=42, command="sleep 60", pid=pid, log_file=log_file)
 
         async def scenario():
@@ -868,7 +876,7 @@ class TestExitWatcher:
     def test_start_exit_watcher_holds_ref(self, tmp_path, tool, injected):
         """_start_exit_watcher创建后台任务并纳入_exit_watchers集合，完成后自动移除"""
         cmd = "exit 0"
-        pid, log_file = dr.start_local_daemon(cmd, tmp_path, "dwt03")
+        pid, log_file, _job = dr.start_local_daemon(cmd, tmp_path, "dwt03")
         entry = dr.register_daemon(task_id=42, command=cmd, pid=pid, log_file=log_file)
 
         async def scenario():
