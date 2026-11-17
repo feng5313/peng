@@ -34,7 +34,6 @@ from typing import Any
 from peng.common.colors import get_bash_colors
 from peng.common.paths import *
 from peng.nest.protocol import NestError
-from peng.task.info import is_urgent_content
 from peng.tools.base import DualOutput, Tool, ToolError
 from peng.common.truncation import truncate_output
 
@@ -233,6 +232,10 @@ class BashTool(Tool):
     ):
         """中断监控协程：定期检查事务状态/info/根消息回复/Ctrl+C
 
+        实现已抽取为共享模块 peng.task.interrupt_monitor（事务#2751：新增的
+        sleep 工具需要同一套中断语义，禁止两处重复实现）。本方法保持原有
+        签名与返回契约不变。
+
         Args:
             task_manager: 事务管理器
             task_id: 当前事务ID
@@ -245,120 +248,11 @@ class BashTool(Tool):
         Returns:
             中断原因字符串，None表示未中断
         """
-        _last_known_reply_count = -1
-        # 🔧 事务#2064：检测间隔2秒→1秒（打断更及时）；所有同步DB查询经
-        # asyncio.to_thread+wait_for(5s)执行——DB瞬时卡顿（锁/网络）不再
-        # 阻塞事件循环导致监控协程僵死（00:32:27命令124秒未打断事故的
-        # 防御性根治：无论DB状态如何，监控循环永不卡死）
-        check_interval = 1
-        logger.info(
-            f"[interrupt_monitor] 事务#{task_id}命令中断监控已启动"
-            f"(interval={check_interval}s, check_all={check_all})"
+        from peng.task.interrupt_monitor import monitor_interrupts
+
+        return await monitor_interrupts(
+            task_manager, task_id, message_id, check_all=check_all, label="命令"
         )
-
-        async def _db_call(func, *args):
-            """同步DB查询线程化+5秒超时，防止卡死监控/事件循环"""
-            try:
-                return await asyncio.wait_for(
-                    asyncio.to_thread(func, *args), timeout=5.0
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"[interrupt_monitor] 事务#{task_id}DB查询超时5s(跳过本轮): {func.__name__}"
-                )
-                return None
-            except Exception as e:
-                logger.debug(f"[interrupt_monitor] 事务#{task_id}DB查询失败: {e}")
-                return None
-
-        while True:
-            await asyncio.sleep(check_interval)
-
-            # 条件1: 事务状态不再是 running/accepting（所有启用监控的命令都检查：
-            # cancel/pause等系统级控制操作必须立即响应，覆盖所有场景）
-            task = None
-            if task_manager and task_id:
-                task = await _db_call(task_manager.db.get_task, task_id)
-                if task:
-                    status = task.get("status")
-                    if status not in ("running", "accepting"):
-                        status_cn = task_manager.STATUS_CHINESE.get(status, status)
-                        return f"事务已被{status_cn}（状态: {status}），命令已终止。请立刻处理事务状态变更。"
-
-                # 条件2: info字段检查（优先级最高——用户紧急指示）
-                # check_all（含sleep命令，原有行为）：任何未读info都打断
-                # 否则（事务#1860）：仅感叹号开头的紧急未读info打断
-                try:
-                    if task is None:
-                        info_field = "[]"
-                    else:
-                        info_field = task.get("info", "[]") or "[]"
-                    from peng.task.info import parse_info_to_list_with_status, get_unread_info_items
-
-                    info_list = parse_info_to_list_with_status(info_field)
-                    unread_items = get_unread_info_items(info_list)
-                    if check_all:
-                        if unread_items:
-                            # 收集未读info内容
-                            info_contents = [item["content"] for item in unread_items]
-                            info_text = "\n".join(f"  - {c}" for c in info_contents)
-                            return f"收到info注入信息，命令已终止。请立刻处理：\n{info_text}"
-                    else:
-                        for item in unread_items:
-                            if is_urgent_content(item.get("content")):
-                                content = (item.get("content") or "").replace("\\n", "\n")
-                                return (
-                                    "收到感叹号开头的紧急info，命令已终止。请立刻处理：\n"
-                                    f"  - {content.strip()[:200]}"
-                                )
-                except Exception as e:
-                    logger.debug(f"[interrupt_monitor] 检查info字段失败: {e}")
-
-            # 条件3: 根消息有新回复
-            if message_id:
-                if check_all:
-                    # 原有行为：回复计数增加即打断
-                    try:
-                        from peng.message.database import MessageDatabase
-
-                        msg_db = MessageDatabase()
-                        reply_count = await _db_call(
-                            msg_db.get_reply_count, message_id
-                        )
-                        if (
-                            reply_count is not None
-                            and _last_known_reply_count >= 0
-                            and reply_count > _last_known_reply_count
-                        ):
-                            return f"根消息#{message_id}收到新回复（当前{reply_count}条），命令已终止。请立刻用message工具查看并处理。"
-                        if reply_count is not None:
-                            _last_known_reply_count = reply_count
-                    except Exception as e:
-                        logger.debug(f"[interrupt_monitor] 检查消息回复失败: {e}")
-                else:
-                    # 事务#1860：仅感叹号开头的紧急processing回复打断
-                    # （processing=未处理待注入，与 tool_engine._get_processing_messages
-                    #  消费语义一致，处理后标记done不会重复触发）
-                    try:
-                        from peng.config import get_agent_name
-                        from peng.message.database import MessageDatabase
-
-                        msg_db = MessageDatabase()
-                        replies = await _db_call(
-                            msg_db.get_processing_replies,
-                            message_id,
-                            get_agent_name(),
-                        )
-                        for reply in replies or []:
-                            if is_urgent_content(reply.get("content")):
-                                content = (reply.get("content") or "").replace("\\n", "\n")
-                                return (
-                                    f"根消息#{message_id}收到感叹号开头的紧急消息"
-                                    f"#{reply.get('id')} [{reply.get('sender')}]，"
-                                    f"命令已终止。请立刻处理：{content.strip()[:200]}"
-                                )
-                    except Exception as e:
-                        logger.debug(f"[interrupt_monitor] 检查紧急消息回复失败: {e}")
 
     async def _handle_stop_builtin(self, command: str):
         """stop内置命令：停止daemon工具启动的后台进程（bash/daemon工具通用）

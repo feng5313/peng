@@ -15,12 +15,15 @@
 其他功能：使用--help参数探索详细信息
 """
 
+import asyncio
 import logging
+import math
 import os
 import re
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -168,6 +171,39 @@ def _parse_progress(progress: Any) -> int | None:
     if negative:
         return 0  # 负值clamp为0
     return max(0, min(100, value))
+
+
+def _parse_seconds(value: Any) -> float | None:
+    """解析 seconds 参数为等待秒数（兼容 str/int/float，非法返回 None）。
+
+    容错：LLM 常写成 "30" / "30s" / "30 秒" / 5.5 —— 均解析为数值。
+    bool（int子类）/ None / 非数值字符串 / NaN / inf → 返回 None（调用方拒绝）。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        num = float(value)
+        return None if (math.isnan(num) or math.isinf(num)) else num
+    text = str(value).strip()
+    # 去掉单位后缀（"30s"/"30 sec"/"30 秒"），允许数字与单位间空白
+    text = re.sub(
+        r"\s*(?:s|sec|secs|second|seconds|秒)$", "", text, flags=re.IGNORECASE
+    ).strip()
+    try:
+        num = float(text)
+    except ValueError:
+        return None
+    return None if (math.isnan(num) or math.isinf(num)) else num
+
+
+def _normalize_reason(reason: Any) -> str:
+    """折叠 reason 参数中的 \\n 转义与首尾空白（长度校验由调用方做）。
+
+    非字符串/None → 返回空串（调用方按"缺失"拒绝）。
+    """
+    if not isinstance(reason, str):
+        return ""
+    return reason.replace("\\n", " ").strip()
 
 
 class ChecklistTool(Tool):
@@ -1030,3 +1066,239 @@ class TaskTool(Tool):
             summary=output,
             display=output,
         )
+
+
+class SleepTool(Tool):
+    """
+    事务等待工具（SleepTool，事务#2751）
+
+    等待指定秒数（最多5分钟=300秒）再继续，用于等待外部进度
+    （daemon 后台任务、编译、测试、远端服务就绪等），必须提供 reason 说明等待理由。
+
+    等待期间做三件事（缺一不可）：
+    1. 心跳保活：周期性调用 task_manager.update_heartbeat —— heartbeat_monitor
+       在"进程存活但心跳超过 default_heartbeat_timeout"（配置默认300s）时会强制
+       结束事务，静默等待正好踩中该判罚，因此必须由本工具自己刷新心跳。
+    2. 中断响应：复用共享中断监控 peng.task.interrupt_monitor（check_all=True，
+       与 bash 含 sleep 命令的原有语义一致）——事务被暂停/取消、收到未读 info、
+       根消息收到新回复时立刻结束等待，风主🍃的指示不会被等待吞掉。
+    3. 精确计时：按剩余时间分段 await asyncio.sleep，总时长不超发。
+    """
+
+    # 上限5分钟（风主指示）：更长的等待应改用 daemon 后台运行 + 轮询，
+    # 避免工具批次长时间阻塞（期间迭代无法推进，只能靠中断看门狗跳出）。
+    MAX_SLEEP_SECONDS = 300
+
+    # 心跳刷新节流上限（秒），与 bash 命令输出驱动心跳的5秒节流一致
+    HEARTBEAT_INTERVAL = 5.0
+
+    # reason 长度约束，与 bash purpose 的审计要求一致（4-200字符）
+    MIN_REASON_CHARS = 4
+    MAX_REASON_CHARS = 200
+
+    def __init__(self):
+        """初始化工具"""
+        super().__init__()
+
+    @property
+    def name(self) -> str:
+        return "sleep"
+
+    @property
+    def description(self) -> str:
+        return f"""事务等待工具（SleepTool）。
+
+等待指定秒数后再继续，用于等待外部进度（daemon后台任务、编译、测试、远端服务就绪等）。
+必须提供 reason 参数简明扼要地说明等待理由（4-200字符），否则将被拒绝执行！
+
+参数：
+- seconds：等待时长，单位秒（大于0，最多 {self.MAX_SLEEP_SECONDS} 秒=5分钟；支持小数如 5.5）
+- reason：等待理由（必填，4-200字符），例如"等待daemon编译完成"
+
+超过 {self.MAX_SLEEP_SECONDS} 秒会被拒绝：更长的等待请改用 daemon 工具后台运行命令，
+再轮询 task output / read 日志，不要长时间阻塞事务。
+
+等待期间自动保持事务心跳（不会被心跳超时误杀），并会因以下情况提前结束：
+- 事务被暂停/取消等状态变更
+- 收到 info 注入指示（任何未读 info）
+- 根消息收到新回复
+
+用法示例：
+1. sleep seconds=30 reason="等待daemon编译完成再检查产物"
+2. sleep seconds=5.5 reason="等待远端服务端口就绪后重试连接"
+"""
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "seconds": {
+                    "type": "number",
+                    "description": f"等待时长，单位秒（大于0，最多{self.MAX_SLEEP_SECONDS}秒=5分钟）。支持小数与字符串形式（30 / 5.5 / '30s'）",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": f"等待理由说明（必填，{self.MIN_REASON_CHARS}-{self.MAX_REASON_CHARS}字符）。例如：等待daemon训练日志出现epoch 10",
+                },
+            },
+            "required": ["seconds", "reason"],
+        }
+
+    async def _update_heartbeat_safe(self, task_manager: Any, task_id: int) -> bool:
+        """线程化刷新事务心跳（5秒超时；失败只记日志，绝不影响等待）"""
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(task_manager.update_heartbeat, task_id), timeout=5.0
+            )
+        except Exception as e:
+            logger.warning(f"[sleep] 事务#{task_id}心跳更新失败(继续等待): {e}")
+            return False
+
+    async def _resolve_heartbeat_interval(self, task_manager: Any, task_id: int) -> float:
+        """心跳刷新间隔：不超过5秒，且不大于事务 heartbeat_timeout 的1/4（下限1秒）。
+
+        依据事务的 heartbeat_timeout（NULL/0 时取配置默认值）动态收紧，保证等待
+        期间心跳刷新间隔远小于超时判罚窗口（主循环另有最多1秒的步进误差），
+        短超时事务（如小模型子事务）也能在静默等待中保持心跳不被误杀。
+        """
+        timeout_sec = 300
+        try:
+            task = await asyncio.wait_for(
+                asyncio.to_thread(task_manager.get_task, task_id), timeout=5.0
+            )
+            if task:
+                from peng.config.loader import get_default_heartbeat_timeout
+
+                timeout_sec = task.get("heartbeat_timeout") or get_default_heartbeat_timeout()
+        except Exception as e:
+            logger.debug(f"[sleep] 读取事务心跳超时失败(用默认{timeout_sec}s): {e}")
+        return max(1.0, min(self.HEARTBEAT_INTERVAL, float(timeout_sec) / 4.0))
+
+    async def execute(
+        self, seconds: Any = None, reason: Any = None, **kwargs
+    ) -> DualOutput:
+        """等待 seconds 秒（心跳保活 + 中断监控），返回等待结果。
+
+        Args:
+            seconds: 等待时长（单位秒，>0，最多 MAX_SLEEP_SECONDS）
+            reason: 等待理由（必填，4-200字符）
+        Returns:
+            DualOutput: 等待完成/提前中断的结果（拒绝时给出明确原因）
+        """
+        duration = _parse_seconds(seconds)
+        if duration is None or duration <= 0:
+            output = (
+                f"❌ sleep 参数 seconds 无效：{seconds!r}（需要大于0的秒数，"
+                f"最多 {self.MAX_SLEEP_SECONDS} 秒=5分钟）"
+            )
+            return DualOutput(summary=output, display=output)
+        if duration > self.MAX_SLEEP_SECONDS:
+            output = (
+                f"❌ sleep 时长 {duration} 秒超过限制（最多 {self.MAX_SLEEP_SECONDS} "
+                f"秒=5分钟）。更长的等待请改用 daemon 工具后台运行命令，再轮询 "
+                f"task output / read 日志。"
+            )
+            return DualOutput(summary=output, display=output)
+
+        normalized_reason = _normalize_reason(reason)
+        if not normalized_reason:
+            output = (
+                "❌ sleep 必须通过 reason 参数简明扼要地说明等待理由"
+                f"（{self.MIN_REASON_CHARS}-{self.MAX_REASON_CHARS}字符），本次被拒绝。"
+            )
+            return DualOutput(summary=output, display=output)
+        if (
+            len(normalized_reason) < self.MIN_REASON_CHARS
+            or len(normalized_reason) > self.MAX_REASON_CHARS
+        ):
+            output = (
+                f"❌ sleep 的 reason 长度 {len(normalized_reason)} 字符不符合要求"
+                f"（{self.MIN_REASON_CHARS}-{self.MAX_REASON_CHARS}字符），请简明扼要说明等待理由。"
+            )
+            return DualOutput(summary=output, display=output)
+
+        task_manager = self.get_context("task_manager")
+        task_id = self.get_context("task_id")
+        message_id = self.get_context("message_id")
+        has_task = bool(task_manager and task_id)
+
+        started = time.monotonic()
+        deadline = started + duration
+        hb_interval = (
+            await self._resolve_heartbeat_interval(task_manager, task_id)
+            if has_task
+            else self.HEARTBEAT_INTERVAL
+        )
+
+        # 等待起点立刻打一次心跳，之后按 hb_interval 节流刷新（静默等待期心跳不停摆）
+        next_hb = started
+        if has_task:
+            await self._update_heartbeat_safe(task_manager, task_id)
+
+        monitor_task = None
+        if has_task or message_id:
+            from peng.task.interrupt_monitor import monitor_interrupts
+
+            monitor_task = asyncio.ensure_future(
+                monitor_interrupts(
+                    task_manager, task_id, message_id, check_all=True, label="sleep等待"
+                )
+            )
+
+        logger.info(
+            f"[sleep] 事务#{task_id} 等待 {duration} 秒（理由：{normalized_reason}，"
+            f"心跳间隔 {hb_interval:.1f}s）"
+        )
+
+        interrupt_reason: str | None = None
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                # 1秒分段等待：心跳与中断结果都能及时被处理，最后一段精确收敛
+                await asyncio.sleep(min(remaining, 1.0))
+
+                now = time.monotonic()
+                if has_task and now - next_hb >= hb_interval:
+                    await self._update_heartbeat_safe(task_manager, task_id)
+                    next_hb = now
+
+                if monitor_task is not None and monitor_task.done():
+                    try:
+                        interrupt_reason = monitor_task.result()
+                    except asyncio.CancelledError:
+                        interrupt_reason = None
+                    except Exception as e:
+                        # 监控协程异常不应打断等待（心跳保活仍在主循环中）
+                        logger.warning(f"[sleep] 事务#{task_id}中断监控异常(继续等待): {e}")
+                        interrupt_reason = None
+                    monitor_task = None  # 监控已结束（返回原因或异常），不再重复检查
+                    if interrupt_reason:
+                        break
+        finally:
+            # 无论正常完成/中断/被上层cancel，都要收掉监控协程，避免残留任务
+            if monitor_task is not None:
+                monitor_task.cancel()
+                try:
+                    await monitor_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        elapsed = time.monotonic() - started
+        if interrupt_reason:
+            summary = (
+                f"⚠️ sleep 提前结束（已等待 {elapsed:.1f} 秒 / 计划 {duration} 秒，"
+                f"理由：{normalized_reason}）\n{interrupt_reason}"
+            )
+            display = f"{_ANSI['yellow']}{summary}{_ANSI['reset']}"
+        else:
+            hb_note = "等待期间事务心跳已刷新" if has_task else "无事务上下文（纯等待）"
+            summary = (
+                f"✅ sleep {duration} 秒等待完成（实际 {elapsed:.1f} 秒，{hb_note}，"
+                f"理由：{normalized_reason}）"
+            )
+            display = f"{_ANSI['bright_green']}{summary}{_ANSI['reset']}"
+        return DualOutput(summary=summary, display=display)
+
