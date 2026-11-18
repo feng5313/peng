@@ -627,6 +627,54 @@ class LocalExecutor:
             logger.error(f"保存workdir到nest.json失败: {e}\n{traceback.format_exc()}")
             return NestResponse.make_error(params.get("_request_id", ""), str(e))
 
+    # ==================== Daemon 启动（事务#2781） ====================
+
+    async def _handle_daemon_start(self, params: dict) -> NestResponse:
+        """原生启动daemon进程（毫秒级返回，与调用方进程树完全脱钩）
+
+        背景：旧的"bash跑PowerShell ps1"路径Add-Type每次重新csc.exe编译，
+        实测偶发2~9.5分钟卡顿（杀软扫描，事务#2778 daemon工具不返回根因）。
+        本处理器在服务端直接start_local_daemon：Windows用ctypes绑Job，
+        Unix用setsid，全程毫秒级。
+
+        params:
+            command: str - 要后台运行的命令
+            workdir: str - 工作目录（可选）
+            daemon_id: str - daemon id（日志文件名用）
+        """
+        from peng.common.daemon_registry import start_local_daemon
+
+        command = params.get("command", "")
+        workdir = params.get("workdir") or None
+        daemon_id = params.get("daemon_id", "")
+
+        # 安全检查（与bash同级：本质都是执行任意命令）
+        if self.security:
+            allowed, reason = self.security.check_command(command)
+            if not allowed:
+                return NestResponse.make_error(
+                    params.get("_request_id", ""), f"命令被安全策略拒绝: {reason}"
+                )
+
+        if not command or not daemon_id:
+            return NestResponse.make_error(
+                params.get("_request_id", ""), "缺少command/daemon_id参数"
+            )
+
+        try:
+            # 同步函数（Unix分支含最多5s的pgid就绪轮询），放线程池防阻塞事件循环
+            pid, log_file, job_mode = await asyncio.to_thread(
+                start_local_daemon, command, workdir, daemon_id
+            )
+        except Exception as e:
+            logger.error(f"daemon_start失败: {e}\n{traceback.format_exc()}")
+            return NestResponse.make_error(params.get("_request_id", ""), f"daemon启动失败: {e}")
+
+        return NestResponse.make_result(
+            params.get("_request_id", ""),
+            {"pid": pid, "log_file": log_file, "job": bool(job_mode)},
+        )
+
     # ==================== Shell 命令 ====================
 
     async def _handle_bash(self, params: dict) -> NestResponse | AsyncIterator[NestResponse]:

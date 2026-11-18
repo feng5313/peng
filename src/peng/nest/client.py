@@ -644,6 +644,36 @@ class _NestClientCompat:
             raise NestError(resp.error)
         return resp.data if resp and resp.data else {}
 
+    async def daemon_start(
+        self,
+        command: str,
+        workdir: str | None = None,
+        daemon_id: str = "",
+        timeout: int = 30000,
+        **kw,
+    ) -> dict:
+        """nest端原生启动daemon进程（事务#2781）
+
+        服务端直接用ctypes绑Job启动（Windows）/setsid（Unix），毫秒级返回，
+        替代旧的bash跑PowerShell ps1路径（Add-Type偶发分钟级卡顿）。
+
+        Returns:
+            {"pid": int, "log_file": str, "job": bool}
+        """
+        resp = await send_request(
+            "daemon_start",
+            {
+                "command": command,
+                "workdir": workdir or "",
+                "daemon_id": daemon_id,
+            },
+            timeout / 1000.0 + 10,
+            nest_name=self._nest_name,
+        )
+        if resp.error:
+            raise NestError(resp.error)
+        return resp.data if resp and resp.data else {}
+
     async def read_file(
         self, file_path: str, offset: int = 1, limit: int = 2000, **kw
     ) -> NestResponse:

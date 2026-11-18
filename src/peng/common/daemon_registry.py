@@ -1042,6 +1042,172 @@ def _parse_windows_daemon_start_output(stdout: str) -> tuple[int | None, bool]:
     return pid, job
 
 
+def _start_windows_daemon_native(bat_file: str, workdir: str | None) -> tuple[int, bool]:
+    """Windows原生Job启动（ctypes实现，事务#2781替代PowerShell ps1启动器）
+
+    🔧 背景事务#2778/#2781：旧ps1方案Add-Type每次新powershell进程都要
+    csc.exe重新编译（无磁盘缓存），实测偶发2~9.5分钟卡顿（杀软实时扫描
+    csc.exe/临时程序集+系统繁忙叠加，.peng/daemon下bat→log时间戳差为证），
+    期间daemon工具一直不返回。本实现零编译零外部进程，毫秒级完成。
+
+    流程与daemon_start.ps1完全一致：
+    CreateJobObject(KILL_ON_JOB_CLOSE) →
+    CreateProcessW(CREATE_SUSPENDED|CREATE_NO_WINDOW)宿主cmd →
+    DuplicateHandle(job句柄→宿主进程，宿主存续期Job存活，父进程退出不误杀) →
+    AssignProcessToJobObject → ResumeThread → CloseHandle×3。
+    Job API任一步失败自动降级NOJOB（宿主裸跑，行为同ps1 Start-Fallback）。
+
+    Returns:
+        (宿主pid, job_mode)——job_mode=False表示NOJOB降级（无Job保护）
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            (n, ctypes.c_ulonglong)
+            for n in (
+                "ReadOperationCount", "WriteOperationCount",
+                "OtherOperationCount", "ReadTransferCount",
+                "WriteTransferCount", "OtherTransferCount",
+            )
+        ]
+
+    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),  # ULONG_PTR
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    class _STARTUPINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("lpReserved", wintypes.LPWSTR),
+            ("lpDesktop", wintypes.LPWSTR),
+            ("lpTitle", wintypes.LPWSTR),
+            ("dwX", wintypes.DWORD), ("dwY", wintypes.DWORD),
+            ("dwXSize", wintypes.DWORD), ("dwYSize", wintypes.DWORD),
+            ("dwXCountChars", wintypes.DWORD), ("dwYCountChars", wintypes.DWORD),
+            ("dwFillAttribute", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("wShowWindow", wintypes.WORD),
+            ("cbReserved2", wintypes.WORD),
+            ("lpReserved2", ctypes.c_void_p),
+            ("hStdInput", ctypes.c_void_p),
+            ("hStdOutput", ctypes.c_void_p),
+            ("hStdError", ctypes.c_void_p),
+        ]
+
+    class _PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("hProcess", ctypes.c_void_p),
+            ("hThread", ctypes.c_void_p),
+            ("dwProcessId", wintypes.DWORD),
+            ("dwThreadId", wintypes.DWORD),
+        ]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _v = ctypes.c_void_p
+    k32.CreateJobObjectW.restype = _v
+    k32.CreateJobObjectW.argtypes = [_v, wintypes.LPCWSTR]
+    k32.SetInformationJobObject.restype = wintypes.BOOL
+    k32.SetInformationJobObject.argtypes = [_v, wintypes.INT, _v, wintypes.DWORD]
+    k32.GetCurrentProcess.restype = _v
+    k32.GetCurrentProcess.argtypes = []
+    k32.DuplicateHandle.restype = wintypes.BOOL
+    k32.DuplicateHandle.argtypes = [
+        _v, _v, _v, ctypes.POINTER(_v), wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+    ]
+    k32.AssignProcessToJobObject.restype = wintypes.BOOL
+    k32.AssignProcessToJobObject.argtypes = [_v, _v]
+    k32.ResumeThread.restype = wintypes.DWORD
+    k32.ResumeThread.argtypes = [_v]
+    k32.CloseHandle.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [_v]
+    k32.CreateProcessW.restype = wintypes.BOOL
+    k32.CreateProcessW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPWSTR, _v, _v, wintypes.BOOL,
+        wintypes.DWORD, _v, wintypes.LPCWSTR, _v, _v,
+    ]
+
+    CREATE_SUSPENDED = 0x4
+    CREATE_NO_WINDOW = 0x08000000
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    JobObjectExtendedLimitInformation = 9
+    DUPLICATE_SAME_ACCESS = 0x2
+
+    # ---- Job对象（失败降级NOJOB） ----
+    job = None
+    try:
+        job = k32.CreateJobObjectW(None, None)
+        if job:
+            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not k32.SetInformationJobObject(
+                job, JobObjectExtendedLimitInformation,
+                ctypes.byref(info), ctypes.sizeof(info),
+            ):
+                k32.CloseHandle(job)
+                job = None
+    except Exception:
+        if job:
+            try:
+                k32.CloseHandle(job)
+            except Exception:
+                pass
+        job = None
+
+    # ---- 创建宿主cmd（挂起+无窗口，句柄不继承） ----
+    cmdline = ctypes.create_unicode_buffer(f'cmd.exe /c "{bat_file}"')
+    si = _STARTUPINFOW()
+    si.cb = ctypes.sizeof(si)
+    pi = _PROCESS_INFORMATION()
+    created = k32.CreateProcessW(
+        None, cmdline, None, None, False,
+        CREATE_SUSPENDED | CREATE_NO_WINDOW,
+        None, workdir, ctypes.byref(si), ctypes.byref(pi),
+    )
+    if not created:
+        err = ctypes.get_last_error()
+        raise OSError(err, f"CreateProcessW失败(错误码{err}): cmd.exe /c \"{bat_file}\"")
+
+    job_mode = False
+    try:
+        if job:
+            # 先把job句柄复制进宿主进程再Assign（顺序关键，同ps1）：
+            # 复制失败不Assign（防本函数CloseHandle(job)触发KILL_ON_JOB_CLOSE误杀）
+            dup = k32.DuplicateHandle(
+                k32.GetCurrentProcess(), job, pi.hProcess,
+                ctypes.byref(_v()), 0, False, DUPLICATE_SAME_ACCESS,
+            )
+            if dup and k32.AssignProcessToJobObject(job, pi.hProcess):
+                job_mode = True
+        k32.ResumeThread(pi.hThread)
+    finally:
+        k32.CloseHandle(pi.hThread)
+        k32.CloseHandle(pi.hProcess)
+        if job:
+            k32.CloseHandle(job)
+    return pi.dwProcessId, job_mode
+
+
 def start_local_daemon(
     command: str, workdir: str | Path | None, daemon_id: str
 ) -> tuple[int, str, bool]:
@@ -1084,29 +1250,13 @@ def start_local_daemon(
         )
         inner_file.write_text(inner, encoding="utf-8")
         bat_file.write_text(outer, encoding="utf-8")
-        # Job启动器（wmic在Win11 24H2+已移除，PowerShell全版本可用）。
-        # ps1写文件后以-File执行：长脚本不经cmd命令行（8191字符限制+引号
-        # 转义地狱），list形式传参无转义问题；Add-Type首次编译约1-2秒，
-        # timeout放宽到60秒
-        ps1_file = _windows_daemon_ps1_file(str(log_dir))
-        Path(ps1_file).write_text(_WINDOWS_JOB_START_PS1, encoding="ascii")
-        result = subprocess.run(
-            [
-                "powershell", "-NoProfile", "-NonInteractive",
-                "-ExecutionPolicy", "Bypass",
-                "-File", ps1_file, "-BatFile", str(bat_file),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,  # Add-Type首次编译冷启动可达30s+（杀软扫描），给足余量
+        # 🔧 事务#2781：ctypes原生Job启动（毫秒级，零编译零外部进程）。
+        # 旧PowerShell ps1方案Add-Type偶发2~9.5分钟卡顿（杀软扫描csc.exe，
+        # 事务#2778 daemon工具长时间不返回的根因），弃用；ps1路径仅作为
+        # 旧版nest服务回退保留（见start_remote_daemon）。
+        pid, job_mode = _start_windows_daemon_native(
+            str(bat_file), str(workdir) if workdir else None
         )
-        out = (result.stdout or "") + "\n" + (result.stderr or "")
-        pid, job_mode = _parse_windows_daemon_start_output(out)
-        if result.returncode != 0 or pid is None:
-            raise OSError(
-                f"PowerShell启动daemon失败(rc={result.returncode}): "
-                f"{result.stdout[:200]} {result.stderr[:200]}"
-            )
     else:
         inner = shlex.quote(wrap_command_with_exit_code(command, log_file))
         # setsid使daemon自成会话首进程（非交互shell下$!即最终PID）
@@ -1189,6 +1339,24 @@ async def start_remote_daemon(
     import shlex
 
     if is_windows or (platform or "").lower().startswith("win"):
+        # 🔧 事务#2781：优先走原生daemon_start协议——nest服务端ctypes直接
+        # Job启动（毫秒级返回）。旧ps1路径（PowerShell Add-Type）实测偶发
+        # 2~9.5分钟卡顿（杀软扫描csc.exe，事务#2778 daemon工具长时间不
+        # 返回的根因），仅作为旧版nest服务（无daemon_start处理器）回退。
+        try:
+            result = await client.daemon_start(
+                command=command, workdir=workdir, daemon_id=daemon_id, timeout=timeout
+            )
+            pid = result.get("pid")
+            if pid:
+                return int(pid), result.get("log_file", ""), bool(result.get("job"))
+        except Exception as e:
+            if "不支持的请求类型" not in str(e):
+                raise
+            logger.warning(
+                f"nest服务不支持daemon_start（旧版本），回退ps1路径: {e}"
+            )
+
         # Windows远程：用户命令原样写入inner.bat（零转义），outer.bat调用并
         # 捕获退出码（经nest write_file写bat），Job启动器ps1启动
         # （wmic在Win11 24H2+已移除，PowerShell全版本可用）
