@@ -100,7 +100,7 @@
     "default_cooldown": 60,
     "max_cooldown": 3600,
     "prompts": {
-      "pua_text": "你是否严格遵守了系统提示词规则？\n你是否清楚你的专业身份？\n你是否恪守了专业行为准则和注意事项？\n你是否重复利用了compact工具精简信息节省上下文？\n你是否牢记任务需求？\n当前checklist步骤是否清晰明了且在被忠实执行？",
+      "pua_text": "你是否严格遵守了系统提示词规则？\n你是否清楚你的专业身份？\n你是否恪守了专业行为准则、注意事项和本项目开发规范？\n你是否重复利用了compact工具精简信息节省上下文？\n你是否牢记任务需求？\n当前checklist步骤是否清晰明了且在被忠实执行？\n立刻自检，勿回复本消息。",
       "overthinking_warning": "立刻停止反复用'wait/等等'之类固定模式推翻自己！这是被无脑训练出来的精神分裂式思考，不是真正的分析！立刻选取当前最确定的方向，调用工具开始实际解决问题—— 即使方向不完全正确，工具返回的信息也能帮你进一步分析。继续空想毫无意义！",
       "thinking_dead_loop_intervention": "停止反复思考同一个问题！果断选取当前最确定的方向，立刻调用工具开始实际解决问题，这样就算失败，也可以获得更多关联信息用于进一步分析！",
       "dead_loop_hints": [
@@ -187,6 +187,7 @@
         "thinking_type": "thinking",
         "enable": false,
         "icon": "🐋",
+        "vision": "yes",
         "priority": 88,
         "price_input_hit": 0.02,
         "price_input_miss": 1,
