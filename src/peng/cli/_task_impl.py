@@ -1385,7 +1385,8 @@ def render_task_detail_html(
                     except RuntimeError:
                         task_agents_md = asyncio.run(load_task_agents_md(_task_for_md))
                 if task_agents_md and task_agents_md != agent_md:
-                    combined += "\n\n---\n\n" + task_agents_md
+                    # 与实际注入一致（agent.py _prepare_prompt，事务#2770）：内容前加一行标题
+                    combined += "\n\n---\n\n" + f"本项目开发规范\n{task_agents_md}"
         except Exception as e:
             logger.warning(f"[task show] 读取工作目录AGENTS.md用于展示失败(忽略): {e}")
 

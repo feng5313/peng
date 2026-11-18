@@ -64,6 +64,9 @@ class TestWorkdirAgentsMdAppend:
         # 工作目录AGENTS.md存在且追加在尾部（add_system按\n拼接，最后一次即最后一行）
         assert "WORKDIR_MD_RULES_2242" in system
         assert system.split("\n")[-1] == "WORKDIR_MD_RULES_2242"
+        # 事务#2770：内容前加一行标题"本项目开发规范"（标题在内容前，且只注入一次）
+        assert "本项目开发规范\nWORKDIR_MD_RULES_2242" in system
+        assert system.count("本项目开发规范") == 1
         # 顺序：全局在前，工作目录在后
         assert system.index("GLOBAL_MD_RULES_2242") < system.index("WORKDIR_MD_RULES_2242")
         # skills提示词仍居中（在全局之后、工作目录之前）
@@ -115,6 +118,8 @@ class TestWorkdirAgentsMdAppend:
         assert "GLOBAL_MD_RULES_2242" in system
         assert "REMOTE_MD_RULES_2242" in system
         assert system.split("\n")[-1] == "REMOTE_MD_RULES_2242"
+        # 事务#2770：远程nest路径同样加标题（注入逻辑与nest无关）
+        assert "本项目开发规范\nREMOTE_MD_RULES_2242" in system
 
     async def test_remote_nest_load_failure_ignored(self, monkeypatch):
         """远程nest读取失败：静默忽略，系统提示词照常构建，不抛异常"""

@@ -513,7 +513,8 @@ class PengAgent:
         except Exception as e:
             logger.warning(f"[Agent] 读取事务工作目录AGENTS.md失败(忽略): {e}")
         if task_agents_md and task_agents_md != agent_md:
-            self.history.add_system(task_agents_md)
+            # 内容前加一行标题（事务#2770消息#13553）：标明该段为项目开发规范
+            self.history.add_system(f"本项目开发规范\n{task_agents_md}")
             logger.info(
                 f"[Agent] 已追加工作目录AGENTS.md到系统提示词尾部 ({len(task_agents_md)}字符)"
             )
