@@ -99,9 +99,7 @@ def _truncate_display_lines(
     kept = max_lines - 1  # 留 1 行给省略提示
     saved_path = _save_full_result(display, task_id, tool_name)
     if saved_path:
-        notice = (
-            f"… [结果共 {len(lines)} 行，回显截断为前 {kept} 行，全文已存: {saved_path} （点击路径查看；完整结果已提供给大模型）] \x1b[0m"
-        )
+        notice = f"… [结果共 {len(lines)} 行，回显截断为前 {kept} 行，全文已存: {saved_path} （点击路径查看；完整结果已提供给大模型）] \x1b[0m"
     else:
         notice = (
             f"… [结果共 {len(lines)} 行，回显截断为前 {kept} 行；完整结果已提供给大模型] \x1b[0m"
@@ -352,7 +350,9 @@ class PengAgent:
                 skills_base = Path(workdir) / "skills"
                 overlay = self._skill_loader.collect_external_skills([skills_base])
                 if overlay:
-                    logger.info(f"[Agent] 已收集 local nest 工作目录技能 {list(overlay.keys())} (来源: {skills_base})")
+                    logger.info(
+                        f"[Agent] 已收集 local nest 工作目录技能 {list(overlay.keys())} (来源: {skills_base})"
+                    )
                 return overlay
 
             from peng.llm.client import list_remote_skill_dirs, read_remote_skill_md
@@ -365,10 +365,14 @@ class PengAgent:
                 if not content:
                     continue
                 metadata = self._skill_loader._parse_frontmatter(content, name)
-                skill = Skill(metadata=metadata, content=content, path=Path(workdir) / "skills" / name)
+                skill = Skill(
+                    metadata=metadata, content=content, path=Path(workdir) / "skills" / name
+                )
                 overlay[name] = skill
             if overlay:
-                logger.info(f"[Agent] 已收集远程nest {nest_name} 工作目录技能 {list(overlay.keys())}")
+                logger.info(
+                    f"[Agent] 已收集远程nest {nest_name} 工作目录技能 {list(overlay.keys())}"
+                )
             return overlay
 
         except Exception as e:
@@ -514,7 +518,7 @@ class PengAgent:
             logger.warning(f"[Agent] 读取事务工作目录AGENTS.md失败(忽略): {e}")
         if task_agents_md and task_agents_md != agent_md:
             # 内容前加一行标题（事务#2770消息#13553）：标明该段为项目开发规范
-            self.history.add_system(f"本项目开发规范\n{task_agents_md}")
+            self.history.add_system(f"本项目开发规范\nAGENTS.md\n{task_agents_md}")
             logger.info(
                 f"[Agent] 已追加工作目录AGENTS.md到系统提示词尾部 ({len(task_agents_md)}字符)"
             )

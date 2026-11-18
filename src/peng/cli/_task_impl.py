@@ -1053,9 +1053,7 @@ def _section_html(icon_title: str, content_html: str) -> str:
     return f'<div class="task-section"><h3>{_h(icon_title)}</h3>{content_html}</div>'
 
 
-def render_task_detail_html(
-    task_id: int, task_agents_md_override: str | None = None
-) -> str | None:
+def render_task_detail_html(task_id: int, task_agents_md_override: str | None = None) -> str | None:
     """渲染事务详情 HTML 字符串（进程内纯渲染，供 WebUI API 直接调用）
 
     🔧 事务#2246：WebUI 事务详情弹窗原先通过 /api/command 启动 bin/task 子进程
@@ -1386,7 +1384,7 @@ def render_task_detail_html(
                         task_agents_md = asyncio.run(load_task_agents_md(_task_for_md))
                 if task_agents_md and task_agents_md != agent_md:
                     # 与实际注入一致（agent.py _prepare_prompt，事务#2770）：内容前加一行标题
-                    combined += "\n\n---\n\n" + f"本项目开发规范\n{task_agents_md}"
+                    combined += "\n\n---\n\n" + f"本项目开发规范\nAGENTS.md\n{task_agents_md}"
         except Exception as e:
             logger.warning(f"[task show] 读取工作目录AGENTS.md用于展示失败(忽略): {e}")
 
@@ -2579,8 +2577,11 @@ def cmd_daemon(args):
         stat_label = n if n else "本地"
         parts.append(f"{stat_label}: {count}")
     print(f"\n共 {total} 个daemon ({', '.join(parts)})")
-    print(f"{Colors.DIM}停止: task kill -d <daemon_id>，或bash/daemon工具 stop <daemon_id>{Colors.RESET}")
+    print(
+        f"{Colors.DIM}停止: task kill -d <daemon_id>，或bash/daemon工具 stop <daemon_id>{Colors.RESET}"
+    )
     return 0
+
 
 def cmd_move(args):
     """移动事务到新的父事务下或变成树根"""
@@ -2921,7 +2922,9 @@ def cmd_info(args):
     if success:
         info_list_with_status = tm.db.get_task_info(args.id, mode="all") or []
         unread_count = sum(1 for item in info_list_with_status if not item["read"])
-        print(f"{Colors.GREEN}✅ 事务 {formatted_id} 注入信息已添加（未读，来自 {sender}）{Colors.RESET}")
+        print(
+            f"{Colors.GREEN}✅ 事务 {formatted_id} 注入信息已添加（未读，来自 {sender}）{Colors.RESET}"
+        )
         print(f"  添加：{new_info}")
         print(
             f"{Colors.DIM}当前共 {len(info_list_with_status)} 条信息（{unread_count} 条未读）{Colors.RESET}"
@@ -3424,17 +3427,17 @@ def cmd_rollback(args):
         rollback_context=not args.no_context,
     )
     unchecked_dims = [
-        k for k, v in {
+        k
+        for k, v in {
             "工作目录文件": rollback_kwargs["rollback_files"],
             "外部文件": rollback_kwargs["rollback_external"],
             "checklist": rollback_kwargs["rollback_checklist"],
             "上下文": rollback_kwargs["rollback_context"],
-        }.items() if not v
+        }.items()
+        if not v
     ]
     if unchecked_dims:
-        print(
-            f"{Colors.CYAN}🔧 部分回滚（不回滚：{'、'.join(unchecked_dims)}）{Colors.RESET}"
-        )
+        print(f"{Colors.CYAN}🔧 部分回滚（不回滚：{'、'.join(unchecked_dims)}）{Colors.RESET}")
         if all(not v for v in rollback_kwargs.values()):
             print(
                 f"{Colors.RED}❌ 四个维度全部取消勾选，无可回滚内容。请至少保留一个维度。{Colors.RESET}",
@@ -3793,7 +3796,9 @@ def main():
     kill_parser.set_defaults(func=cmd_kill)
 
     # killall 命令
-    killall_parser = subparsers.add_parser("killall", help="杀死daemon.json中记录的所有后台daemon进程")
+    killall_parser = subparsers.add_parser(
+        "killall", help="杀死daemon.json中记录的所有后台daemon进程"
+    )
     killall_parser.set_defaults(func=cmd_killall)
 
     # daemon 命令
@@ -3996,20 +4001,24 @@ def main():
     # 🔧 回滚内容维度（事务#2476）：与 WebUI 确认窗口四勾选框一致，默认全选；
     # --no-xxx 取消勾选对应维度（不回滚该内容）
     rollback_parser.add_argument(
-        "--no-files", action="store_true",
-        help="不回滚工作目录文件（取消勾选\"工作目录文件\"）",
+        "--no-files",
+        action="store_true",
+        help='不回滚工作目录文件（取消勾选"工作目录文件"）',
     )
     rollback_parser.add_argument(
-        "--no-external", action="store_true",
-        help="不回滚外部文件（取消勾选\"外部文件\"）",
+        "--no-external",
+        action="store_true",
+        help='不回滚外部文件（取消勾选"外部文件"）',
     )
     rollback_parser.add_argument(
-        "--no-checklist", action="store_true",
-        help="不回滚 checklist（取消勾选\"checklist\"）",
+        "--no-checklist",
+        action="store_true",
+        help='不回滚 checklist（取消勾选"checklist"）',
     )
     rollback_parser.add_argument(
-        "--no-context", action="store_true",
-        help="不回滚对话上下文（取消勾选\"上下文\"）",
+        "--no-context",
+        action="store_true",
+        help='不回滚对话上下文（取消勾选"上下文"）',
     )
     rollback_parser.set_defaults(func=cmd_rollback)
 
