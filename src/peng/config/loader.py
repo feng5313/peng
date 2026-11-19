@@ -1684,6 +1684,44 @@ class LLMConfig(BaseModel):
                 logger.debug(f"[LLMConfig] provider分配登记失败(忽略): {e}")
         return provider
 
+    def _vision_prefer_pool(self, pool: list[str], prefer_vision: bool) -> list[str]:
+        """prefer_vision时从候选池中优先筛选可用vision provider（事务#2783）
+
+        与_get_best_available_provider的vision_shifts筛选及空回退语义完全一致：
+        池中存在可用vision provider（is_vision_enabled且非vision-only且未被
+        运行期禁用）时仅保留它们；否则回退原池（附件将由client降级为文本提示，
+        有既有warning）。get_provider的target无效/未启用/上下文能力guard等
+        **兜底路径必须经此筛选**，否则会按纯priority选中非vision provider，
+        附件被静默降级、图片识别失效（事务#2783现场：上下文44万token，
+        vision provider全部被上下文能力过滤→_get_best_available_provider返回
+        None→兜底选中priority最高的文本provider→图片降级为文本提示）。
+
+        Args:
+            pool: 候选provider名列表（保序传入）
+            prefer_vision: 是否优先vision provider
+
+        Returns:
+            筛选后的候选列表（保序；无可用vision时返回原池）
+        """
+        if not prefer_vision:
+            return pool
+        vision_pool = [
+            p
+            for p in pool
+            if p in self.providers
+            and self.providers[p].is_vision_enabled()
+            and not self.providers[p].is_vision_only()
+            and not is_provider_vision_runtime_disabled(p)
+        ]
+        if vision_pool:
+            if len(vision_pool) < len(pool):
+                logger.info(
+                    f"[LLMConfig] prefer_vision兜底筛选：候选{pool}中优先"
+                    f"vision provider {vision_pool}（事务#2783）"
+                )
+            return vision_pool
+        return pool
+
     def _get_best_available_provider(
         self,
         forbidden: list[str] | None = None,
@@ -2801,7 +2839,10 @@ class LLMConfig(BaseModel):
                     )
                 logger.error("❌ [LLMConfig] config/peng.json中没有可用的provider配置！")
                 sys.exit(1)
-            first_provider = enabled_usable[0]
+            # 🔧 事务#2783：兜底保持prefer_vision语义——_get_best_available_provider
+            # 因上下文能力过滤等返回None时，按纯priority兜底会选中非vision的
+            # 主力文本provider，附件被静默降级、图片识别失效。优先vision provider。
+            first_provider = self._vision_prefer_pool(enabled_usable, prefer_vision)[0]
             logger.warning(
                 f"[LLMConfig] target_provider无效 ({target_provider})，"
                 f"使用priority最高的可用provider: {first_provider}"
@@ -2822,7 +2863,8 @@ class LLMConfig(BaseModel):
             enabled_usable = [p for p in enabled_providers if self.blocked_remaining(p) <= 0]
             if enabled_usable:
                 # 使用priority最高的启用的provider（排除硬阻塞）
-                target_provider = enabled_usable[0]
+                # 🔧 事务#2783：同样保持prefer_vision语义（favorites路径兜底）
+                target_provider = self._vision_prefer_pool(enabled_usable, prefer_vision)[0]
                 logger.warning(
                     f"[LLMConfig] {original_provider}{reason}，切换到priority最高的provider: {target_provider}"
                 )
@@ -2865,6 +2907,11 @@ class LLMConfig(BaseModel):
             enabled_providers = self._get_enabled_providers_sorted()
             if forbidden:
                 enabled_providers = [p for p in enabled_providers if p not in set(forbidden)]
+            # 🔧 事务#2783：guard兜底同样保持prefer_vision语义——全部能力
+            # 不足时按纯"能力最大"兜底会选中非vision provider（compact_threshold
+            # 并列时取池首=priority最高的主力文本模型），附件被静默降级为文本、
+            # 图片识别失效。capable/usable_pool均从vision筛选后的池派生。
+            enabled_providers = self._vision_prefer_pool(enabled_providers, prefer_vision)
             # 🔧 事务#2666：能力足够的provider全部处于硬阻塞时，宁可等待恢复时刻，
             # 也不发起注定400超限的请求（换到能力不足的provider同样必然失败）。
             # 排序优先级：能力足够且未阻塞 → 能力足够但阻塞（等待）→ 全能力不足
