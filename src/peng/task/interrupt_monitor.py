@@ -1,6 +1,6 @@
 """事务中断监控（共享协程）
 
-长时间等待/执行期间（bash 命令进程、sleep 工具等待）轮询中断条件，
+长时间等待/执行期间（bash 命令进程、wait 工具等待）轮询中断条件，
 让风主🍃的指示与控制信号能立刻被响应而不是等工具自然结束：
 
 1. 事务状态变更：不再是 running/accepting（cancel/pause 等系统级控制必须立刻响应）
@@ -9,7 +9,7 @@
 
 共享原因（peng/task/info.py:is_urgent_content 文档同样强调"不要写两份"）：
 - src/peng/tools/bash.py 的 _interrupt_monitor（命令进程中断）
-- src/peng/tools/task.py 的 SleepTool（等待中断）
+- src/peng/tools/task.py 的 WaitTool（等待中断）
 
 所有同步 DB 查询经 asyncio.to_thread + wait_for(5s) 执行——DB 瞬时卡顿
 （锁/网络）不再阻塞事件循环导致监控协程僵死（事务#2064：命令124秒未打断
@@ -53,10 +53,10 @@ async def monitor_interrupts(
         task_id: 当前事务ID
         message_id: 当前根消息ID（None则只检查事务状态/info）
         check_all: 是否检查全部中断条件。True=任何未读info/任何新回复都打断
-            （等待类操作语义：sleep/含sleep的命令，用户在等待时应能随时介入）；
+            （等待类操作语义：wait 工具/含sleep的命令，用户在等待时应能随时介入）；
             False=仅事务状态变更 + 感叹号开头的紧急未读info/新回复（事务#1860），
             普通消息/info不打断（与思考流打断策略一致）
-        label: 日志中的被监控对象描述（"命令"/"sleep等待"）
+        label: 日志中的被监控对象描述（"命令"/"wait等待"）
 
     Returns:
         中断原因字符串，None表示未中断（协程持续运行直到被cancel）

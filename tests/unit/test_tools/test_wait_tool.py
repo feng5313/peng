@@ -1,7 +1,7 @@
-"""事务#2751测试：sleep 工具（等待 + 心跳保活 + 中断提前结束）
+"""事务#2751测试：wait 工具（等待 + 心跳保活 + 中断提前结束）
 
-需求：在 src/peng/tools/task.py 添加 sleep 工具，参数单位秒，最多5分钟，
-sleep 期间保持心跳；追加指示（消息#13493）：必须 reason 参数说明等待理由。
+需求：在 src/peng/tools/task.py 添加 wait 工具，参数单位秒，最多5分钟，
+wait 期间保持心跳；追加指示（消息#13493）：必须 reason 参数说明等待理由。
 
 验证点：
 1. _parse_seconds / _normalize_reason 纯函数容错
@@ -11,7 +11,7 @@ sleep 期间保持心跳；追加指示（消息#13493）：必须 reason 参数
    事务状态变更 / 未读 info → 立刻结束等待并给出原因
 5. 无事务上下文（adhoc）：纯等待不报错、不打心跳
 6. 上层 cancel：CancelledError 向上抛且监控协程被收掉（无残留任务）
-7. registry 注册 sleep，参数 required=[seconds, reason]
+7. registry 注册 wait，参数 required=[seconds, reason]
 8. bash._interrupt_monitor 委托共享模块（原有签名/返回契约不变）
 """
 
@@ -25,7 +25,7 @@ import pytest
 import peng.task.interrupt_monitor as im
 from peng.tools.bash import BashTool
 from peng.tools.registry import ToolRegistry
-from peng.tools.task import SleepTool, _normalize_reason, _parse_seconds
+from peng.tools.task import WaitTool, _normalize_reason, _parse_seconds
 
 
 class TestParseSeconds:
@@ -61,9 +61,9 @@ class TestNormalizeReason:
         assert _normalize_reason("") == ""
 
 
-def _make_sleep_tool(task_row: dict | None = None) -> tuple[SleepTool, MagicMock]:
-    """注入 mock 事务上下文的 SleepTool（返回工具与 task_manager mock）"""
-    tool = SleepTool()
+def _make_wait_tool(task_row: dict | None = None) -> tuple[WaitTool, MagicMock]:
+    """注入 mock 事务上下文的 WaitTool（返回工具与 task_manager mock）"""
+    tool = WaitTool()
     tool.set_context(task_id=42, message_id=100)
     tm = MagicMock()
     row = task_row or {
@@ -97,7 +97,7 @@ def _patch_msg_db(monkeypatch, reply_count: int = 0) -> None:
 
 @pytest.mark.asyncio
 async def test_reject_invalid_seconds():
-    tool, tm = _make_sleep_tool()
+    tool, tm = _make_wait_tool()
     for bad in (None, 0, -3, "abc", True):
         result = await tool.execute(seconds=bad, reason="等待编译产物")
         assert result.summary.startswith("❌"), f"seconds={bad!r} 应被拒绝"
@@ -107,7 +107,7 @@ async def test_reject_invalid_seconds():
 @pytest.mark.asyncio
 async def test_reject_over_5_minutes():
     """上限300秒（5分钟）：超时必须拒绝，且不真的等待"""
-    tool, tm = _make_sleep_tool()
+    tool, tm = _make_wait_tool()
     started = time.monotonic()
     result = await tool.execute(seconds=301, reason="等待远端大模型推理完成")
     assert "5分钟" in result.summary and result.summary.startswith("❌")
@@ -118,7 +118,7 @@ async def test_reject_over_5_minutes():
 @pytest.mark.asyncio
 async def test_reject_missing_or_bad_reason():
     """追加指示（消息#13493）：reason 必填，缺失/空白/长度不符一律拒绝"""
-    tool, tm = _make_sleep_tool()
+    tool, tm = _make_wait_tool()
     for bad_reason in (None, "", "   ", "短", "x" * 201):
         result = await tool.execute(seconds=1, reason=bad_reason)
         assert result.summary.startswith("❌"), f"reason={bad_reason!r} 应被拒绝"
@@ -127,10 +127,10 @@ async def test_reject_missing_or_bad_reason():
 
 
 @pytest.mark.asyncio
-async def test_sleep_waits_and_keeps_heartbeat(monkeypatch):
+async def test_wait_waits_and_keeps_heartbeat(monkeypatch):
     """按时长完成等待；起点立刻打心跳，等待期间按心跳间隔持续刷新"""
     _patch_msg_db(monkeypatch)
-    tool, tm = _make_sleep_tool()
+    tool, tm = _make_wait_tool()
 
     async def fast_interval(task_manager, task_id):
         return 0.5
@@ -148,22 +148,22 @@ async def test_sleep_waits_and_keeps_heartbeat(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_sleep_default_interval_respects_task_timeout():
+async def test_wait_default_interval_respects_task_timeout():
     """心跳间隔依据事务 heartbeat_timeout 动态收紧（至少保证4次刷新）"""
-    tool, _tm = _make_sleep_tool({"status": "running", "info": "[]", "heartbeat_timeout": 20})
+    tool, _tm = _make_wait_tool({"status": "running", "info": "[]", "heartbeat_timeout": 20})
     assert await tool._resolve_heartbeat_interval(_tm, 42) == 5.0
 
-    tool2, tm2 = _make_sleep_tool({"status": "running", "info": "[]"})
+    tool2, tm2 = _make_wait_tool({"status": "running", "info": "[]"})
     tm2.get_task.side_effect = Exception("db down")
     interval = await tool2._resolve_heartbeat_interval(tm2, 42)
-    assert 1.0 <= interval <= SleepTool.HEARTBEAT_INTERVAL
+    assert 1.0 <= interval <= WaitTool.HEARTBEAT_INTERVAL
 
 
 @pytest.mark.asyncio
-async def test_sleep_interrupts_on_status_change(monkeypatch):
+async def test_wait_interrupts_on_status_change(monkeypatch):
     """事务被暂停 → 共享监控立刻结束等待（真实 monitor_interrupts）"""
     _patch_msg_db(monkeypatch)
-    tool, tm = _make_sleep_tool({"status": "paused", "info": "[]", "heartbeat_timeout": 300})
+    tool, tm = _make_wait_tool({"status": "paused", "info": "[]", "heartbeat_timeout": 300})
     started = time.monotonic()
     result = await tool.execute(seconds=20, reason="等待测试跑完")
     elapsed = time.monotonic() - started
@@ -173,10 +173,10 @@ async def test_sleep_interrupts_on_status_change(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_sleep_interrupts_on_unread_info(monkeypatch):
+async def test_wait_interrupts_on_unread_info(monkeypatch):
     """未读 info → check_all=True 立刻结束等待（风主指示不被等待吞掉）"""
     _patch_msg_db(monkeypatch)
-    tool, _tm = _make_sleep_tool(
+    tool, _tm = _make_wait_tool(
         {
             "status": "running",
             "info": '[{"content": "立刻停止等待", "read": false}]',
@@ -191,9 +191,9 @@ async def test_sleep_interrupts_on_unread_info(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_sleep_without_task_context_is_plain_wait():
+async def test_wait_without_task_context_is_plain_wait():
     """无事务上下文（adhoc）：退化为纯等待，不打心跳也不报错"""
-    tool = SleepTool()
+    tool = WaitTool()
     started = time.monotonic()
     result = await tool.execute(seconds=0.3, reason="临时等待外部端口")
     assert result.summary.startswith("✅"), result.summary
@@ -201,10 +201,10 @@ async def test_sleep_without_task_context_is_plain_wait():
 
 
 @pytest.mark.asyncio
-async def test_sleep_cancel_propagates_and_reaps_monitor(monkeypatch):
+async def test_wait_cancel_propagates_and_reaps_monitor(monkeypatch):
     """上层cancel（控制信号/紧急中断）：CancelledError向上抛，监控协程无残留"""
     _patch_msg_db(monkeypatch)
-    tool, tm = _make_sleep_tool()
+    tool, tm = _make_wait_tool()
     task = asyncio.create_task(tool.execute(seconds=10, reason="等待快照完成"))
     await asyncio.sleep(0.4)
     assert tm.update_heartbeat.call_count >= 1
@@ -228,13 +228,13 @@ async def test_bash_monitor_delegates_to_shared_module(monkeypatch):
     assert reason == "captured:命令:True"
 
 
-def test_registry_registers_sleep():
+def test_registry_registers_wait():
     registry = ToolRegistry()
     registry.load_builtin_tools()
-    tool = registry.get("sleep")
-    assert isinstance(tool, SleepTool)
+    tool = registry.get("wait")
+    assert isinstance(tool, WaitTool)
     definition = tool.to_openai_format()
-    assert definition["function"]["name"] == "sleep"
+    assert definition["function"]["name"] == "wait"
     assert sorted(definition["function"]["parameters"]["required"]) == ["reason", "seconds"]
     desc = definition["function"]["description"]
     assert "5分钟" in desc and "reason" in desc

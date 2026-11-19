@@ -1068,9 +1068,9 @@ class TaskTool(Tool):
         )
 
 
-class SleepTool(Tool):
+class WaitTool(Tool):
     """
-    事务等待工具（SleepTool，事务#2751）
+    事务等待工具（WaitTool，事务#2751）
 
     等待指定秒数（最多5分钟=300秒）再继续，用于等待外部进度
     （daemon 后台任务、编译、测试、远端服务就绪等），必须提供 reason 说明等待理由。
@@ -1087,7 +1087,7 @@ class SleepTool(Tool):
 
     # 上限5分钟（风主指示）：更长的等待应改用 daemon 后台运行 + 轮询，
     # 避免工具批次长时间阻塞（期间迭代无法推进，只能靠中断看门狗跳出）。
-    MAX_SLEEP_SECONDS = 300
+    MAX_WAIT_SECONDS = 300
 
     # 心跳刷新节流上限（秒），与 bash 命令输出驱动心跳的5秒节流一致
     HEARTBEAT_INTERVAL = 5.0
@@ -1102,20 +1102,20 @@ class SleepTool(Tool):
 
     @property
     def name(self) -> str:
-        return "sleep"
+        return "wait"
 
     @property
     def description(self) -> str:
-        return f"""事务等待工具（SleepTool）。
+        return f"""事务等待工具（WaitTool）。
 
 等待指定秒数后再继续，用于等待外部进度（daemon后台任务、编译、测试、远端服务就绪等）。
 必须提供 reason 参数简明扼要地说明等待理由（4-200字符），否则将被拒绝执行！
 
 参数：
-- seconds：等待时长，单位秒（大于0，最多 {self.MAX_SLEEP_SECONDS} 秒=5分钟；支持小数如 5.5）
+- seconds：等待时长，单位秒（大于0，最多 {self.MAX_WAIT_SECONDS} 秒=5分钟；支持小数如 5.5）
 - reason：等待理由（必填，4-200字符），例如"等待daemon编译完成"
 
-超过 {self.MAX_SLEEP_SECONDS} 秒会被拒绝：更长的等待请改用 daemon 工具后台运行命令，
+超过 {self.MAX_WAIT_SECONDS} 秒会被拒绝：更长的等待请改用 daemon 工具后台运行命令，
 再轮询 task output / read 日志，不要长时间阻塞事务。
 
 等待期间自动保持事务心跳（不会被心跳超时误杀），并会因以下情况提前结束：
@@ -1124,8 +1124,8 @@ class SleepTool(Tool):
 - 根消息收到新回复
 
 用法示例：
-1. sleep seconds=30 reason="等待daemon编译完成再检查产物"
-2. sleep seconds=5.5 reason="等待远端服务端口就绪后重试连接"
+1. wait seconds=30 reason="等待daemon编译完成再检查产物"
+2. wait seconds=5.5 reason="等待远端服务端口就绪后重试连接"
 """
 
     @property
@@ -1135,7 +1135,7 @@ class SleepTool(Tool):
             "properties": {
                 "seconds": {
                     "type": "number",
-                    "description": f"等待时长，单位秒（大于0，最多{self.MAX_SLEEP_SECONDS}秒=5分钟）。支持小数与字符串形式（30 / 5.5 / '30s'）",
+                    "description": f"等待时长，单位秒（大于0，最多{self.MAX_WAIT_SECONDS}秒=5分钟）。支持小数与字符串形式（30 / 5.5 / '30s'）",
                 },
                 "reason": {
                     "type": "string",
@@ -1152,7 +1152,7 @@ class SleepTool(Tool):
                 asyncio.to_thread(task_manager.update_heartbeat, task_id), timeout=5.0
             )
         except Exception as e:
-            logger.warning(f"[sleep] 事务#{task_id}心跳更新失败(继续等待): {e}")
+            logger.warning(f"[wait] 事务#{task_id}心跳更新失败(继续等待): {e}")
             return False
 
     async def _resolve_heartbeat_interval(self, task_manager: Any, task_id: int) -> float:
@@ -1172,7 +1172,7 @@ class SleepTool(Tool):
 
                 timeout_sec = task.get("heartbeat_timeout") or get_default_heartbeat_timeout()
         except Exception as e:
-            logger.debug(f"[sleep] 读取事务心跳超时失败(用默认{timeout_sec}s): {e}")
+            logger.debug(f"[wait] 读取事务心跳超时失败(用默认{timeout_sec}s): {e}")
         return max(1.0, min(self.HEARTBEAT_INTERVAL, float(timeout_sec) / 4.0))
 
     async def execute(
@@ -1181,7 +1181,7 @@ class SleepTool(Tool):
         """等待 seconds 秒（心跳保活 + 中断监控），返回等待结果。
 
         Args:
-            seconds: 等待时长（单位秒，>0，最多 MAX_SLEEP_SECONDS）
+            seconds: 等待时长（单位秒，>0，最多 MAX_WAIT_SECONDS）
             reason: 等待理由（必填，4-200字符）
         Returns:
             DualOutput: 等待完成/提前中断的结果（拒绝时给出明确原因）
@@ -1189,13 +1189,13 @@ class SleepTool(Tool):
         duration = _parse_seconds(seconds)
         if duration is None or duration <= 0:
             output = (
-                f"❌ sleep 参数 seconds 无效：{seconds!r}（需要大于0的秒数，"
-                f"最多 {self.MAX_SLEEP_SECONDS} 秒=5分钟）"
+                f"❌ wait 参数 seconds 无效：{seconds!r}（需要大于0的秒数，"
+                f"最多 {self.MAX_WAIT_SECONDS} 秒=5分钟）"
             )
             return DualOutput(summary=output, display=output)
-        if duration > self.MAX_SLEEP_SECONDS:
+        if duration > self.MAX_WAIT_SECONDS:
             output = (
-                f"❌ sleep 时长 {duration} 秒超过限制（最多 {self.MAX_SLEEP_SECONDS} "
+                f"❌ wait 时长 {duration} 秒超过限制（最多 {self.MAX_WAIT_SECONDS} "
                 f"秒=5分钟）。更长的等待请改用 daemon 工具后台运行命令，再轮询 "
                 f"task output / read 日志。"
             )
@@ -1204,7 +1204,7 @@ class SleepTool(Tool):
         normalized_reason = _normalize_reason(reason)
         if not normalized_reason:
             output = (
-                "❌ sleep 必须通过 reason 参数简明扼要地说明等待理由"
+                "❌ wait 必须通过 reason 参数简明扼要地说明等待理由"
                 f"（{self.MIN_REASON_CHARS}-{self.MAX_REASON_CHARS}字符），本次被拒绝。"
             )
             return DualOutput(summary=output, display=output)
@@ -1213,7 +1213,7 @@ class SleepTool(Tool):
             or len(normalized_reason) > self.MAX_REASON_CHARS
         ):
             output = (
-                f"❌ sleep 的 reason 长度 {len(normalized_reason)} 字符不符合要求"
+                f"❌ wait 的 reason 长度 {len(normalized_reason)} 字符不符合要求"
                 f"（{self.MIN_REASON_CHARS}-{self.MAX_REASON_CHARS}字符），请简明扼要说明等待理由。"
             )
             return DualOutput(summary=output, display=output)
@@ -1242,12 +1242,12 @@ class SleepTool(Tool):
 
             monitor_task = asyncio.ensure_future(
                 monitor_interrupts(
-                    task_manager, task_id, message_id, check_all=True, label="sleep等待"
+                    task_manager, task_id, message_id, check_all=True, label="wait等待"
                 )
             )
 
         logger.info(
-            f"[sleep] 事务#{task_id} 等待 {duration} 秒（理由：{normalized_reason}，"
+            f"[wait] 事务#{task_id} 等待 {duration} 秒（理由：{normalized_reason}，"
             f"心跳间隔 {hb_interval:.1f}s）"
         )
 
@@ -1272,7 +1272,7 @@ class SleepTool(Tool):
                         interrupt_reason = None
                     except Exception as e:
                         # 监控协程异常不应打断等待（心跳保活仍在主循环中）
-                        logger.warning(f"[sleep] 事务#{task_id}中断监控异常(继续等待): {e}")
+                        logger.warning(f"[wait] 事务#{task_id}中断监控异常(继续等待): {e}")
                         interrupt_reason = None
                     monitor_task = None  # 监控已结束（返回原因或异常），不再重复检查
                     if interrupt_reason:
@@ -1289,14 +1289,14 @@ class SleepTool(Tool):
         elapsed = time.monotonic() - started
         if interrupt_reason:
             summary = (
-                f"⚠️ sleep 提前结束（已等待 {elapsed:.1f} 秒 / 计划 {duration} 秒，"
+                f"⚠️ wait 提前结束（已等待 {elapsed:.1f} 秒 / 计划 {duration} 秒，"
                 f"理由：{normalized_reason}）\n{interrupt_reason}"
             )
             display = f"{_ANSI['yellow']}{summary}{_ANSI['reset']}"
         else:
             hb_note = "等待期间事务心跳已刷新" if has_task else "无事务上下文（纯等待）"
             summary = (
-                f"✅ sleep {duration} 秒等待完成（实际 {elapsed:.1f} 秒，{hb_note}，"
+                f"✅ wait {duration} 秒等待完成（实际 {elapsed:.1f} 秒，{hb_note}，"
                 f"理由：{normalized_reason}）"
             )
             display = f"{_ANSI['bright_green']}{summary}{_ANSI['reset']}"

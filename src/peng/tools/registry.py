@@ -488,7 +488,7 @@ class ToolRegistry(metaclass=MetaSingleton):
 
         包括: read, write, edit, bash, daemon, glob, grep, websearch, webfetch,
               lsp, goto_definition, find_references,
-              message, task, skill, info, sleep
+              message, task, skill, info, wait
         """
         if self._tools:
             return
@@ -501,7 +501,7 @@ class ToolRegistry(metaclass=MetaSingleton):
         from peng.tools.message import MessageTool
         from peng.tools.nest import InputTool, NestTool, ShotTool, WindowTool
         from peng.tools.skill import SKILL_TOOL
-        from peng.tools.task import ChecklistTool, InfoTool, ReportTool, SleepTool, TaskTool
+        from peng.tools.task import ChecklistTool, InfoTool, ReportTool, WaitTool, TaskTool
         from peng.tools.web import WebFetchTool, WebSearchTool
 
         # 文件操作
@@ -533,7 +533,7 @@ class ToolRegistry(metaclass=MetaSingleton):
         # 事务信息注入工具
         self.register(InfoTool())
         # 事务等待工具（事务#2751：等待外部进度，等待期间保持心跳+可被中断）
-        self.register(SleepTool())
+        self.register(WaitTool())
         # 窗口查询和截屏工具
         self.register(WindowTool())
         self.register(ShotTool())

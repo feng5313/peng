@@ -233,7 +233,7 @@ class BashTool(Tool):
         """中断监控协程：定期检查事务状态/info/根消息回复/Ctrl+C
 
         实现已抽取为共享模块 peng.task.interrupt_monitor（事务#2751：新增的
-        sleep 工具需要同一套中断语义，禁止两处重复实现）。本方法保持原有
+        wait 工具需要同一套中断语义，禁止两处重复实现）。本方法保持原有
         签名与返回契约不变。
 
         Args:
