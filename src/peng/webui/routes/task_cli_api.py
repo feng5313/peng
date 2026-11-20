@@ -58,6 +58,7 @@ class SubtaskCreateRequest(BaseModel):
 class TaskControlRequest(BaseModel):
     """事务控制请求"""
     action: str  # pause/cancel/up/down/restart/resume/start
+    recursive: bool = False  # 是否递归联动子事务（仅 pause/cancel/resume/restart 有效）
 
 
 class StatusUpdateRequest(BaseModel):
@@ -463,8 +464,12 @@ async def task_control(task_id: int, request: TaskControlRequest) -> dict[str, A
                 ids.extend(collect_recursive(child_id))
         return ids
 
-    all_task_ids = []
-    if action in ("pause", "cancel", "up", "down"):
+    # 暂停/取消/恢复/重启默认不联动子事务，仅 recursive=True 时递归整棵事务树；
+    # up/down（优先级）保持原有的递归行为
+    recursive_ctrl = getattr(request, "recursive", False)
+    if action in ("up", "down"):
+        all_task_ids = collect_recursive(task_id)
+    elif recursive_ctrl:
         all_task_ids = collect_recursive(task_id)
     else:
         all_task_ids = [task_id]

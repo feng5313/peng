@@ -580,7 +580,7 @@ async def _chat_interactive_async(agent, config, chat_args: ChatArgs) -> int:
                 task_id = task.get("id")
                 if task_id:
                     task_manager.stop_task(
-                        task_id, recursive=True, keep_context=True, reason="用户中断"
+                        task_id, recursive=False, keep_context=True, reason="用户中断"
                     )
             chat_session.pause()
             print(f"\n{colorize('⏸️ 已暂停当前对话', 'yellow')}")
@@ -719,7 +719,7 @@ async def _chat_interactive_async(agent, config, chat_args: ChatArgs) -> int:
                             if task_id:
                                 asyncio.run(
                                     task_manager.pause_task(
-                                        task_id, recursive=True, reason="用户命令/pause"
+                                        task_id, recursive=False, reason="用户命令/pause"
                                     )
                                 )
                         chat_session.pause()

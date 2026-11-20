@@ -837,10 +837,12 @@ class TaskTool(Tool):
      示例：tree 1（获取事务#1的完整树状结构信息）
 2. 获取消息树：msg <id>
      示例：msg 1（获取事务#1关联的消息链）
-3. 控制事务：pause|cancel|resume|restart|start <id>
-     示例：pause 6（暂停事务#6）
-     示例：start 7（启动待定事务#7）
-     示例：restart 8（清除上下文重启事务#8，加--force参数无视当前状态强制重启）
+ 3. 控制事务：pause|cancel|resume|restart|start <id> [-r]
+     注意：暂停/取消/恢复/重启默认只作用于该事务自身，不联动子事务；加 -r（--recursive）才递归作用于整棵事务树。
+      示例：pause 6（暂停事务#6，子事务不受影响）
+      示例：cancel 6 -r（递归取消事务#6及其所有子事务）
+      示例：start 7（启动待定事务#7）
+      示例：restart 8（清除上下文重启事务#8，加--force参数无视当前状态强制重启；加-r递归重启整棵事务树）
 4. 显示或设置事务状态：status <id> [pending|running|completed|failed]
      示例：status 1（显示事务#1的状态）
 5. 创建子事务：subtask <parent_id> 事务需求描述 --prompt 提示词名称 --workdir 子事务工作目录 --creator 子事务创建者 [--small-model]

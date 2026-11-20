@@ -387,13 +387,11 @@ class TaskManager(metaclass=MetaSingleton):
         kill_process: bool = False,
     ) -> bool:
         """
-        停止事务
-
-        需求 §5.11: 递归停止事务树，杀死活跃进程
+        停止事务（默认仅停止自身，不联动子事务；recursive=True 时递归停止整棵事务树）
 
         Args:
             task_id: 事务 ID
-            recursive: 是否递归停止所有子事务（默认 True）
+            recursive: 是否递归停止所有子事务（默认 False，不联动子事务）
 
         Returns:
             是否成功
@@ -453,7 +451,7 @@ class TaskManager(metaclass=MetaSingleton):
 
     # ==================== 暂停/恢复/重启（需求 6） ====================
     async def cancel_task(
-        self, task_id: int, recursive: bool = True, kill_process: bool = True, reason: str = ""
+        self, task_id: int, recursive: bool = False, kill_process: bool = True, reason: str = ""
     ) -> bool:
         return self.stop_task(
             task_id,
@@ -493,8 +491,6 @@ class TaskManager(metaclass=MetaSingleton):
 
         current_status = task.get("status")
         non_restartable_statuses = [TaskStatus.RUNNING.value, TaskStatus.ACCEPTING.value]
-        descendants = self.db.get_descendants(task_id)
-        all_descendant_ids = [d["id"] for d in descendants]
 
         if current_status == TaskStatus.CANCELLED.value:
             keep_context = False

@@ -11,8 +11,8 @@
     task full-tree <ID>         显示事务完整树（从根事务开始）
     task msg <ID>               显示根事务的根消息回复链
     task context <ID>           显示消息上下文
-    task pause <ID>             暂停事务（递归暂停子事务）
-    task cancel <ID>            取消事务（递归取消子事务）
+    task pause <ID>             暂停事务（默认不联动子事务，-r 递归暂停）
+    task cancel <ID>            取消事务（默认不联动子事务，-r 递归取消）
     task up <ID>                提高优先级（递归提高子事务）
     task down <ID>              降低优先级（递归降低子事务）
     task delete <ID>            递归删除事务及其所有子事务
@@ -1974,7 +1974,7 @@ def cmd_context(args):
 
 
 def cmd_pause(args):
-    """暂停事务（递归暂停子事务）"""
+    """暂停事务（默认不联动子事务，-r/--recursive 递归暂停整棵事务树）"""
     tm = get_task_manager()
 
     # 检查事务是否存在
@@ -1998,23 +1998,27 @@ def cmd_pause(args):
         project_root = get_project_root()
         from peng.config import get_path
 
-        # 获取所有需要暂停的事务（递归）
+        # 默认仅暂停自身；-r/--recursive 时递归收集所有子事务
         all_task_ids = [args.id]
 
-        def collect_recursive(task_id: int):
-            children = tm.get_children(task_id)
-            for child in children:
-                all_task_ids.append(child["id"])
-                collect_recursive(child["id"])
+        if getattr(args, "recursive", False):
+            def collect_recursive(task_id: int):
+                children = tm.get_children(task_id)
+                for child in children:
+                    all_task_ids.append(child["id"])
+                    collect_recursive(child["id"])
 
-        collect_recursive(args.id)
+            collect_recursive(args.id)
 
         # 使用TaskDatabase的insert_task_control方法
         for task_id in all_task_ids:
             tm.db.insert_task_control(task_id, "pause")
 
         formatted_id = format_task_id(args.id, task)
-        print(f"事务树 {formatted_id} 暂停控制已加入队列 ({len(all_task_ids)} 个事务)")
+        if len(all_task_ids) > 1:
+            print(f"事务树 {formatted_id} 暂停控制已加入队列 ({len(all_task_ids)} 个事务)")
+        else:
+            print(f"事务 {formatted_id} 暂停控制已加入队列")
         return 0
 
     except Exception as e:
@@ -2026,7 +2030,7 @@ def cmd_pause(args):
 
 
 def cmd_cancel(args):
-    """取消事务（递归取消子事务）"""
+    """取消事务（默认不联动子事务，-r/--recursive 递归取消整棵事务树）"""
     tm = get_task_manager()
 
     # 检查事务是否存在
@@ -2043,23 +2047,27 @@ def cmd_cancel(args):
         project_root = get_project_root()
         from peng.config import get_path
 
-        # 获取所有需要取消的事务（递归）
+        # 默认仅取消自身；-r/--recursive 时递归收集所有子事务
         all_task_ids = [args.id]
 
-        def collect_recursive(task_id: int):
-            children = tm.get_children(task_id)
-            for child in children:
-                all_task_ids.append(child["id"])
-                collect_recursive(child["id"])
+        if getattr(args, "recursive", False):
+            def collect_recursive(task_id: int):
+                children = tm.get_children(task_id)
+                for child in children:
+                    all_task_ids.append(child["id"])
+                    collect_recursive(child["id"])
 
-        collect_recursive(args.id)
+            collect_recursive(args.id)
 
         # 使用TaskDatabase的insert_task_control方法
         for task_id in all_task_ids:
             tm.db.insert_task_control(task_id, "cancel")
 
         formatted_id = format_task_id(args.id, task)
-        print(f"事务树 {formatted_id} 取消控制已加入队列 ({len(all_task_ids)} 个事务)")
+        if len(all_task_ids) > 1:
+            print(f"事务树 {formatted_id} 取消控制已加入队列 ({len(all_task_ids)} 个事务)")
+        else:
+            print(f"事务 {formatted_id} 取消控制已加入队列")
         return 0
 
     except Exception as e:
@@ -2173,11 +2181,30 @@ def cmd_restart(args):
 
         if args.force:
             tm.db.update_task(args.id, checklist="")
+
+        # 默认仅重启自身；-r/--recursive 时递归重启所有子事务
+        all_task_ids = [args.id]
+        if getattr(args, "recursive", False):
+            def _collect(task_id: int):
+                for child in tm.get_children(task_id):
+                    all_task_ids.append(child["id"])
+                    _collect(child["id"])
+
+            _collect(args.id)
+            if args.force:
+                for tid in all_task_ids:
+                    if tid != args.id:
+                        tm.db.update_task(tid, checklist="")
+
         # 使用TaskDatabase的insert_task_control方法
-        tm.db.insert_task_control(args.id, "restart")
+        for tid in all_task_ids:
+            tm.db.insert_task_control(tid, "restart")
 
         formatted_id = format_task_id(args.id, task)
-        print(f"事务 {formatted_id} 重启控制已加入队列")
+        if len(all_task_ids) > 1:
+            print(f"事务树 {formatted_id} 重启控制已加入队列 ({len(all_task_ids)} 个事务)")
+        else:
+            print(f"事务 {formatted_id} 重启控制已加入队列")
         return 0
 
     except Exception as e:
@@ -2189,7 +2216,7 @@ def cmd_restart(args):
 
 
 def cmd_resume(args):
-    """恢复事务（从当前步骤继续）"""
+    """恢复事务（默认不联动子事务，-r/--recursive 递归恢复整棵事务树）"""
     tm = get_task_manager()
 
     task = tm.get_task(args.id)
@@ -2202,10 +2229,25 @@ def cmd_resume(args):
     from pathlib import Path
 
     try:
+        # 默认仅恢复自身；-r/--recursive 时递归恢复所有子事务
+        all_task_ids = [args.id]
+        if getattr(args, "recursive", False):
+            def _collect(task_id: int):
+                for child in tm.get_children(task_id):
+                    all_task_ids.append(child["id"])
+                    _collect(child["id"])
+
+            _collect(args.id)
+
         # 使用TaskDatabase的insert_task_control方法
-        tm.db.insert_task_control(args.id, "resume")
+        for tid in all_task_ids:
+            tm.db.insert_task_control(tid, "resume")
+
         formatted_id = format_task_id(args.id, task)
-        print(f"事务 {formatted_id} 恢复控制已加入队列")
+        if len(all_task_ids) > 1:
+            print(f"事务树 {formatted_id} 恢复控制已加入队列 ({len(all_task_ids)} 个事务)")
+        else:
+            print(f"事务 {formatted_id} 恢复控制已加入队列")
         return 0
 
     except Exception as e:
@@ -3611,6 +3653,17 @@ def main():
             print_provider_usage_footer()
         return rc
 
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if hasattr(args, "func"):
+        return args.func(args)
+
+    return 0
+
+
+def build_parser():
+    """构建 task CLI 的 argparse 解析器（供 main 与单元测试复用）"""
     parser = argparse.ArgumentParser(
         description=f"{AGENT_NAME}的事务管理工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3623,8 +3676,12 @@ def main():
     task new 123 -c "内容"  创建子事务
     task show 123            显示事务详情
     task tree 123            显示事务树
-    task pause 123           暂停事务（包括子事务）
-    task cancel 123          取消事务（包括子事务）
+    task pause 123           暂停事务（默认不联动子事务）
+    task pause 123 -r        递归暂停事务树（包括子事务）
+    task cancel 123          取消事务（默认不联动子事务）
+    task cancel 123 -r       递归取消事务树（包括子事务）
+    task resume 123 -r       递归恢复事务树（包括子事务）
+    task restart 123 -r      递归重启事务树（包括子事务）
     task up 123              提高优先级（包括子事务）
     task down 123            降低优先级（包括子事务）
         """,
@@ -3715,13 +3772,19 @@ def main():
     msg_parser.set_defaults(func=cmd_msg)
 
     # pause 命令
-    pause_parser = subparsers.add_parser("pause", help="暂停事务（递归暂停子事务）")
+    pause_parser = subparsers.add_parser("pause", help="暂停事务（默认不联动子事务）")
     pause_parser.add_argument("id", type=int, help="事务ID")
+    pause_parser.add_argument(
+        "-r", "--recursive", action="store_true", help="递归暂停整棵事务树（包括子事务）"
+    )
     pause_parser.set_defaults(func=cmd_pause)
 
     # cancel 命令
-    cancel_parser = subparsers.add_parser("cancel", help="取消事务（递归取消子事务）")
+    cancel_parser = subparsers.add_parser("cancel", help="取消事务（默认不联动子事务）")
     cancel_parser.add_argument("id", type=int, help="事务ID")
+    cancel_parser.add_argument(
+        "-r", "--recursive", action="store_true", help="递归取消整棵事务树（包括子事务）"
+    )
     cancel_parser.set_defaults(func=cmd_cancel)
 
     # up 命令
@@ -3735,14 +3798,20 @@ def main():
     down_parser.set_defaults(func=cmd_down)
 
     # restart 命令
-    restart_parser = subparsers.add_parser("restart", help="重启事务（从步骤1开始）")
+    restart_parser = subparsers.add_parser("restart", help="重启事务（从步骤1开始，默认不联动子事务）")
     restart_parser.add_argument("id", type=int, help="事务ID")
     restart_parser.add_argument("-f", "--force", action="store_true", help="强制重新启动")
+    restart_parser.add_argument(
+        "-r", "--recursive", action="store_true", help="递归重启整棵事务树（包括子事务）"
+    )
     restart_parser.set_defaults(func=cmd_restart)
 
     # resume 命令
-    resume_parser = subparsers.add_parser("resume", help="恢复事务（从当前步骤继续）")
+    resume_parser = subparsers.add_parser("resume", help="恢复事务（从当前步骤继续，默认不联动子事务）")
     resume_parser.add_argument("id", type=int, help="事务ID")
+    resume_parser.add_argument(
+        "-r", "--recursive", action="store_true", help="递归恢复整棵事务树（包括子事务）"
+    )
     resume_parser.set_defaults(func=cmd_resume)
 
     # start 命令
@@ -4022,12 +4091,7 @@ def main():
     )
     rollback_parser.set_defaults(func=cmd_rollback)
 
-    args = parser.parse_args()
-
-    if hasattr(args, "func"):
-        return args.func(args)
-
-    return 0
+    return parser
 
 
 if __name__ == "__main__":
