@@ -107,7 +107,7 @@
         "⚠️  你似乎陷入了死循环！ 执行 git diff 对照 checklist 核对当前实际变更和进展！"
       ],
       "thinking_truncated": "[已截断前 {truncated_count} 行思考内容...]",
-      "context_too_large": "⚠️  [{timestamp}] 事务#{task_id}当前上下文紧张({current_kb}K/{threshold_kb}K)。\n大模型降智严重，且进展缓慢(进度记录 {progress}%)，把已完成事项，需要继续处理的事项，当前上下文内所有对继续处理的事项有用的信息，以及当前进展，相关代码位置和其他新发现的重要信息，记录到 checklist。然后用工具调用'task restart {task_id}'（禁止添加--force）重启本事务。",
+      "context_too_large": "⚠️  [{timestamp}] 事务#{task_id}当前上下文紧张({current_kb}K/{threshold_kb}K)。\n大模型降智严重，且进展缓慢(进度记录 {progress}%)，把已完成事项，需要继续处理的事项，当前上下文内所有对继续处理的事项有用的信息，以及当前进展，相关代码详细位置和其他新发现的重要信息，记录到 checklist。然后用工具调用'task restart {task_id}'（禁止添加--force）重启本事务。",
       "iteration_limit_warning": "⚠️  将达到系统迭代限制（{iteration}/{max_iterations}），请尽快结束本轮对话，避免强制中断。",
       "iteration_exhausted": "⚠️  达到最大迭代次数 {max_iterations}，强制结束对话循环",
       "degenerate_loop_intervention": "⚠️ 你已检测到自身陷入退化循环！立即停止当前思考方向！换用完全不同的策略：直接调用工具获取新信息或执行具体操作。禁止继续在当前方向上推理！",
@@ -192,6 +192,21 @@
         "price_input_hit": 0.02,
         "price_input_miss": 1,
         "price_output": 4
+      },
+      "hy4-flash": {
+        "api_key": "your_key",
+        "base_url": "https://tokenhub.tencentmaas.com/v1",
+        "model": "hy4-flash",
+        "small_model": "hy4-flash",
+        "max_concurrent": 8,
+        "thinking_type": "thinking",
+        "enable": false,
+        "icon": "🍀",
+        "vision": "yes",
+        "priority": 90,
+        "price_input_hit": 0.02,
+        "price_input_miss": 0.5,
+        "price_output": 2
       }
     },
     "degenerate_loop_patterns": [
