@@ -2116,12 +2116,16 @@ class TaskDatabase(metaclass=MetaSingleton):
                 )
             return [dict(row) for row in cursor.fetchall()]
 
-    def get_tasks_by_message_ids_list(self, message_ids: list[int]) -> list[dict[str, Any]]:
+    def get_tasks_by_message_ids_list(
+        self, message_ids: list[int], root_only: bool = False
+    ) -> list[dict[str, Any]]:
         """
         根据消息ID列表获取事务
 
         Args:
             message_ids: 消息ID列表
+            root_only: 是否只返回根事务（事务#2802：消息级控制只作用于根事务，
+                       避免递归联动子事务——子事务的 message_id 与根事务相同）
 
         Returns:
             事务列表，包含 id, status
@@ -2130,11 +2134,12 @@ class TaskDatabase(metaclass=MetaSingleton):
             return []
 
         placeholders = ",".join(["%s"] * len(message_ids))
+        root_filter = " AND parent_task_id IS NULL" if root_only else ""
         with self._get_connection() as conn:
             cursor = conn.execute(
                 f"""
                 SELECT id, status FROM tasks
-                WHERE message_id IN ({placeholders})
+                WHERE message_id IN ({placeholders}){root_filter}
                 """,
                 tuple(message_ids),
             )

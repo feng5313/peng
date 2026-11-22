@@ -271,11 +271,12 @@ class MessageManager(metaclass=MetaSingleton):
                 return await self.handle_reply(msg_id)
             # 检查当前消息本身是否有关联事务
             # 【原则】对于已经存在事务的消息，任何时候都不应该发起新事务
+            # 事务#2802：只匹配根事务（子事务的 message_id 与根事务相同）
             if msg.get("status") != "unread":
                 all_tasks = self._task_manager.list_tasks()
                 msg_existing_task = None
                 for task in all_tasks:
-                    if task.get("message_id") == msg_id:
+                    if task.get("message_id") == msg_id and not task.get("parent_task_id"):
                         msg_existing_task = task
                         break
 
@@ -806,9 +807,10 @@ class MessageManager(metaclass=MetaSingleton):
             logger.info(f"消息 ID={msg_id} 已处于暂停状态")
             return True
 
-        # 暂停关联的事务
+        # 暂停关联的事务（事务#2802：只作用于根事务，不联动子事务；
+        # 子事务的 message_id 与根事务相同，必须 root_only 过滤）
         if self._task_manager:
-            tasks = self._task_manager.list_tasks(message_id=msg_id)
+            tasks = self._task_manager.list_tasks(message_id=msg_id, root_only=True)
             for task in tasks:
                 task_id = task.get("id")
                 task_status = task.get("status")
@@ -850,8 +852,8 @@ class MessageManager(metaclass=MetaSingleton):
             logger.info(f"消息 ID={msg_id} 已处于取消状态")
             return True
 
-        # 恢复关联的事务
-        tasks = self._task_manager.list_tasks(message_id=msg_id)
+        # 恢复关联的事务（事务#2802：只作用于根事务，不联动子事务）
+        tasks = self._task_manager.list_tasks(message_id=msg_id, root_only=True)
         for task in tasks:
             task_id = task.get("id")
             task_status = task.get("status")
@@ -891,7 +893,9 @@ class MessageManager(metaclass=MetaSingleton):
         success = False
 
         # 恢复关联的事务（包括终态事务，保留 context）
-        tasks = self._task_manager.list_tasks(message_id=msg_id)
+        # 事务#2802修复：只恢复根事务！子事务的 message_id 与根事务相同，
+        # 不加 root_only 过滤会把整棵事务树全部启动（收到回复消息只应启动根事务）
+        tasks = self._task_manager.list_tasks(message_id=msg_id, root_only=True)
         for task in tasks:
             task_id = task.get("id")
             task_status = task.get("status")

@@ -615,7 +615,13 @@ def control_message_task(message_id: int, action: str) -> dict[str, Any]:
         return {"success": False, "error": f"消息 #{message_id} 不存在"}
 
     task_manager = get_task_manager()
-    tasks = task_manager.get_tasks_by_message(message_id)
+    # 事务#2802：只对根事务写入控制（子事务的 message_id 与根事务相同，
+    # 不过滤会导致消息级暂停/取消/继续/重启递归联动整棵事务树）
+    tasks = [
+        t
+        for t in task_manager.get_tasks_by_message(message_id)
+        if not t.get("parent_task_id")
+    ]
 
     if not tasks:
         return {"success": False, "error": f"消息 #{message_id} 没有关联的事务"}

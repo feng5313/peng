@@ -484,7 +484,8 @@ class HeartbeatMonitor:
             return []
 
         # 2. 从 tasks.db 获取关联的事务（通过TaskDatabase）
-        tasks = self.task_db.get_tasks_by_message_ids_list(paused_msg_ids)
+        # 事务#2802：只取根事务——消息暂停不再递归暂停子事务
+        tasks = self.task_db.get_tasks_by_message_ids_list(paused_msg_ids, root_only=True)
 
         # 3. 更新需要暂停的事务
         tasks_to_pause = []  # [task_id, ...]
