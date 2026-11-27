@@ -194,11 +194,7 @@ def _info_running_gate_reason(tool: Tool, task_id: int) -> str | None:
     shown = status or "不存在或状态未知"
     return (
         f"🚫 拒绝：事务#{task_id}当前状态为「{shown}」，不在运行状态！"
-        "info 只能发给**正在运行**的事务（running/accepting），"
-        "发给非运行事务会被 CLI 自动 resume 拉起，属于越权唤醒。"
-        "正确做法：要让它继续工作请显式用 task resume/start/restart <id>；"
-        "要传达内容请用 message reply 挂到该事务的消息链；"
-        "查看已注入信息仍可用 info <id>（只读不受限制）。"
+        "info 只能发给**正在运行**的事务！"
     )
 
 
@@ -244,9 +240,7 @@ def _parse_seconds(value: Any) -> float | None:
         return None if (math.isnan(num) or math.isinf(num)) else num
     text = str(value).strip()
     # 去掉单位后缀（"30s"/"30 sec"/"30 秒"），允许数字与单位间空白
-    text = re.sub(
-        r"\s*(?:s|sec|secs|second|seconds|秒)$", "", text, flags=re.IGNORECASE
-    ).strip()
+    text = re.sub(r"\s*(?:s|sec|secs|second|seconds|秒)$", "", text, flags=re.IGNORECASE).strip()
     try:
         num = float(text)
     except ValueError:
@@ -1270,9 +1264,7 @@ class WaitTool(Tool):
             logger.debug(f"[wait] 读取事务心跳超时失败(用默认{timeout_sec}s): {e}")
         return max(1.0, min(self.HEARTBEAT_INTERVAL, float(timeout_sec) / 4.0))
 
-    async def execute(
-        self, seconds: Any = None, reason: Any = None, **kwargs
-    ) -> DualOutput:
+    async def execute(self, seconds: Any = None, reason: Any = None, **kwargs) -> DualOutput:
         """等待 seconds 秒（心跳保活 + 中断监控），返回等待结果。
 
         Args:
@@ -1396,4 +1388,3 @@ class WaitTool(Tool):
             )
             display = f"{_ANSI['bright_green']}{summary}{_ANSI['reset']}"
         return DualOutput(summary=summary, display=display)
-
