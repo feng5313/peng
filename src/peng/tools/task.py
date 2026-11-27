@@ -144,6 +144,64 @@ def _write_temp_file(content: str) -> str:
     return str(path)
 
 
+# === 事务#2885：info 注入的运行状态门禁（只约束大模型工具路径） ===
+# 需求：严格禁止大模型用 info 工具把信息发给**不在运行状态**的事务。
+# 原理：CLI(cmd_info) 对非运行事务追加信息后会 insert_task_control("resume")
+# 主动把它拉起，等于大模型越权唤醒/重启事务（另起进程易引发多进程竞态调用LLM）。
+# 手动操作不受限制：webui/命令行/hooks 直接走 CLI，用户主动拉起正是其意图。
+# 判定沿用工程内既有口径（tool_engine.task_stopped / TaskStatus.active_states）：
+# running、accepting 视为运行中——进程仍在迭代循环，注入的 info 会被自动消费。
+
+
+def _lookup_task_status(tool: Tool, task_id: int) -> str | None:
+    """查询目标事务当前状态（查不到/查询异常返回 None）。
+
+    优先复用工具上下文的 task_manager（服务进程内直连数据库），
+    无上下文时退化为新建 TaskDatabase。
+    """
+    try:
+        task_manager = tool.get_context("task_manager")
+        if task_manager:
+            task = task_manager.get_task(task_id)
+        else:
+            from peng.task.database import TaskDatabase
+
+            task = TaskDatabase().get_task(task_id)
+    except Exception as e:
+        logger.warning(f"[info门禁] 查询事务#{task_id}状态失败: {e}")
+        return None
+
+    if not task:
+        return None
+    return str(task.get("status") or "")
+
+
+def _is_task_running(status: str | None) -> bool:
+    """运行状态判定：running/accepting 为运行中；状态未知（查询失败）按运行中放行。"""
+    if status is None:
+        return True
+    from peng.task.task_types import TaskStatus
+
+    return status in {s.value for s in TaskStatus.active_states()}
+
+
+def _info_running_gate_reason(tool: Tool, task_id: int) -> str | None:
+    """大模型 info 发送门禁：目标事务在运行中返回 None（放行），否则返回拒绝理由。"""
+    status = _lookup_task_status(tool, task_id)
+    if _is_task_running(status):
+        return None
+
+    shown = status or "不存在或状态未知"
+    return (
+        f"🚫 拒绝：事务#{task_id}当前状态为「{shown}」，不在运行状态！"
+        "info 只能发给**正在运行**的事务（running/accepting），"
+        "发给非运行事务会被 CLI 自动 resume 拉起，属于越权唤醒。"
+        "正确做法：要让它继续工作请显式用 task resume/start/restart <id>；"
+        "要传达内容请用 message reply 挂到该事务的消息链；"
+        "查看已注入信息仍可用 info <id>（只读不受限制）。"
+    )
+
+
 def _parse_progress(progress: Any) -> int | None:
     """解析progress参数为0-100整数。
 
@@ -674,6 +732,11 @@ class InfoTool(Tool):
         return """事务信息提示工具（InfoTool）。
 
 向指定id的事务注入上下文信息，用于父事务向运行中的子事务大模型发送紧急信息指示。
+
+🚫 硬性限制：只能发给**正在运行**的事务（running/accepting）。
+向已暂停/已完成/已取消/待定等不在运行状态的事务发送 info 会被直接拒绝
+（不会写入，也不会顺手把对方 resume 拉起）；需要唤醒请显式用 task resume/start/restart，
+需要传达内容请改用 message reply。查看(info <id>)与清空(--delete)不受此限制。
 info字段必须是普通字符串格式，支持\\n换行符。
 发送者由系统自动标识为「事务#当前事务ID」（事务#2089），接收方会看到info来源。
 常用功能：
@@ -720,7 +783,19 @@ info字段必须是普通字符串格式，支持\\n换行符。
                 - 有内容：添加 info
         Returns:
             DualOutput: 执行结果
+
+
+        事务#2885 门禁：发送（info_string 非空）时目标事务必须处于运行状态，
+        否则直接返回拒绝结果——不写入 info，也不触发 CLI 的 resume 拉起。
         """
+        # 运行状态门禁：只有「发送新信息」受限，查看(None)/清空("")不受限。
+        # 放在 try 之外，避免被下方兜底 except 吞掉具体拒绝理由。
+        if info_string:
+            reason = _info_running_gate_reason(self, task_id)
+            if reason:
+                logger.warning(f"[info工具] 拒绝向非运行事务#{task_id}注入信息")
+                return DualOutput(summary=reason, display=reason)
+
         try:
             if not task_id or task_id <= 0:
                 return DualOutput(
@@ -854,9 +929,11 @@ class TaskTool(Tool):
       含回滚超链接的行会在行尾追加 [R<序号>] task rollback <事务ID> R<序号>（含回滚ID+完整回滚命令行，橙色）
       示例：output 2 --tail 10 --verbose（显示事务#2输出文件的后10行，带时间戳）
       示例：output 7 --line-count（只显示事务#7输出文件的总行数，不显示文件内容）
-9. 向运行中事务注入实时提示信息：info <id> 提示信息  发实时提示信息给事务，若事务不在处理则启动事务
-      示例：info 3 编辑文件后要用git diff确认是否修改正确！ （提醒事务3核对文件编辑结果）
-      （发送者自动标识为 事务#当前事务ID，接收方info中显示 [来自 事务#N]）
+9. 向运行中事务注入实时提示信息：info <id> 提示信息 （🚫只能发给**正在运行**的事务，
+       发给已暂停/已完成/已取消等不在运行状态的事务会被直接拒绝，不会自动把它拉起）
+       示例：info 3 编辑文件后要用git diff确认是否修改正确！ （提醒事务3核对git diff结果）
+       （发送者自动标识为 事务#当前事务ID，接收方info中显示 [来自 事务#N]；
+        info <id> 只读查看与 info <id> -d 清空不受运行状态限制）
 10. 修改事务需求描述：content <id> <detail>  (只允许在监控子事务时使用)
       示例：content 5 修改后的需求描述内容（修改事务#5的需求描述）
       示例：content 5 -d（清空事务#5的需求描述）
@@ -1013,6 +1090,22 @@ class TaskTool(Tool):
             if arg_parts and arg_parts[0].isdigit():
                 cmd.append(arg_parts[0])
                 content = arg_parts[1] if len(arg_parts) > 1 else ""
+
+            # 事务#2885：info 子命令的运行状态门禁——大模型只能把信息发给运行中的事务。
+            # 只拦截「真正发送新内容」：正文非空，或显式传了 --file（内容来自文件）；
+            # 只读查看（无内容）与清空（-d/--delete）不受限。
+            is_info_send = bool(content) or "--file" in option_tokens
+            if (
+                subcmd == "info"
+                and is_info_send
+                and not any(token in ("-d", "--delete") for token in option_tokens)
+            ):
+                target_id = int(arg_parts[0]) if arg_parts and arg_parts[0].isdigit() else 0
+                if target_id:
+                    reason = _info_running_gate_reason(self, target_id)
+                    if reason:
+                        logger.warning(f"[task工具] info拒绝发给非运行事务#{target_id}")
+                        return DualOutput(summary=reason, display=reason)
 
             # 内容中残留疑似选项文本时给出显式提示，避免"选项被当作内容静默忽略"
             suspicious = find_unparsed_option_flags(content, value_flags + bool_flags)

@@ -242,7 +242,11 @@ class TestMessageToolNoRootMessage:
 class TestInfoTool:
     async def test_info_add_includes_sender(self, monkeypatch):
         tool = InfoTool()
-        tool.set_context(task_id=2089)
+        # 事务#2885：发送info受运行状态门禁，目标事务必须是running/accepting
+        tool.set_context(
+            task_id=2089,
+            task_manager=_FakeTaskManager({2064: {"id": 2064, "status": "running"}}),
+        )
         captured = _CapturedRun()
         monkeypatch.setattr("peng.tools.task.subprocess.run", captured)
         result = await _run_tool_args(tool, task_id=2064, info_string="请注意xxx")
