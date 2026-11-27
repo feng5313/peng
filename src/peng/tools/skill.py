@@ -85,12 +85,14 @@ class SkillTool(Tool):
 
         # 🔧 事务#1827：优先从 per-agent overlay（工作nest/工作目录技能）解析，同名覆盖全局
         overlay = self.get_context("skill_overlay") or {}
-        skill = overlay.get(name) if isinstance(overlay, dict) else None
-        if skill is None:
-            skill = _skill_loader.get(name)
+        overlay = overlay if isinstance(overlay, dict) else {}
+        skill = _skill_loader.get(name, overlay=overlay)
 
         if not skill:
-            available = ", ".join(_skill_loader.list_skills())
+            # 🔧 事务#2882：可用技能清单须包含 overlay（工作目录）技能，
+            # 否则系统提示词里已列出的工作目录技能在报错中被漏列，误导排查
+            names = list(dict.fromkeys(_skill_loader.list_skills() + list(overlay.keys())))
+            available = ", ".join(names)
             return f"错误：未找到 skill '{name}'。可用技能：{available}"
 
         # 返回完整 skill 内容

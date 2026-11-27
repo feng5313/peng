@@ -379,6 +379,17 @@ class PengAgent:
             logger.warning(f"[Agent] 收集任务技能失败(忽略): {e}")
             return {}
 
+    async def _ensure_task_skills_overlay(self, task) -> dict:
+        """确保本次运行的 task级技能 overlay 可用（事务#2882）
+
+        run_stream 从 task.context 恢复 history 时跳过 _prepare_prompt，若只在
+        _prepare_prompt 内构建 overlay，恢复运行的 skill_overlay 恒为空 dict，
+        skill 工具便只能解析全局技能（系统提示词已列出的工作目录技能报"未找到"）。
+        """
+        if not self._task_skills_overlay:
+            self._task_skills_overlay = await self._build_task_skills_overlay(task)
+        return self._task_skills_overlay
+
     @property
     def is_auto_mode(self) -> bool:
         """是否处于全自动模式"""
@@ -557,6 +568,10 @@ class PengAgent:
                 f"[Agent.run_stream] 从task.context恢复history成功（包含{len(self.history.to_api_format())}条消息）"
             )
             # 恢复成功，跳过_prepare_prompt，保持完整的对话历史
+            # 🔧 事务#2882：恢复路径不走 _prepare_prompt，必须在此重建技能 overlay，
+            # 否则 skill_overlay 恒为空 dict，skill 工具只能解析全局技能，
+            # 系统提示词 discovery 已列出的工作目录技能会报"未找到"
+            await self._ensure_task_skills_overlay(task)
         else:
             # context为空、反序列化失败、或消息为空（重启清空历史但保留统计）时，
             # 需要执行_prepare_prompt重新构建系统提示词
